@@ -5,7 +5,7 @@
 ## 📢 Follow Us
 
 <p align="center">
-  <a href="https://twitter.com/blipmq">
+  <a href="https://x.com/blipmq">
     <img src="https://img.shields.io/badge/Twitter-@blipmq-1DA1F2?style=flat&logo=twitter&logoColor=white" alt="Twitter" />
   </a>
   <a href="https://linkedin.com/company/blipmq">
@@ -74,9 +74,4 @@
 
 ---
 
-## 📦 Installation
 
-```bash
-curl -LO https://github.com/blipmq/blipmq/releases/download/v1.0.0/blipmq-x86_64-linux
-chmod +x blipmq-x86_64-linux
-./blipmq-x86_64-linux --config blipmq.toml
