@@ -1,10 +1,22 @@
 <p align="center">
-  <img src="./assets/blipmq.jpg" alt="BlipMQ Logo" width="100%" height="100%" />
+  <img src="./assets/blipmq.jpg" alt="BlipMQ Logo" width="100%" />
 </p>
 
-[![Twitter](https://img.shields.io/badge/Twitter-@blipmq-1DA1F2?style=flat&logo=twitter&logoColor=white)](https://x.com/blipmq)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-blipmq-blue?style=flat&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/blipmq)
-[![Instagram](https://img.shields.io/badge/Instagram-@blipmq-E4405F?style=flat&logo=instagram&logoColor=white)](https://www.instagram.com/blipmq)
+## 📢 Follow Us
+
+<p align="center">
+  <a href="https://twitter.com/blipmq">
+    <img src="https://img.shields.io/badge/Twitter-@blipmq-1DA1F2?style=flat&logo=twitter&logoColor=white" alt="Twitter" />
+  </a>
+  <a href="https://linkedin.com/company/blipmq">
+    <img src="https://img.shields.io/badge/LinkedIn-blipmq-blue?style=flat&logo=linkedin&logoColor=white" alt="LinkedIn" />
+  </a>
+  
+  <a href="https://www.instagram.com/blipmq">
+    <img src="https://img.shields.io/badge/Instagram-@blipmq-E4405F?style=flat&logo=instagram&logoColor=white" alt="Instagram" />
+  </a>
+</p>
+
 
 
 
