@@ -1,8 +1,13 @@
 <p align="center">
-  <img src="./assets/blipmq.jpg" alt="BlipMQ Logo" width="100%" />
+  <img src="./assets/blipmq.jpg" alt="BlipMQ Logo" width="100%" height="100%" />
 </p>
 
-<h1 align="center">🚀 BlipMQ</h1>
+[![Twitter](https://img.shields.io/badge/Twitter-@blipmq-1DA1F2?style=flat&logo=twitter&logoColor=white)](https://x.com/blipmq)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-blipmq-blue?style=flat&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/blipmq)
+[![Instagram](https://img.shields.io/badge/Instagram-@blipmq-E4405F?style=flat&logo=instagram&logoColor=white)](https://www.instagram.com/blipmq)
+
+
+
 
 <p align="center">
   <b>BlipMQ</b> is an ultra-lightweight, fault-tolerant message queue written in Rust — built for edge, embedded, and developer-first environments.
