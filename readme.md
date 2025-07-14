@@ -1,53 +1,65 @@
-# 🚀 BlipMQ — Lightweight, Durable, Single-Binary Message Broker
+<p align="center">
+  <img src="./assets/blipmq.jpg" alt="BlipMQ Logo" width="100%" />
+</p>
 
-**BlipMQ** is an ultra-lightweight, fault-tolerant message queue written in Rust — designed for local-first, edge, and high-performance embedded systems. It offers **durability**, **per-subscriber isolation**, and **QoS-aware delivery**, all in a **single deployable binary**.
+<h1 align="center">🚀 BlipMQ</h1>
 
-> Think: MQTT simplicity meets Kafka reliability — without the complexity.
+<p align="center">
+  <b>BlipMQ</b> is an ultra-lightweight, fault-tolerant message queue written in Rust — built for edge, embedded, and developer-first environments.
+</p>
 
----
-
-## 🧩 Features — v1.0.0
-
-✅ = Included in `v1.0.0`
-
-### Core Functionality
-- [x] Single-node deployment (no external services required)
-- [x] TCP-based binary protocol (Protobuf framed)
-- [x] Publish / Subscribe with topic-based routing
-- [x] Per-subscriber isolated in-memory queues
-- [x] QoS 0 (fire-and-forget) and QoS 1 (retry until ack)
-- [x] Configurable TTL for message expiration
-- [x] Configurable queue depth with drop policies:
-    - [x] Drop oldest
-    - [x] Drop new
-    - [x] Block publisher (backpressure)
-- [x] Unique message IDs per publish
-
-### Durability & Recovery
-- [x] Append-only Write-Ahead Log (WAL) for durability
-- [x] WAL-backed crash recovery (replay unacked messages)
-- [x] WAL segmentation (fixed-size rotated files)
-- [x] CRC32 checksums per WAL record
-- [x] Batched WAL flush with optional fsync
-
-### Performance & Observability
-- [x] High-throughput async architecture (powered by `tokio`)
-- [x] Prometheus-compatible `/metrics` HTTP endpoint
-- [x] Tracing and logging with structured events
-
-### Security & Access
-- [x] Static API key-based authentication per client
-- [x] Connection limits and rate limiting (configurable)
+<p align="center">
+  ⚡ <i>“Kafka-level durability. MQTT-level simplicity. NATS-level performance — all in one binary.”</i>
+</p>
 
 ---
 
-## 🚦 Ideal Use Cases
+## 🧩 Features — `v1.0.0`
 
-- Local-first apps needing embedded queues
-- Edge devices or gateways (e.g. IoT ingestion)
-- CI/CD pipelines that need a drop-in pub/sub layer
-- Durable telemetry collectors in constrained environments
-- Lightweight alternatives to Kafka, RabbitMQ, NATS
+✅ = Implemented in `v1.0.0`  
+⬜ = Planned for future
+
+### 🔌 Core Broker
+- ✅ Single static binary (no runtime deps)
+- ✅ TCP-based protobuf protocol
+- ✅ Topic-based publish/subscribe
+- ✅ QoS 0 & QoS 1 support
+- ✅ Per-subscriber isolated in-memory queues
+- ✅ Configurable TTL and max queue size
+- ✅ Overflow policies: `drop_oldest`, `drop_new`, `block`
+
+### 🔐 Durability & Safety
+- ✅ Append-only Write-Ahead Log (WAL)
+- ✅ WAL segmentation (rotated files)
+- ✅ Replay unacknowledged messages on restart
+- ✅ CRC32 checksum for corruption detection
+- ✅ Batched WAL flushing with fsync
+
+### 📈 Observability
+- ✅ Prometheus `/metrics` endpoint
+- ✅ Tracing + structured logs
+- ✅ Connection + delivery stats
+
+### 🧰 Operational Controls
+- ✅ Configurable limits (connections, queue depth)
+- ✅ API-key based authentication
 
 ---
 
+## 💡 Ideal Use Cases
+
+| Scenario                        | Why BlipMQ?                               |
+|---------------------------------|-------------------------------------------|
+| 🛰️ IoT or edge gateways          | Single-binary durability, low memory use   |
+| 🧪 Local testing/dev environments| Embedded broker with crash recovery        |
+| ⚙️ Internal microservice bus      | Fast pub/sub with no external dependencies |
+| 🧱 CI/CD pipelines               | Durable test event ingestion               |
+
+---
+
+## 📦 Installation
+
+```bash
+curl -LO https://github.com/blipmq/blipmq/releases/download/v1.0.0/blipmq-x86_64-linux
+chmod +x blipmq-x86_64-linux
+./blipmq-x86_64-linux --config blipmq.toml

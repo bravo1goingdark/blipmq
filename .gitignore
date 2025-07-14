@@ -1,0 +1,69 @@
+# ========================================
+# Rust build artifacts
+# ========================================
+target
+**/*.rs.bk
+
+# Cargo-specific
+/Cargo.lock
+/.cargo/
+/.cargo-target/
+
+# ========================================
+# Editor and IDE files
+# ========================================
+# JetBrains (RustRover, IntelliJ)
+.idea/
+*.iml
+*.iws
+
+# VSCode
+.vscode/
+
+# Sublime
+*.sublime-workspace
+*.sublime-project
+
+# ========================================
+# OS-specific files
+# ========================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+__MACOSX/
+
+# ========================================
+# WAL and runtime artifacts
+# ========================================
+/wal/
+*.wal
+*.log
+*.pid
+/tmp/
+/*.db
+/logs/
+
+# ========================================
+# Testing / CI / coverage
+# ========================================
+/coverage/
+/grcov/
+/test-output/
+/*.profraw
+
+# ========================================
+# Binary output
+# ========================================
+blipmq
+blipmq.exe
+*.out
+*.bin
+
+# ========================================
+# Misc
+# ========================================
+*.lock
+*.bak
+*.swp
+*.tmp
