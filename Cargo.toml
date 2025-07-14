@@ -1,6 +1,26 @@
 [package]
 name = "blipmq"
-version = "0.1.0"
-edition = "2024"
+version = "1.0.0"
+edition = "2021"
+authors = ["Ashutosh Kumar <kumarashutosh34169@gmail.com>"]
+description = "Ultra-lightweight, durable, high-throughput message queue written in Rust."
+license = "MIT"
+repository = "https://github.com/bravo1goingdark/blipmq"
 
 [dependencies]
+tokio = { version = "1.38", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std" , "time"] }
+
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9.2"
+anyhow = "1.0"
+tracing = "0.1.41"
+
+
+[build-dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

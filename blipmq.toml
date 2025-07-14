@@ -1,0 +1,19 @@
+[server]
+bind_addr = "127.0.0.1:8080"
+max_connections = 100
+
+[auth]
+api_keys = ["supersecretkey"]
+
+[queues]
+default_ttl_ms = 60000
+max_queue_depth = 1000
+overflow_policy = "drop_oldest"
+
+[wal]
+directory = "./wal"
+segment_size_bytes = 1048576
+flush_interval_ms = 5000
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
