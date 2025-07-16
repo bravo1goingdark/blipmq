@@ -1,12 +1,13 @@
 
 use blipmq::{config::load_config, logging::init_logging, run};
 use std::process;
+use blipmq::config::Config;
 
 #[tokio::main]
 async fn main() {
     init_logging();
 
-    let config = match load_config("blipmq.toml") {
+    let config : Config = match load_config("blipmq.toml") {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("[FATAL] Failed to load config: {e}");
