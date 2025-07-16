@@ -68,12 +68,13 @@
 
 ## 💡 Ideal Use Cases
 
-| Scenario                        | Why BlipMQ?                               |
-|---------------------------------|-------------------------------------------|
-| 🛰️ IoT or edge gateways          | Single-binary durability, low memory use   |
-| 🧪 Local testing/dev environments| Embedded broker with crash recovery        |
-| ⚙️ Internal microservice bus      | Fast pub/sub with no external dependencies |
-| 🧱 CI/CD pipelines               | Durable test event ingestion               |
+| Scenario                        | Why BlipMQ?                                           |
+|---------------------------------|-------------------------------------------------------|
+| 🛰️ IoT or edge gateways          | Single-binary durability, low memory use              |
+| 🧪 Local testing/dev environments| Embedded broker with crash recovery                   |
+| ⚙️ Internal microservice bus      | Fast pub/sub with no external dependencies            |
+| 🧱 CI/CD pipelines               | Durable test event ingestion                          |
+| 📜 Lightweight log ingestion     | Real-time, low-latency stream processing and storage  |
 
 ---
 
