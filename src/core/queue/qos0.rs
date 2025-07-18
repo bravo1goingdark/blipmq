@@ -10,7 +10,6 @@ pub struct Queue {
     name: String,
     sender: Sender<Arc<Message>>, // fast, async, non-blocking channel
 }
-
 impl Queue {
     /// Creates a new queue with a name and an associated message sender.
     ///
