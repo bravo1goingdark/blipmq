@@ -2,6 +2,7 @@ use crate::config::Config;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task;
+use crate::broker::client::handle_client;
 
 // entry point to start the broker
 // accepts a config object -> helps us avoid hardcoding values
@@ -28,8 +29,6 @@ pub async fn start_broker(config: Config) -> anyhow::Result<()> {
             }
 
         });
-
-        drop(stream); // drops the tcp connection
     }
     Ok(())
 }
