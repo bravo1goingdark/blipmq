@@ -1,62 +1,98 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::task;
 
 use crate::core::message::Message;
 use crate::core::queue::qos0::Queue as QoS0Queue;
+use crate::core::queue::QueueBehavior;
 use crate::core::subscriber::{Subscriber, SubscriberId};
+use crate::core::delivery_mode::DeliveryMode;
 
-/// Represents a topic to which subscribers can subscribe.
-/// Maintains a map of subscribers, each with an individual QoS0 queue.
+/// Alias for a topic name.
+pub type TopicName = String;
+
+/// A topic represents a named channel for message distribution.
+/// It handles multiple subscribers and delivers messages to all of them.
+#[derive(Debug)]
 pub struct Topic {
-    name: String,
-    subscribers: RwLock<HashMap<SubscriberId, Arc<QoS0Queue>>>,
+    name: TopicName,
+
+    /// Concurrent map of subscriber ID to their queue.
+    subscribers: DashMap<SubscriberId, Arc<dyn QueueBehavior + Send + Sync>>,
 }
 
 impl Topic {
-    /// Creates a new topic with the given name.
-    ///
-    /// # Arguments
-    /// * `name` - A string-like identifier for the topic (e.g., "chat/messages").
-    pub fn new(name: impl Into<String>) -> Self {
+    /// Creates a new topic with a name.
+    pub fn new(name: impl Into<TopicName>) -> Self {
         Self {
             name: name.into(),
-            subscribers: RwLock::new(HashMap::new()),
+            subscribers: DashMap::new(),
         }
     }
 
-    /// Returns the name of the topic.
-    pub fn name(&self) -> &str {
+    /// Returns the topic's name.
+    pub fn name(&self) -> &TopicName {
         &self.name
     }
 
-    /// Adds a subscriber to the topic and assigns a dedicated QoS0 queue.
+    /// Subscribes a new subscriber to this topic.
     ///
-    /// # Arguments
-    /// * `subscriber` - The subscriber object containing id and sender.
+    /// If the subscriber is disconnected (`sender == None`), it is ignored.
     pub async fn subscribe(&self, subscriber: Subscriber) {
-        let mut subs: RwLockWriteGuard<'_, _> = self.subscribers.write().await;
-        let queue = Arc::new(QoS0Queue::new(subscriber.id.clone(), subscriber.sender));
-        subs.insert(subscriber.id, queue);
+        if let Some(sender) = subscriber.sender() {
+            let queue: Arc<dyn QueueBehavior + Send + Sync> = Arc::new(QoS0Queue::new(
+                subscriber.id().clone(),
+                sender.clone(),
+            ));
+            self.subscribers.insert(subscriber.id().clone(), queue);
+        } else {
+            tracing::warn!(
+                target: "blipmq::topic",
+                subscriber_id = %subscriber.id(),
+                "Skipping subscription: subscriber is disconnected"
+            );
+        }
     }
 
-    /// Removes a subscriber from the topic.
-    ///
-    /// # Arguments
-    /// * `subscriber_id` - The identifier of the subscriber to remove.
+    /// Removes a subscriber by ID.
     pub async fn unsubscribe(&self, subscriber_id: &SubscriberId) {
-        let mut subs = self.subscribers.write().await;
-        subs.remove(subscriber_id);
+        self.subscribers.remove(subscriber_id);
     }
 
-    /// Publishes a message to all active subscribers' queues.
+    /// Publishes a message to all subscribers with ordered delivery (default).
+    pub async fn publish(&self, message: Arc<Message>) {
+        self.publish_with_mode(message, DeliveryMode::Ordered).await;
+    }
+
+    /// Publishes a message to all subscribers using the specified delivery mode.
     ///
-    /// # Arguments
-    /// * `message` - An Arc-wrapped message to deliver.
-    pub fn publish(&self, message: Arc<Message>) {
-        let subscribers = self.subscribers.blocking_read();
-        for queue in subscribers.values() {
-            queue.enqueue(message.clone());
+    /// - Ordered: enqueues sequentially (preserving order)
+    /// - Unordered: enqueues in parallel (order not guaranteed)
+    pub async fn publish_with_mode(&self, message: Arc<Message>, mode: DeliveryMode) {
+        match mode {
+            DeliveryMode::Ordered => {
+                for queue in self.subscribers.iter() {
+                    queue.value().enqueue(message.clone());
+                }
+            }
+            DeliveryMode::Unordered => {
+                let mut handles = Vec::with_capacity(self.subscribers.len());
+
+                for queue in self.subscribers.iter() {
+                    let msg_clone = message.clone();
+                    let queue_clone = queue.value().clone();
+
+                    let handle = task::spawn(async move {
+                        queue_clone.enqueue(msg_clone);
+                    });
+
+                    handles.push(handle);
+                }
+
+                for handle in handles {
+                    let _ = handle.await;
+                }
+            }
         }
     }
 }
