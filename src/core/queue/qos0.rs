@@ -1,47 +1,75 @@
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
+use crossbeam_queue::SegQueue;
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::warn;
 
 use crate::core::message::Message;
+use crate::core::queue::QueueBehavior;
 
-/// A lightweight, non-blocking queue for QoS 0 message delivery.
-/// Messages are dropped silently if the queue is full.
-#[derive(Debug, Clone)]
+/// A zero-copy, ultra-lightweight queue for QoS 0 (fire-and-forget) delivery.
+///
+///  Lock-free via `SegQueue`
+///
+///  Direct push into subscriber channel
+///
+///  Drops message if send fails (no retries)
+///
+///  Internal buffer for debug/dequeue inspection (not used for real delivery)
+#[derive(Debug)]
 pub struct Queue {
     name: String,
-    sender: Sender<Arc<Message>>, // fast, async, non-blocking channel
+    sender: UnboundedSender<Arc<Message>>,
+    buffer: Arc<SegQueue<Arc<Message>>>, // optional debug/dequeue tracking
 }
+
 impl Queue {
-    /// Creates a new queue with a name and an associated message sender.
+    /// Creates a new QoS 0 queue instance.
     ///
     /// # Arguments
-    ///
-    /// * `name` - A name for the queue (typically subscriber ID).
-    /// * `sender` - The Tokio mpsc sender used for message delivery.
-    pub fn new(name: impl Into<String>, sender: Sender<Arc<Message>>) -> Self {
+    /// - `name`: Queue name (typically the SubscriberId)
+    /// - `sender`: Channel to deliver messages to the subscriber
+    pub fn new(name: impl Into<String>, sender: UnboundedSender<Arc<Message>>) -> Self {
         Self {
             name: name.into(),
             sender,
+            buffer: Arc::new(SegQueue::new()),
         }
     }
+}
 
-    /// Attempts to enqueue a message.
+impl QueueBehavior for Queue {
+    /// Immediately attempts to send the message.
     ///
-    /// # Behavior
-    /// - Uses `try_send` to avoid blocking.
-    /// - If the queue is full or disconnected, the message is dropped.
-    /// - ⚠️ This follows **QoS 0**, so dropped messages are not retried.
-    pub fn enqueue(&self, message: Arc<Message>) {
-        if let Err(e) = self.sender.try_send(message) {
-            tracing::warn!(
+    /// If the receiver has dropped, the message is discarded.
+    /// Also pushes into the debug buffer (optional, non-critical).
+    fn enqueue(&self, message: Arc<Message>) {
+        if let Err(e) = self.sender.send(message.clone()) {
+            warn!(
+                target: "blipmq::queue::qos0",
                 queue = %self.name,
                 error = %e,
-                "QoS 0: Dropped message due to queue full or disconnected"
+                "QoS 0: Dropped message — receiver unavailable"
             );
         }
+
+        // Debug / metrics use only — does not affect delivery
+        self.buffer.push(message);
     }
 
-    /// Returns the name of the queue.
-    pub fn name(&self) -> &str {
+    /// Debug-only: pops a message from internal buffer.
+    ///
+    /// Has no impact on actual delivery path.
+    fn dequeue(&self) -> Option<Arc<Message>> {
+        self.buffer.pop()
+    }
+
+    /// Returns approximate size of the debug buffer.
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns queue name (typically subscriber ID).
+    fn name(&self) -> &str {
         &self.name
     }
 }
