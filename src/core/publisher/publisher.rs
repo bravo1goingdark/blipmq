@@ -1,44 +1,71 @@
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{warn, trace};
 
+use crate::core::delivery_mode::DeliveryMode;
 use crate::core::message::Message;
-use crate::core::topics::topic::{TopicName, TopicRegistry};
+use crate::core::topics::registry::TopicRegistry;
+use crate::core::topics::topic::TopicName;
 
-/// Responsible for publishing messages to topics using QoS 0 delivery.
+/// Configuration options for the `Publisher`.
+#[derive(Debug, Clone, Copy)]
+pub struct PublisherConfig {
+    /// Delivery mode used for all published messages.
+    pub delivery_mode: DeliveryMode,
+}
+
+impl Default for PublisherConfig {
+    fn default() -> Self {
+        Self {
+            delivery_mode: DeliveryMode::Ordered,
+        }
+    }
+}
+
+/// The `Publisher` is responsible for delivering messages to topics using QoS 0 (at-most-once).
 ///
-/// - If the topic does not exist, the message is dropped.
-/// - If delivery fails, it is also silently ignored (as per QoS 0).
+/// # Characteristics
+/// - Fire-and-forget semantics (no retries or acknowledgments).
+/// - Messages are dropped if the topic does not exist.
+/// - Delivery mode (ordered or unordered) is applied globally.
 pub struct Publisher {
     topic_registry: Arc<TopicRegistry>,
+    delivery_mode: DeliveryMode,
 }
 
 impl Publisher {
-    /// Creates a new publisher with access to the shared topic registry.
-    ///
-    /// # Arguments
-    /// * `topic_registry` - A thread-safe reference to the topic registry.
-    pub fn new(topic_registry: Arc<TopicRegistry>) -> Self {
-        Self { topic_registry }
+    /// Creates a new `Publisher` instance with access to the shared `TopicRegistry`
+    /// and the specified `PublisherConfig`.
+    #[inline]
+    pub fn new(topic_registry: Arc<TopicRegistry>, config: PublisherConfig) -> Self {
+        Self {
+            topic_registry,
+            delivery_mode: config.delivery_mode,
+        }
     }
 
-    /// Publishes a message to the specified topic.
+    /// Publishes a message to the given topic using the configured QoS 0 delivery mode.
     ///
-    /// # Arguments
-    /// * `topic` - The name of the topic to publish to.
-    /// * `message` - The message to be published.
-    ///
-    /// # QoS
-    /// QoS 0: fire-and-forget. Failures are silently ignored.
-    pub fn publish(&self, topic: &TopicName, message: Arc<Message>) {
-        match self.topic_registry.get_topic(topic) {
-            Some(topic_ref) => {
-                debug!(target: "publisher", topic = ?topic, "Publishing message");
-                topic_ref.publish(message);
-            }
-            None => {
-                // QoS 0 : silently ignore
-                warn!(target: "publisher", topic = ?topic, "Topic not found. Message dropped.");
-            }
+    /// - If the topic is not found, the message is dropped.
+    /// - No delivery confirmation is provided (QoS 0).
+    pub async fn publish(&self, topic: &TopicName, message: Arc<Message>) {
+        if let Some(topic_ref) = self.topic_registry.get_topic(topic) {
+            topic_ref
+                .publish_with_mode(message, self.delivery_mode)
+                .await;
+
+            #[cfg(debug_assertions)]
+            trace!(
+                target: "blipmq::publisher",
+                topic = ?topic,
+                delivery_mode = ?self.delivery_mode,
+                "Publish complete (QoS 0)"
+            );
+        } else {
+            warn!(
+                target: "blipmq::publisher",
+                topic = ?topic,
+                "Topic not found. Dropping message."
+            );
         }
     }
 }
