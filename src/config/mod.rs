@@ -78,15 +78,12 @@ pub struct MetricsConfig {
 pub struct DeliveryConfig {
     /// Maximum number of messages to coalesce per flush.
     pub max_batch: usize,
-    /// Polling interval for subscriber flush (if using polling mode), in milliseconds.
-    pub flush_interval_ms: u64,
 }
 
 impl Default for DeliveryConfig {
     fn default() -> Self {
         DeliveryConfig {
             max_batch: 64,
-            flush_interval_ms: 5,
         }
     }
 }
