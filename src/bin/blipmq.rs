@@ -48,10 +48,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Command::Start { config } => {
-            let cfg_path : String = std::env::var("BLIPMQ_CONFIG").unwrap_or(config);
-            let cfg : Config = load_config(&cfg_path)?;
+            let cfg_path: String = std::env::var("BLIPMQ_CONFIG").unwrap_or(config);
+            let cfg: Config = load_config(&cfg_path)?;
             println!("📡 BlipMQ broker listening on {}", cfg.server.bind_addr);
-            start_broker(&cfg.server.bind_addr).await?;
+            // --- CALL WITHOUT ARGUMENTS ---
+            start_broker().await?;
         }
         Command::Connect { addr } => repl(addr).await?,
     }
@@ -60,9 +61,6 @@ async fn main() -> anyhow::Result<()> {
 
 // ───────────────────────────────────────────────────────────
 // Interactive REPL shell
-// ───────────────────────────────────────────────────────────
-// ───────────────────────────────────────────────────────────
-// Interactive REPL shell (real-time printing)
 // ───────────────────────────────────────────────────────────
 async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
     // Rusty line editor for history & prompt
