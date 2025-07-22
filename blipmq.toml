@@ -17,3 +17,7 @@ flush_interval_ms = 5000
 
 [metrics]
 bind_addr = "127.0.0.1:9090"
+
+[delivery]
+# Maximum number of messages to coalesce per subscriber flush
+max_batch = 64

@@ -2,31 +2,14 @@
 //!
 //! Provides a convenient command-line interface for publishing, subscribing, and unsubscribing
 //! to topics on a running BlipMQ instance.
-//!
-//! All commands are routed through a single entrypoint (`blipmq-cli`).
-//!
-//! # Usage Examples
-//!
-//! Publish a message:
-//! ```bash
-//! blipmq-cli --addr 127.0.0.1:6379 pub mytopic "hello world"
-//! ```
-//!
-//! Subscribe to a topic:
-//! ```bash
-//! blipmq-cli --addr 127.0.0.1:6379 sub mytopic
-//! ```
-//!
-//! Unsubscribe from a topic:
-//! ```bash
-//! blipmq-cli --addr 127.0.0.1:6379 unsub mytopic
-//! ```
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::info;
+
+use blipmq::core::message::decode_message;
 
 /// Command-line interface for BlipMQ.
 #[derive(Debug, Parser)]
@@ -37,7 +20,8 @@ use tracing::info;
 )]
 pub struct Cli {
     /// Address of the BlipMQ broker (e.g. 127.0.0.1:6379)
-    #[arg(short, long, default_value = "127.0.0.1:8080")]    pub addr: SocketAddr,
+    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    pub addr: SocketAddr,
 
     #[command(subcommand)]
     pub command: Command,
@@ -70,7 +54,6 @@ pub enum Command {
 /// Entrypoint: parse CLI args and dispatch commands.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing subscriber for logging
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -79,11 +62,13 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", cli.addr, e))?;
 
     let (read_half, mut write_half) = stream.split();
-    let mut reader = BufReader::new(read_half).lines();
+    let reader = BufReader::new(read_half).lines();
 
-    // Format and send the request line
+    // Send request line
     let request = match &cli.command {
-        Command::Pub { topic, message } => format!("PUB {} {}\n", topic, message),
+        Command::Pub { topic, message } => {
+            format!("PUB {} {}\n", topic, message)
+        }
         Command::Sub { topic } => format!("SUB {}\n", topic),
         Command::Unsub { topic } => format!("UNSUB {}\n", topic),
     };
@@ -91,13 +76,43 @@ async fn main() -> anyhow::Result<()> {
     write_half.write_all(request.as_bytes()).await?;
     info!("Sent request: {}", request.trim());
 
-    // If subscribing, continuously read messages from broker
+    // Handle subscription with binary Protobuf decoding
     if matches!(cli.command, Command::Sub { .. }) {
-        while let Ok(Some(line)) = reader.next_line().await {
-            println!("{}", line);
+        let mut lines = reader;
+
+        // ✅ Step 1: Read and print OK SUB line
+        if let Ok(Some(line)) = lines.next_line().await {
+            println!("> {}", line.trim());
+        } else {
+            println!("> Failed to receive subscription confirmation");
+            return Ok(());
         }
+
+        // ✅ Step 2: Switch to raw binary mode
+        let mut raw_reader = lines.into_inner();
+
+        loop {
+            let mut len_buf = [0u8; 4];
+            if raw_reader.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+            let mut msg_buf = vec![0u8; msg_len];
+            if raw_reader.read_exact(&mut msg_buf).await.is_err() {
+                break;
+            }
+
+            if let Ok(message) = decode_message(&msg_buf) {
+                let payload = String::from_utf8_lossy(&message.payload);
+                println!("{} {} {}", message.id, payload, message.timestamp);
+            }
+        }
+
         info!("Subscription ended");
     }
+
+
 
     Ok(())
 }

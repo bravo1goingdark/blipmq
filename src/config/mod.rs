@@ -27,7 +27,6 @@
 //!
 //! [delivery]
 //! max_batch = 32             # maximum messages per flush
-//! flush_interval_ms = 10     # subscriber flush polling interval, in ms
 //! ```
 //! # Usage
 //! ```rust

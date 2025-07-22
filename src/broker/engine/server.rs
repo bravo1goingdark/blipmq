@@ -4,142 +4,142 @@
 //! with the core pub/sub engine (TopicRegistry). Implements PRODUCE/SUBSCRIBE/UNSUBSCRIBE
 //! operations and streams messages back to subscribed clients.
 
-use crate::core::topics::Topic;
-use crate::{
-    config::load_config,
-    core::{
-        message::Message,
-        subscriber::{Subscriber, SubscriberId},
-        topics::TopicRegistry,
-    },
-    Config,
+use crate::core::{
+    message::{new_message, encode_message},
+    subscriber::{Subscriber, SubscriberId},
+    topics::TopicRegistry,
 };
+use tokio::time::{timeout, Duration};
 use bytes::BytesMut;
-use std::borrow::Cow;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::mpsc::unbounded_channel,
     task,
 };
 use tracing::{debug, error, info};
 
 /// Starts the BlipMQ broker server.
-///
-/// Loads `blipmq.toml`, binds to `server.bind_addr`, and spawns a handler task per connection.
-pub async fn serve() -> anyhow::Result<()> {
-    // Load configuration
-    let cfg: Config = load_config("blipmq.toml")?;
-    info!("Starting BlipMQ broker on {}", cfg.server.bind_addr);
+pub async fn serve(bind_addr: &str, max_batch: usize) -> anyhow::Result<()> {
+    info!("Starting BlipMQ broker on {}", bind_addr);
 
-    let listener: TcpListener = TcpListener::bind(&cfg.server.bind_addr).await?;
-    let registry: Arc<TopicRegistry> = Arc::new(TopicRegistry::new());
+    let listener = TcpListener::bind(bind_addr).await?;
+    let registry = Arc::new(TopicRegistry::new());
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let registry: Arc<TopicRegistry> = Arc::clone(&registry);
-        let max_batch: usize = cfg.delivery.max_batch;
+        let registry = Arc::clone(&registry);
         info!("Client connected: {}", peer);
 
-        task::spawn(async move {
-            if let Err(err) = handle_client(socket, registry, max_batch).await {
-                error!("Error handling client {}: {:?}", peer, err);
-            } else {
-                debug!("Client {} disconnected", peer);
-            }
-        });
+        task::spawn(handle_client(socket, registry, max_batch));
     }
 }
 
-/// Handles an individual client connection.
-///
-/// Supports:
-/// - `PUB <topic> <message>`
-/// - `SUB <topic>`
-/// - `UNSUB <topic>`
-///
-/// For subscribers, messages are pushed back as:
-/// `MSG <id> <payload>\n`, batched up to `max_batch`.
 async fn handle_client(
     stream: TcpStream,
     registry: Arc<TopicRegistry>,
     max_batch: usize,
 ) -> anyhow::Result<()> {
-    let peer: SocketAddr = stream.peer_addr()?;
+    let peer = stream.peer_addr()?;
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let reader = BufReader::new(read_half);
+    let mut lines = reader.lines();
 
-    // Channel for this subscriber
-    let (tx, mut rx) = mpsc::unbounded_channel::<Arc<Message>>();
-    let subscriber_id: SubscriberId = SubscriberId::from(peer.to_string());
-    let subscriber: Subscriber = Subscriber::new(subscriber_id.clone(), tx);
+    let subscriber_id = SubscriberId::from(peer.to_string());
+    let (subscriber, cb_rx) = Subscriber::new_with_receiver(subscriber_id.clone());
 
-    // Track topics to unsubscribe on disconnect
-    let mut subscriptions: Vec<String> = Vec::new();
+    // Bridge crossbeam -> async channel
+    let (async_tx, mut async_rx) = unbounded_channel();
+    task::spawn_blocking(move || {
+        for msg in cb_rx.iter() {
+            if async_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut subscriptions = Vec::new();
 
     loop {
         tokio::select! {
-            // Client command
-            line = lines.next_line() => {
-                let line : String = match line? {
+            line_result = lines.next_line() => {
+                let line = match line_result? {
                     Some(l) => l,
                     None => break,
                 };
 
-                let parts: Vec<_> = line.trim().splitn(3, ' ').collect();
+                let parts: Vec<String> = line.trim().splitn(3, ' ').map(|s| s.to_string()).collect();
+
                 match parts.as_slice() {
-                    ["PUB", topic, body] => {
-                        let msg : Arc<Message> = Arc::new(Message::new(body.as_bytes().to_vec()));
-                        if let Some(t) = registry.get_topic(&topic.to_string()) {
+                    [cmd, topic, body] if cmd == "PUB" => {
+                        let topic = topic.clone();
+                        let msg = Arc::new(new_message(body.clone().into_bytes()));
+                        if let Some(t) = registry.get_topic(&topic) {
                             t.publish(msg).await;
+                            write_half.write_all(b"OK PUB\n").await?;
+                            write_half.flush().await?;
                             debug!("Published to {}", topic);
                         } else {
+                            write_half.write_all(b"ERR NO SUCH TOPIC\n").await?;
+                            write_half.flush().await?;
                             debug!("Publish to unknown topic: {}", topic);
                         }
                     }
-                    ["SUB", topic] => {
-                        let topic_obj : Arc<Topic> = registry.create_or_get_topic(&topic.to_string());
+                    [cmd, topic] if cmd == "SUB" => {
+                        let topic = topic.clone();
+                        let topic_obj = registry.create_or_get_topic(&topic);
                         topic_obj.subscribe(subscriber.clone()).await;
-                        subscriptions.push(topic.to_string());
-                        write_half
-                            .write_all(format!("OK SUB {}\n", topic).as_bytes())
-                            .await?;
+                        subscriptions.push(topic.clone());
+                        write_half.write_all(format!("OK SUB {}\n", topic).as_bytes()).await?;
+                        write_half.flush().await?;
                         debug!("{} subscribed to {}", subscriber_id, topic);
                     }
-                    ["UNSUB", topic] => {
-                        if let Some(t) = registry.get_topic(&topic.to_string()) {
+                    [cmd, topic] if cmd == "UNSUB" => {
+                        let topic = topic.clone();
+                        if let Some(t) = registry.get_topic(&topic) {
                             t.unsubscribe(&subscriber_id).await;
-                            write_half
-                                .write_all(format!("OK UNSUB {}\n", topic).as_bytes())
-                                .await?;
+                            write_half.write_all(format!("OK UNSUB {}\n", topic).as_bytes()).await?;
+                            write_half.flush().await?;
                             debug!("{} unsubscribed from {}", subscriber_id, topic);
+                        } else {
+                            write_half.write_all(b"ERR NO SUCH TOPIC\n").await?;
+                            write_half.flush().await?;
                         }
                     }
-                    cmd => {
-                        write_half
-                            .write_all(format!("ERR UNKNOWN COMMAND: {:?}\n", cmd).as_bytes())
-                            .await?;
-                        debug!("Unknown command from {}: {:?}", subscriber_id, cmd);
+                    [cmd] if cmd == "QUIT" || cmd == "EXIT" => {
+                        write_half.write_all(b"BYE\n").await?;
+                        break;
+                    }
+                    _ => {
+                        let err_msg = format!("ERR UNKNOWN COMMAND: {}\n", line.trim());
+                        write_half.write_all(err_msg.as_bytes()).await?;
+                        write_half.flush().await?;
+                        debug!("Unknown command from {}: {}", subscriber_id, line.trim());
                     }
                 }
             }
 
-            // Batched subscriber flush
-            Some(msg) = rx.recv() => {
-                let mut buffer : BytesMut = BytesMut::with_capacity(4096);
-                let payload: Cow<str> = String::from_utf8_lossy(&msg.payload);
-                buffer.extend_from_slice(format!("MSG {} {}\n", msg.id, payload).as_bytes());
+            Some(msg) = async_rx.recv() => {
+                let mut buffer = BytesMut::with_capacity(4096);
 
-                let mut count : usize = 1;
-                while let Ok(next_msg) = rx.try_recv() {
-                    if count >= max_batch {
-                        break;
+                let encoded = encode_message(&msg);
+                let len_prefix = (encoded.len() as u32).to_be_bytes();
+                buffer.extend_from_slice(&len_prefix);
+                buffer.extend_from_slice(&encoded);
+
+                let mut count = 1;
+                while count < max_batch {
+                    match timeout(Duration::from_millis(1), async_rx.recv()).await {
+                        Ok(Some(next_msg)) => {
+                            let encoded = encode_message(&next_msg);
+                            let len_prefix = (encoded.len() as u32).to_be_bytes();
+                            buffer.extend_from_slice(&len_prefix);
+                            buffer.extend_from_slice(&encoded);
+                            count += 1;
+                        }
+                        Ok(None) | Err(_) => break,
                     }
-                    let payload: Cow<str> = String::from_utf8_lossy(&next_msg.payload);
-                    buffer.extend_from_slice(format!("MSG {} {}\n", next_msg.id, payload).as_bytes());
-                    count += 1;
                 }
 
                 if let Err(err) = write_half.write_all(&buffer).await {
@@ -150,7 +150,6 @@ async fn handle_client(
         }
     }
 
-    // Unsubscribe on disconnect
     for topic in subscriptions {
         if let Some(t) = registry.get_topic(&topic) {
             t.unsubscribe(&subscriber_id).await;

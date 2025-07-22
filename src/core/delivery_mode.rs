@@ -3,6 +3,4 @@
 pub enum DeliveryMode {
     /// Guarantees in-order delivery (default).
     Ordered,
-    /// Allows parallel fan-out; breaks ordering but boosts throughput.
-    Unordered,
 }

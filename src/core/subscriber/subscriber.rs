@@ -1,12 +1,11 @@
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::core::message::Message;
 
 /// Unique identifier for a subscriber.
-/// Used for routing messages to the correct subscriber queues.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubscriberId(pub String);
 
@@ -47,69 +46,80 @@ impl Deref for SubscriberId {
         &self.0
     }
 }
+impl Clone for Subscriber {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            sender: self.sender.clone(),
+            receiver: self.receiver.clone(),
+        }
+    }
+}
 
 /// Represents a connected subscriber to a topic.
-///
-/// Each subscriber has:
-/// - a unique ID (used for registration and routing),
-/// - an optional sender to deliver messages via a channel.
 #[derive(Debug)]
 pub struct Subscriber {
     id: SubscriberId,
-    sender: Option<UnboundedSender<Arc<Message>>>,
+    sender: Sender<Arc<Message>>,
+    receiver: Receiver<Arc<Message>>,
 }
 
 impl Subscriber {
-    /// Creates a new subscriber instance with the given ID and message channel.
+    /// Create a new subscriber with a fresh unbounded crossbeam channel.
     #[inline(always)]
-    pub fn new(id: SubscriberId, sender: UnboundedSender<Arc<Message>>) -> Self {
+    pub fn new(id: SubscriberId) -> Self {
+        let (tx, rx) = unbounded();
         Self {
             id,
-            sender: Some(sender),
+            sender: tx,
+            receiver: rx,
         }
     }
 
-    /// Returns a reference to the subscriber's ID.
+    /// Use bounded channel version
+    pub fn new_bounded(id: SubscriberId, capacity: usize) -> Self {
+        let (tx, rx) = bounded(capacity);
+        Self {
+            id,
+            sender: tx,
+            receiver: rx,
+        }
+    }
+
     #[inline(always)]
     pub fn id(&self) -> &SubscriberId {
         &self.id
     }
 
-    /// Returns a reference to the sender channel, if connected.
     #[inline(always)]
-    pub fn sender(&self) -> Option<&UnboundedSender<Arc<Message>>> {
-        self.sender.as_ref()
+    pub fn sender(&self) -> &Sender<Arc<Message>> {
+        &self.sender
     }
 
-    /// Replaces the internal sender with a new one.
     #[inline(always)]
-    pub fn set_sender(&mut self, new_sender: UnboundedSender<Arc<Message>>) {
-        self.sender = Some(new_sender);
+    pub fn receiver(&self) -> &Receiver<Arc<Message>> {
+        &self.receiver
     }
 
-    /// Returns whether the subscriber is still connected.
+    /// Consumes and returns the receiver (for async bridge)
     #[inline(always)]
-    pub fn is_connected(&self) -> bool {
-        self.sender
-            .as_ref()
-            .map(|s| !s.is_closed())
-            .unwrap_or(false)
+    pub fn take_receiver(self) -> Receiver<Arc<Message>> {
+        self.receiver
     }
 
-    /// Disconnects the subscriber by dropping its sender.
-    #[inline(always)]
-    pub fn disconnect(&mut self) {
-        self.sender = None;
-    }
-
-    /// Tries to send a message to the subscriber.
-    /// Returns Ok(()) if successful, Err(()) otherwise.
     #[inline(always)]
     pub fn try_send(&self, msg: Arc<Message>) -> Result<(), ()> {
-        if let Some(sender) = &self.sender {
-            sender.send(msg).map_err(|_| ())
-        } else {
-            Err(())
-        }
+        self.sender.try_send(msg).map_err(|_| ())
+    }
+
+    // Creates a subscriber and returns the receiver separately
+    pub fn new_with_receiver(id: SubscriberId) -> (Self, Receiver<Arc<Message>>) {
+        let (tx, rx) = unbounded();
+        let subscriber = Subscriber {
+            id,
+            sender: tx.clone(),
+            receiver: rx.clone(), // used once for internal tracking
+        };
+        (subscriber, rx)
     }
 }

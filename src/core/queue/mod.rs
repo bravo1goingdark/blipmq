@@ -28,9 +28,10 @@ use crate::core::message::Message;
 /// - Clone-efficient (Arc<Message> based)
 pub trait QueueBehavior: Send + Sync + Debug {
     /// Enqueue a message into the queue (fan-in).
-    fn enqueue(&self, message: Arc<Message>);
+    /// Returns Err if the subscriber is disconnected or the queue is closed.
+    fn enqueue(&self, message: Arc<Message>) -> Result<(), ()>;
 
-    /// Attempt to dequeue a message (fan-out).
+    /// Attempt to dequeue a message (fan-out). Not used in QoS 0.
     fn dequeue(&self) -> Option<Arc<Message>>;
 
     /// Return the current number of messages in the queue.

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use dashmap::DashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::core::topics::topic::{Topic, TopicName};
@@ -40,7 +40,10 @@ impl TopicRegistry {
 
     /// Lists all topic names currently registered.
     pub fn list_topics(&self) -> Vec<TopicName> {
-        self.topics.iter().map(|entry| entry.key().clone()).collect()
+        self.topics
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Removes a topic by name.
