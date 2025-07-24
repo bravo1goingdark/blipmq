@@ -1,7 +1,5 @@
-
-
 <p align="center">
-  <img src="./assets/readme-banner.png" alt="BlipMQ Logo" width="100%" />
+  <img src="./assets/readme-banner.png" alt="BlipMQ Logo" width="1200" />
 </p>
 
 <p align="center">
@@ -11,6 +9,8 @@
 <p align="center">
   ⚡ <i>“Kafka-level durability. MQTT-level simplicity. NATS-level performance — all in one binary.”</i>
 </p>
+
+## 📢 Follow Us
 
 <p align="center">
   <a href="https://blipmq.dev">
