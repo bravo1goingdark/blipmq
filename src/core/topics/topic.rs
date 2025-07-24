@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 
 use crate::core::delivery_mode::DeliveryMode;
+use crate::core::error::BlipError;
 use crate::core::message::Message;
 use crate::core::queue::qos0::Queue as QoS0Queue;
 use crate::core::queue::QueueBehavior;
@@ -51,8 +52,13 @@ impl Topic {
                 let mut disconnected = vec![];
 
                 for entry in self.subscribers.iter() {
-                    if entry.value().enqueue(message.clone()).is_err() {
-                        disconnected.push(entry.key().clone());
+                    if let Err(err) = entry.value().enqueue(message.clone()) {
+                        match err {
+                            BlipError::Disconnected | BlipError::QueueClosed => {
+                                disconnected.push(entry.key().clone());
+                            }
+                            _ => {}
+                        }
                     }
                 }
 
