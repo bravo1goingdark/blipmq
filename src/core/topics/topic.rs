@@ -1,6 +1,5 @@
-use crossbeam_channel::bounded;
 use dashmap::DashMap;
-use std::{sync::Arc, thread};
+use std::sync::Arc;
 
 use crate::core::delivery_mode::DeliveryMode;
 use crate::core::message::Message;
@@ -18,27 +17,7 @@ pub struct Topic {
 
 impl Topic {
     pub fn new(name: impl Into<TopicName>) -> Self {
-        let (_tx, rx) = bounded::<(
-            SubscriberId,
-            Arc<dyn QueueBehavior + Send + Sync>,
-            Arc<Message>,
-        )>(4096);
-
         let subscribers = DashMap::new();
-        let subs_handle = subscribers.clone();
-
-        let num_workers = num_cpus::get();
-        for _ in 0..num_workers {
-            let rx = rx.clone();
-            let subs = subs_handle.clone();
-            thread::spawn(move || {
-                for (id, queue, msg) in rx.iter() {
-                    if queue.enqueue(msg).is_err() {
-                        subs.remove(&id);
-                    }
-                }
-            });
-        }
 
         Self {
             name: name.into(),
