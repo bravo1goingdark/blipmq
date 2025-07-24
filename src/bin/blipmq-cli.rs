@@ -1,7 +1,7 @@
 //! CLI client for BlipMQ broker.
 //!
-//! Provides a convenient command-line interface for publishing, subscribing, and unsubscribing
-//! to topics on a running BlipMQ instance.
+//! Provides a convenient command-line interface for publishing, subscribing, and
+//! unsubscribing from topics on a running BlipMQ instance.
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;

@@ -60,6 +60,7 @@ async fn handle_client(
     });
 
     let mut subscriptions = Vec::new();
+    let mut buffer = BytesMut::with_capacity(4096);
 
     loop {
         tokio::select! {
@@ -91,7 +92,7 @@ async fn handle_client(
                         let topic_obj = registry.create_or_get_topic(&topic);
                         topic_obj.subscribe(subscriber.clone()).await;
                         subscriptions.push(topic.clone());
-                        write_half.write_all(format!("OK SUB {}\n", topic).as_bytes()).await?;
+                        write_half.write_all(format!("OK SUB {topic}\n").as_bytes()).await?;
                         write_half.flush().await?;
                         debug!("{} subscribed to {}", subscriber_id, topic);
                     }
@@ -99,7 +100,7 @@ async fn handle_client(
                         let topic = topic.clone();
                         if let Some(t) = registry.get_topic(&topic) {
                             t.unsubscribe(&subscriber_id).await;
-                            write_half.write_all(format!("OK UNSUB {}\n", topic).as_bytes()).await?;
+                            write_half.write_all(format!("OK UNSUB {topic}\n").as_bytes()).await?;
                             write_half.flush().await?;
                             debug!("{} unsubscribed from {}", subscriber_id, topic);
                         } else {
@@ -121,7 +122,7 @@ async fn handle_client(
             }
 
             Some(msg) = async_rx.recv() => {
-                let mut buffer = BytesMut::with_capacity(4096);
+                buffer.clear();
 
                 let encoded = encode_message(&msg);
                 let len_prefix = (encoded.len() as u32).to_be_bytes();
