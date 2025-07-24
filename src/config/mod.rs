@@ -81,9 +81,7 @@ pub struct DeliveryConfig {
 
 impl Default for DeliveryConfig {
     fn default() -> Self {
-        DeliveryConfig {
-            max_batch: 64,
-        }
+        DeliveryConfig { max_batch: 64 }
     }
 }
 

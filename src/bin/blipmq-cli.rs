@@ -112,7 +112,5 @@ async fn main() -> anyhow::Result<()> {
         info!("Subscription ended");
     }
 
-
-
     Ok(())
 }

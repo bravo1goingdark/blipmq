@@ -7,8 +7,8 @@
 //  > sub chat
 //  > [msg-id] hello @ timestamp
 
-use blipmq::{load_config, start_broker, Config};
 use blipmq::core::message::decode_message;
+use blipmq::{load_config, start_broker, Config};
 
 use clap::{Parser, Subcommand};
 use rustyline::history::DefaultHistory;
@@ -118,7 +118,8 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
             ["help"] => println!("pub <topic> <msg> | sub <topic> | unsub <topic> | exit"),
             ["exit" | "quit"] => break,
             ["pub", topic, rest @ ..] => {
-                w.write_all(format!("PUB {topic} {}\n", rest.join(" ")).as_bytes()).await?;
+                w.write_all(format!("PUB {topic} {}\n", rest.join(" ")).as_bytes())
+                    .await?;
                 w.flush().await?;
             }
             ["sub", topic] => {

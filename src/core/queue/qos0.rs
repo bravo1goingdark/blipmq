@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crossbeam_channel::Sender;
+use std::sync::Arc;
 
 use crate::core::message::Message;
 use crate::core::queue::QueueBehavior;

@@ -1,6 +1,6 @@
+use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use std::sync::Arc;
-use crossbeam_channel::Sender;
 
 use crate::core::message::Message;
 use crate::core::queue::{qos0, QueueBehavior};

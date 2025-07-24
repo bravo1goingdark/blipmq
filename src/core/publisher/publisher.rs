@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use tracing::warn;
 
-
 use tracing::trace;
 
 use crate::core::delivery_mode::DeliveryMode;
@@ -52,7 +51,9 @@ impl Publisher {
     /// - No delivery confirmation is provided (QoS 0).
     pub async fn publish(&self, topic: &TopicName, message: Arc<Message>) {
         if let Some(topic_ref) = self.topic_registry.get_topic(topic) {
-            topic_ref.publish_with_mode(message, self.delivery_mode).await;
+            topic_ref
+                .publish_with_mode(message, self.delivery_mode)
+                .await;
 
             trace!(
                 target: "blipmq::publisher",

@@ -5,13 +5,13 @@
 //! operations and streams messages back to subscribed clients.
 
 use crate::core::{
-    message::{new_message, encode_message},
+    message::{encode_message, new_message},
     subscriber::{Subscriber, SubscriberId},
     topics::TopicRegistry,
 };
-use tokio::time::{timeout, Duration};
 use bytes::BytesMut;
 use std::sync::Arc;
+use tokio::time::{timeout, Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
