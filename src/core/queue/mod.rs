@@ -16,8 +16,8 @@ pub use manager::QueueManager;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::core::message::Message;
 use crate::core::error::BlipError;
+use crate::core::message::Message;
 
 /// Trait representing the common interface for all queue implementations.
 ///
