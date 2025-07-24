@@ -30,9 +30,12 @@
 //! ```
 //! # Usage
 //! ```rust
-//! let cfg = blipmq::config::load_config("./blipmq.toml")?;
-//! println!("Broker listening on {}", cfg.server.bind_addr);
-//! println!("Delivery max_batch = {}", cfg.delivery.max_batch);
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let cfg = blipmq::config::load_config("./blipmq.toml")?;
+//!     println!("Broker listening on {}", cfg.server.bind_addr);
+//!     println!("Delivery max_batch = {}", cfg.delivery.max_batch);
+//!     Ok(())
+//! }
 //! ```
 
 use serde::Deserialize;
