@@ -3,6 +3,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use crate::core::error::BlipError;
 use crate::core::message::Message;
 
 /// Unique identifier for a subscriber.
@@ -108,8 +109,11 @@ impl Subscriber {
     }
 
     #[inline(always)]
-    pub fn try_send(&self, msg: Arc<Message>) -> Result<(), ()> {
-        self.sender.try_send(msg).map_err(|_| ())
+    pub fn try_send(&self, msg: Arc<Message>) -> Result<(), BlipError> {
+        self.sender.try_send(msg).map_err(|e| match e {
+            crossbeam_channel::TrySendError::Full(_) => BlipError::QueueFull,
+            crossbeam_channel::TrySendError::Disconnected(_) => BlipError::Disconnected,
+        })
     }
 
     // Creates a subscriber and returns the receiver separately
