@@ -1,36 +1,4 @@
-<p align="center">
-  <img src="./assets/readme-banner.png" alt="BlipMQ Logo" width="1200" />
-</p>
 
-## 📢 Follow Us
-
-<p align="center">
-  <a href="https://blipmq.dev">
-    <img src="https://img.shields.io/badge/Website-blipmq.dev-0A0A0A?style=flat&logo=google-chrome&logoColor=white" alt="Website" />
-  </a>
-  <a href="https://x.com/blipmq">
-    <img src="https://img.shields.io/badge/Twitter-@blipmq-1DA1F2?style=flat&logo=twitter&logoColor=white" alt="Twitter" />
-  </a>
-  <a href="https://linkedin.com/company/blipmq">
-    <img src="https://img.shields.io/badge/LinkedIn-blipmq-blue?style=flat&logo=linkedin&logoColor=white" alt="LinkedIn" />
-  </a>
-  <a href="https://www.instagram.com/blipmq">
-    <img src="https://img.shields.io/badge/Instagram-@blipmq-E4405F?style=flat&logo=instagram&logoColor=white" alt="Instagram" />
-  </a>
-</p>
-
-
-
-
-
-
-<p align="center">
-  <b>BlipMQ</b> is an ultra-lightweight, fault-tolerant message queue written in Rust — built for edge, embedded, and developer-first environments.
-</p>
-
-<p align="center">
-  ⚡ <i>“Kafka-level durability. MQTT-level simplicity. NATS-level performance — all in one binary.”</i>
-</p>
 
 <p align="center">
   <img src="./assets/readme-banner.png" alt="BlipMQ Logo" width="100%" />
