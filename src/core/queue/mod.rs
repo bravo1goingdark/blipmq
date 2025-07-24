@@ -17,6 +17,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::core::message::Message;
+use crate::core::error::BlipError;
 
 /// Trait representing the common interface for all queue implementations.
 ///
@@ -29,13 +30,16 @@ use crate::core::message::Message;
 pub trait QueueBehavior: Send + Sync + Debug {
     /// Enqueue a message into the queue (fan-in).
     /// Returns Err if the subscriber is disconnected or the queue is closed.
-    fn enqueue(&self, message: Arc<Message>) -> Result<(), ()>;
+    fn enqueue(&self, message: Arc<Message>) -> Result<(), BlipError>;
 
     /// Attempt to dequeue a message (fan-out). Not used in QoS 0.
     fn dequeue(&self) -> Option<Arc<Message>>;
 
     /// Return the current number of messages in the queue.
     fn len(&self) -> usize;
+
+    /// Return true if the current queue is empty
+    fn is_empty(&self) -> bool;
 
     /// Return the queue’s identifier (usually subscriber ID).
     fn name(&self) -> &str;

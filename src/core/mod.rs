@@ -4,3 +4,4 @@ pub mod publisher;
 pub mod queue;
 pub mod subscriber;
 pub mod topics;
+pub mod error;
