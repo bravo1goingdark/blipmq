@@ -53,7 +53,13 @@ async fn main() -> anyhow::Result<()> {
             let cfg_path: String = std::env::var("BLIPMQ_CONFIG").unwrap_or(config);
             let cfg: Config = load_config(&cfg_path)?;
             println!("📡 BlipMQ broker listening on {}", cfg.server.bind_addr);
-            start_broker(&cfg.server.bind_addr, cfg.delivery.max_batch).await?;
+            start_broker(
+                &cfg.server.bind_addr,
+                cfg.delivery.max_batch,
+                cfg.queues.default_ttl_ms,
+                cfg.queues.max_queue_depth,
+            )
+                .await?;
         }
         Command::Connect { addr } => repl(addr).await?,
     }
