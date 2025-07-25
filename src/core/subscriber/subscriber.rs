@@ -103,4 +103,11 @@ impl Subscriber {
     pub fn new_with_receiver(id: SubscriberId) -> (Self, Receiver<Arc<Message>>) {
         Self::new(id)
     }
+    /// Creates a subscriber with a custom queue capacity and returns the receiver.
+    pub fn new_with_receiver_capacity(
+        id: SubscriberId,
+        capacity: usize,
+    ) -> (Self, Receiver<Arc<Message>>) {
+        Self::with_capacity(id, capacity)
+    }
 }
