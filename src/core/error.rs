@@ -20,7 +20,7 @@ impl fmt::Display for BlipError {
             BlipError::QueueFull => write!(f, "Queue is full"),
             BlipError::InvalidSubscriber => write!(f, "Invalid subscriber"),
             BlipError::Timeout => write!(f, "Operation timed out"),
-            BlipError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            BlipError::Internal(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }
