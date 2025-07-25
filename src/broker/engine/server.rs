@@ -18,11 +18,14 @@ use tokio::{
     task,
 };
 use tracing::{debug, error, info};
-/// Maximum age of a message (in milliseconds) before it is discarded
-const MESSAGE_TTL_MS: u64 = 30_000;
 
 /// Starts the BlipMQ broker server.
-pub async fn serve(bind_addr: &str, max_batch: usize) -> anyhow::Result<()> {
+pub async fn serve(
+    bind_addr: &str,
+    max_batch: usize,
+    ttl_ms: u64,
+    queue_capacity: usize,
+) -> anyhow::Result<()> {
     info!("Starting BlipMQ broker on {}", bind_addr);
 
     let listener = TcpListener::bind(bind_addr).await?;
@@ -33,7 +36,13 @@ pub async fn serve(bind_addr: &str, max_batch: usize) -> anyhow::Result<()> {
         let registry = Arc::clone(&registry);
         info!("Client connected: {}", peer);
 
-        task::spawn(handle_client(socket, registry, max_batch));
+        task::spawn(handle_client(
+            socket,
+            registry,
+            max_batch,
+            ttl_ms,
+            queue_capacity,
+        ));
     }
 }
 
@@ -41,6 +50,8 @@ async fn handle_client(
     stream: TcpStream,
     registry: Arc<TopicRegistry>,
     max_batch: usize,
+    ttl_ms : u64,
+    queue_capacity : usize
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
     let (read_half, mut write_half) = stream.into_split();
@@ -49,7 +60,7 @@ async fn handle_client(
 
     let subscriber_id = SubscriberId::from(peer.to_string());
     let (subscriber, mut async_rx): (Subscriber, Receiver<Arc<Message>>) =
-        Subscriber::new_with_receiver(subscriber_id.clone());
+        Subscriber::new_with_receiver_capacity(subscriber_id.clone(),queue_capacity);
     let mut subscriptions = Vec::new();
     let mut buffer = BytesMut::with_capacity(4096);
 
@@ -113,8 +124,8 @@ async fn handle_client(
                 }
 
                 Some(msg) = async_rx.recv() => {
-                     if current_timestamp().saturating_sub(msg.timestamp) > MESSAGE_TTL_MS {
-                        /// Drop expired message
+                     if current_timestamp().saturating_sub(msg.timestamp) > ttl_ms {
+                        // Drop expired message
                         continue;
                     }
                     buffer.clear();
@@ -128,7 +139,7 @@ async fn handle_client(
                     while count < max_batch {
                         match async_rx.try_recv() {
                             Ok(next_msg) => {
-                                if current_timestamp().saturating_sub(next_msg.timestamp) <= MESSAGE_TTL_MS {
+                                if current_timestamp().saturating_sub(next_msg.timestamp) <= ttl_ms {
                                     let encoded = encode_message(&next_msg);
                                     let len_prefix = (encoded.len() as u32).to_be_bytes();
                                     buffer.extend_from_slice(&len_prefix);
