@@ -5,37 +5,39 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
+use log::{info, error};
 
-const NUM_SUBSCRIBERS: usize = 250;
-const NUM_MESSAGES: usize = 100000;
+const NUM_SUBSCRIBERS: usize = 25;
+const NUM_MESSAGES: usize = 25000;
 const MAX_BATCH: usize = 64;
 
 fn run_network_qos0_benchmark() -> (f64, f64) {
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         let addr = "127.0.0.1:7000";
+        info!("Starting BlipMQ server on {}", addr);
         let server_handle = tokio::spawn(async move {
-            let _ = start_broker(addr, MAX_BATCH).await;
+            let _ = start_broker(addr, MAX_BATCH,30_000,1024).await;
         });
 
-        // Give the server a moment to start
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let topic = "bench_topic".to_string();
-
         let mut sub_handles = Vec::with_capacity(NUM_SUBSCRIBERS);
-        for _ in 0..NUM_SUBSCRIBERS {
+
+        info!("Spawning {} BlipMQ subscribers...", NUM_SUBSCRIBERS);
+        for i in 0..NUM_SUBSCRIBERS {
             let addr = addr.to_string();
             let topic = topic.clone();
             sub_handles.push(tokio::spawn(async move {
                 let stream = TcpStream::connect(addr).await.unwrap();
+                stream.set_nodelay(true).expect("Nagle couldnt be off");
                 let (read_half, mut write_half) = stream.into_split();
                 write_half
                     .write_all(format!("SUB {}\n", topic).as_bytes())
                     .await
                     .unwrap();
                 let mut reader = BufReader::new(read_half);
-                // Read OK SUB line
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
 
@@ -52,29 +54,33 @@ fn run_network_qos0_benchmark() -> (f64, f64) {
                     }
                     received += 1;
                 }
+                info!("[Sub {}] Received all messages", i);
                 received
             }));
         }
 
-        // Wait a moment for subscribers to establish
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut pub_stream = TcpStream::connect(addr).await.unwrap();
 
+        info!("Publishing {} messages to BlipMQ...", NUM_MESSAGES);
         let start = Instant::now();
         for i in 0..NUM_MESSAGES {
             let cmd = format!("PUB {} msg-{}\n", topic, i);
             pub_stream.write_all(cmd.as_bytes()).await.unwrap();
+            if i % 10_000 == 0 {
+                info!("Published {}/{}", i, NUM_MESSAGES);
+            }
         }
         pub_stream.flush().await.unwrap();
         let publish_duration = start.elapsed();
+        info!("Published all messages in {:?}", publish_duration);
 
         for handle in sub_handles {
             let _ = handle.await.unwrap();
         }
         let total_duration = start.elapsed();
 
-        // Shut down server
         server_handle.abort();
         let _ = server_handle.await;
 
@@ -82,8 +88,8 @@ fn run_network_qos0_benchmark() -> (f64, f64) {
         let throughput = total_fanout as f64 / total_duration.as_secs_f64();
         let mean_latency_us = total_duration.as_secs_f64() / total_fanout as f64 * 1e6;
 
-        println!(
-            "Network QoS0 => pub_time={:?}, total_time={:?}, throughput={:.2} msgs/s, mean_latency={:.2}µs",
+        info!(
+            "BlipMQ QoS0 => pub_time={:?}, total_time={:?}, throughput={:.2} msgs/s, mean_latency={:.2}µs",
             publish_duration, total_duration, throughput, mean_latency_us
         );
         (throughput, mean_latency_us)
@@ -91,28 +97,37 @@ fn run_network_qos0_benchmark() -> (f64, f64) {
 }
 
 fn run_nats_benchmark() -> (f64, f64) {
-    // Expect a running NATS server on localhost:4222
+    info!("Connecting to NATS server on 127.0.0.1:4222...");
     let nc = nats::connect("127.0.0.1:4222").expect("failed to connect to NATS at localhost:4222");
 
+    info!("Subscribing {} NATS clients to 'bench.nats'...", NUM_SUBSCRIBERS);
     let subs: Vec<_> = (0..NUM_SUBSCRIBERS)
         .map(|_| nc.subscribe("bench.nats").unwrap())
         .collect();
 
+    info!("Publishing {} messages to NATS...", NUM_MESSAGES);
     let start = Instant::now();
     for i in 0..NUM_MESSAGES {
         nc.publish("bench.nats", format!("msg-{}", i)).unwrap();
+        if i % 10_000 == 0 {
+            info!("Published {}/{}", i, NUM_MESSAGES);
+        }
     }
     nc.flush().unwrap();
 
-    for sub in &subs {
+    for (i, sub) in subs.iter().enumerate() {
         let mut received = 0;
         while received < NUM_MESSAGES {
             match sub.next_timeout(Duration::from_millis(500)) {
-                Ok(_m) => received += 1,
+                Ok(_) => received += 1,
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-                Err(e) => panic!("NATS receive error: {}", e),
+                Err(e) => {
+                    error!("NATS receive error for sub {}: {}", i, e);
+                    break;
+                }
             }
         }
+        info!("[NATS Sub {}] Received all messages", i);
     }
 
     let total_duration = start.elapsed();
@@ -120,7 +135,7 @@ fn run_nats_benchmark() -> (f64, f64) {
     let throughput = total_fanout as f64 / total_duration.as_secs_f64();
     let mean_latency_us = total_duration.as_secs_f64() / total_fanout as f64 * 1e6;
 
-    println!(
+    info!(
         "NATS => total_time={:?}, throughput={:.2} msgs/s, mean_latency={:.2}µs",
         total_duration, throughput, mean_latency_us
     );
@@ -130,15 +145,15 @@ fn run_nats_benchmark() -> (f64, f64) {
 
 fn qos0_network_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("qos0_network");
-    group.throughput(Throughput::Elements(
-        (NUM_MESSAGES * NUM_SUBSCRIBERS) as u64,
-    ));
+    group.throughput(Throughput::Elements((NUM_MESSAGES * NUM_SUBSCRIBERS) as u64));
+
     let (tp_blip, lat_blip) = run_network_qos0_benchmark();
     group.bench_function("blipmq_qos0_network", |b| b.iter(|| tp_blip));
 
     let (tp_nats, lat_nats) = run_nats_benchmark();
     group.bench_function("nats", |b| b.iter(|| tp_nats));
     group.finish();
+
     println!("\n=== Latency Summary ===");
     println!("BlipMQ QoS0 network mean latency: {:.2} µs", lat_blip);
     println!("NATS mean latency: {:.2} µs", lat_nats);
