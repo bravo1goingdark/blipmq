@@ -1,5 +1,5 @@
-use crossbeam_channel::Sender;
 use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 
 use crate::core::error::BlipError;
 use crate::core::message::Message;
@@ -23,8 +23,8 @@ impl Queue {
 impl QueueBehavior for Queue {
     fn enqueue(&self, message: Arc<Message>) -> Result<(), BlipError> {
         self.sender.try_send(message).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(_) => BlipError::QueueFull,
-            crossbeam_channel::TrySendError::Disconnected(_) => BlipError::Disconnected,
+            tokio::sync::mpsc::error::TrySendError::Full(_) => BlipError::QueueFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => BlipError::Disconnected,
         })
     }
     fn dequeue(&self) -> Option<Arc<Message>> {
@@ -35,7 +35,7 @@ impl QueueBehavior for Queue {
     }
 
     fn is_empty(&self) -> bool {
-        self.sender.is_empty()
+        true
     }
 
     fn name(&self) -> &str {

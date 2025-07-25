@@ -1,7 +1,10 @@
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
+use tokio::sync::mpsc::{self, Receiver, Sender};
+
+/// Default capacity for per-subscriber message queues
+pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 use crate::core::error::BlipError;
 use crate::core::message::Message;
@@ -52,7 +55,6 @@ impl Clone for Subscriber {
         Self {
             id: self.id.clone(),
             sender: self.sender.clone(),
-            receiver: self.receiver.clone(),
         }
     }
 }
@@ -62,29 +64,24 @@ impl Clone for Subscriber {
 pub struct Subscriber {
     id: SubscriberId,
     sender: Sender<Arc<Message>>,
-    receiver: Receiver<Arc<Message>>,
 }
 
 impl Subscriber {
-    /// Create a new subscriber with a fresh unbounded crossbeam channel.
+    /// Create a new subscriber and return its receiver.
     #[inline(always)]
-    pub fn new(id: SubscriberId) -> Self {
-        let (tx, rx) = unbounded();
-        Self {
-            id,
-            sender: tx,
-            receiver: rx,
-        }
+    pub fn new(id: SubscriberId) -> (Self, Receiver<Arc<Message>>) {
+        Self::with_capacity(id, DEFAULT_QUEUE_CAPACITY)
     }
 
-    /// Use bounded channel version
-    pub fn new_bounded(id: SubscriberId, capacity: usize) -> Self {
-        let (tx, rx) = bounded(capacity);
-        Self {
-            id,
-            sender: tx,
-            receiver: rx,
-        }
+    /// Use bounded channel version (currently unused)
+    pub fn new_bounded(id: SubscriberId, capacity: usize) -> (Self, Receiver<Arc<Message>>) {
+        Self::with_capacity(id, capacity)
+    }
+
+    /// Internal helper to create a subscriber with specified capacity.
+    fn with_capacity(id: SubscriberId, capacity: usize) -> (Self, Receiver<Arc<Message>>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { id, sender: tx }, rx)
     }
 
     #[inline(always)]
@@ -98,32 +95,12 @@ impl Subscriber {
     }
 
     #[inline(always)]
-    pub fn receiver(&self) -> &Receiver<Arc<Message>> {
-        &self.receiver
-    }
-
-    /// Consumes and returns the receiver (for async bridge)
-    #[inline(always)]
-    pub fn take_receiver(self) -> Receiver<Arc<Message>> {
-        self.receiver
-    }
-
-    #[inline(always)]
     pub fn try_send(&self, msg: Arc<Message>) -> Result<(), BlipError> {
-        self.sender.try_send(msg).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(_) => BlipError::QueueFull,
-            crossbeam_channel::TrySendError::Disconnected(_) => BlipError::Disconnected,
-        })
+        self.sender.try_send(msg).map_err(|_| BlipError::QueueFull)
     }
 
     // Creates a subscriber and returns the receiver separately
     pub fn new_with_receiver(id: SubscriberId) -> (Self, Receiver<Arc<Message>>) {
-        let (tx, rx) = unbounded();
-        let subscriber = Subscriber {
-            id,
-            sender: tx.clone(),
-            receiver: rx.clone(), // used once for internal tracking
-        };
-        (subscriber, rx)
+        Self::new(id)
     }
 }

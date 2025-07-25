@@ -1,13 +1,13 @@
-use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 
 use crate::core::message::Message;
 use crate::core::queue::{qos0, QueueBehavior};
 
 /// A thread-safe manager for per-subscriber queues.
 ///
-/// Uses `crossbeam_channel::Sender` for QoS 0 queues (non-blocking, high-throughput).
+/// Uses Tokio mpsc senders for QoS 0 queues (non-blocking, high-throughput).
 #[derive(Debug, Default)]
 pub struct QueueManager {
     queues: DashMap<String, Arc<dyn QueueBehavior>>,
@@ -21,7 +21,7 @@ impl QueueManager {
         }
     }
 
-    /// Gets or creates a queue for a given subscriber ID using a crossbeam sender.
+    /// Gets or creates a queue for a given subscriber ID using an async sender.
     ///
     /// If a queue already exists for the subscriber, returns it.
     pub fn get_or_create(

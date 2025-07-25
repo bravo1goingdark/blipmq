@@ -5,20 +5,21 @@
 //! operations and streams messages back to subscribed clients.
 
 use crate::core::{
-    message::{encode_message, new_message},
+    message::{current_timestamp, encode_message, new_message, Message},
     subscriber::{Subscriber, SubscriberId},
     topics::TopicRegistry,
 };
 use bytes::BytesMut;
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::mpsc::unbounded_channel,
+    sync::mpsc::Receiver,
     task,
 };
 use tracing::{debug, error, info};
+/// Maximum age of a message (in milliseconds) before it is discarded
+const MESSAGE_TTL_MS: u64 = 30_000;
 
 /// Starts the BlipMQ broker server.
 pub async fn serve(bind_addr: &str, max_batch: usize) -> anyhow::Result<()> {
@@ -47,107 +48,104 @@ async fn handle_client(
     let mut lines = reader.lines();
 
     let subscriber_id = SubscriberId::from(peer.to_string());
-    let (subscriber, cb_rx) = Subscriber::new_with_receiver(subscriber_id.clone());
-
-    // Bridge crossbeam -> async channel
-    let (async_tx, mut async_rx) = unbounded_channel();
-    task::spawn_blocking(move || {
-        for msg in cb_rx.iter() {
-            if async_tx.send(msg).is_err() {
-                break;
-            }
-        }
-    });
-
+    let (subscriber, mut async_rx): (Subscriber, Receiver<Arc<Message>>) =
+        Subscriber::new_with_receiver(subscriber_id.clone());
     let mut subscriptions = Vec::new();
     let mut buffer = BytesMut::with_capacity(4096);
 
     loop {
         tokio::select! {
-            line_result = lines.next_line() => {
-                let line = match line_result? {
-                    Some(l) => l,
-                    None => break,
-                };
+                line_result = lines.next_line() => {
+                    let line = match line_result? {
+                        Some(l) => l,
+                        None => break,
+                    };
 
-                let parts: Vec<String> = line.trim().splitn(3, ' ').map(|s| s.to_string()).collect();
+                    let parts: Vec<String> = line.trim().splitn(3, ' ').map(|s| s.to_string()).collect();
 
-                match parts.as_slice() {
-                    [cmd, topic, body] if cmd == "PUB" => {
-                        let topic = topic.clone();
-                        let msg = Arc::new(new_message(body.clone().into_bytes()));
-                        if let Some(t) = registry.get_topic(&topic) {
-                            t.publish(msg).await;
-                            write_half.write_all(b"OK PUB\n").await?;
+                    match parts.as_slice() {
+                        [cmd, topic, body] if cmd == "PUB" => {
+                            let topic = topic.clone();
+                            let msg = Arc::new(new_message(body.clone().into_bytes()));
+                            if let Some(t) = registry.get_topic(&topic) {
+                                t.publish(msg).await;
+                                write_half.write_all(b"OK PUB\n").await?;
+                                write_half.flush().await?;
+                                debug!("Published to {}", topic);
+                            } else {
+                                write_half.write_all(b"ERR NO SUCH TOPIC\n").await?;
+                                write_half.flush().await?;
+                                debug!("Publish to unknown topic: {}", topic);
+                            }
+                        }
+                        [cmd, topic] if cmd == "SUB" => {
+                            let topic = topic.clone();
+                            let topic_obj = registry.create_or_get_topic(&topic);
+                            topic_obj.subscribe(subscriber.clone()).await;
+                            subscriptions.push(topic.clone());
+                            write_half.write_all(format!("OK SUB {topic}\n").as_bytes()).await?;
                             write_half.flush().await?;
-                            debug!("Published to {}", topic);
-                        } else {
-                            write_half.write_all(b"ERR NO SUCH TOPIC\n").await?;
+                            debug!("{} subscribed to {}", subscriber_id, topic);
+                        }
+                        [cmd, topic] if cmd == "UNSUB" => {
+                            let topic = topic.clone();
+                            if let Some(t) = registry.get_topic(&topic) {
+                                t.unsubscribe(&subscriber_id).await;
+                                write_half.write_all(format!("OK UNSUB {topic}\n").as_bytes()).await?;
+                                write_half.flush().await?;
+                                debug!("{} unsubscribed from {}", subscriber_id, topic);
+                            } else {
+                                write_half.write_all(b"ERR NO SUCH TOPIC\n").await?;
+                                write_half.flush().await?;
+                            }
+                        }
+                        [cmd] if cmd == "QUIT" || cmd == "EXIT" => {
+                            write_half.write_all(b"BYE\n").await?;
+                            break;
+                        }
+                        _ => {
+                            let err_msg = format!("ERR UNKNOWN COMMAND: {}\n", line.trim());
+                            write_half.write_all(err_msg.as_bytes()).await?;
                             write_half.flush().await?;
-                            debug!("Publish to unknown topic: {}", topic);
+                            debug!("Unknown command from {}: {}", subscriber_id, line.trim());
                         }
                     }
-                    [cmd, topic] if cmd == "SUB" => {
-                        let topic = topic.clone();
-                        let topic_obj = registry.create_or_get_topic(&topic);
-                        topic_obj.subscribe(subscriber.clone()).await;
-                        subscriptions.push(topic.clone());
-                        write_half.write_all(format!("OK SUB {topic}\n").as_bytes()).await?;
-                        write_half.flush().await?;
-                        debug!("{} subscribed to {}", subscriber_id, topic);
+                }
+
+                Some(msg) = async_rx.recv() => {
+                     if current_timestamp().saturating_sub(msg.timestamp) > MESSAGE_TTL_MS {
+                        /// Drop expired message
+                        continue;
                     }
-                    [cmd, topic] if cmd == "UNSUB" => {
-                        let topic = topic.clone();
-                        if let Some(t) = registry.get_topic(&topic) {
-                            t.unsubscribe(&subscriber_id).await;
-                            write_half.write_all(format!("OK UNSUB {topic}\n").as_bytes()).await?;
-                            write_half.flush().await?;
-                            debug!("{} unsubscribed from {}", subscriber_id, topic);
-                        } else {
-                            write_half.write_all(b"ERR NO SUCH TOPIC\n").await?;
-                            write_half.flush().await?;
+                    buffer.clear();
+
+                    let encoded = encode_message(&msg);
+                    let len_prefix = (encoded.len() as u32).to_be_bytes();
+                    buffer.extend_from_slice(&len_prefix);
+                    buffer.extend_from_slice(&encoded);
+
+                    let mut count = 1;
+                    while count < max_batch {
+                        match async_rx.try_recv() {
+                            Ok(next_msg) => {
+                                if current_timestamp().saturating_sub(next_msg.timestamp) <= MESSAGE_TTL_MS {
+                                    let encoded = encode_message(&next_msg);
+                                    let len_prefix = (encoded.len() as u32).to_be_bytes();
+                                    buffer.extend_from_slice(&len_prefix);
+                                    buffer.extend_from_slice(&encoded);
+                                    count += 1;
+                                }
+                            }
+                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                         }
                     }
-                    [cmd] if cmd == "QUIT" || cmd == "EXIT" => {
-                        write_half.write_all(b"BYE\n").await?;
+
+                    if let Err(err) = write_half.write_all(&buffer).await {
+                        error!("Write failed to {}: {:?}", subscriber_id, err);
                         break;
                     }
-                    _ => {
-                        let err_msg = format!("ERR UNKNOWN COMMAND: {}\n", line.trim());
-                        write_half.write_all(err_msg.as_bytes()).await?;
-                        write_half.flush().await?;
-                        debug!("Unknown command from {}: {}", subscriber_id, line.trim());
-                    }
                 }
-            }
-
-            Some(msg) = async_rx.recv() => {
-                buffer.clear();
-
-                let encoded = encode_message(&msg);
-                let len_prefix = (encoded.len() as u32).to_be_bytes();
-                buffer.extend_from_slice(&len_prefix);
-                buffer.extend_from_slice(&encoded);
-
-                let mut count = 1;
-                while count < max_batch {
-                    match timeout(Duration::from_millis(1), async_rx.recv()).await {
-                        Ok(Some(next_msg)) => {
-                            let encoded = encode_message(&next_msg);
-                            let len_prefix = (encoded.len() as u32).to_be_bytes();
-                            buffer.extend_from_slice(&len_prefix);
-                            buffer.extend_from_slice(&encoded);
-                            count += 1;
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-
-                if let Err(err) = write_half.write_all(&buffer).await {
-                    error!("Write failed to {}: {:?}", subscriber_id, err);
-                    break;
-                }
-            }
         }
     }
 
