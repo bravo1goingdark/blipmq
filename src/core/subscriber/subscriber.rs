@@ -110,4 +110,9 @@ impl Subscriber {
     ) -> (Self, Receiver<Arc<Message>>) {
         Self::with_capacity(id, capacity)
     }
+
+    /// Returns `true` if the subscriber's channel is closed.
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
 }
