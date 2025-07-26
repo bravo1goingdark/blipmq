@@ -13,7 +13,6 @@
 //! api_keys = ["secret-key-1", "secret-key-2"]
 //!
 //! [queues]
-//! default_ttl_ms    = 86_400_000  # 24h
 //! max_queue_depth   = 1_000_000
 //! overflow_policy   = "drop_oldest"
 //!
@@ -56,7 +55,6 @@ pub struct AuthConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueueConfig {
-    pub default_ttl_ms: u64,
     pub max_queue_depth: usize,
     /// Overflow policy when queue is full: "drop_oldest" | "drop_new" | "block"
     pub overflow_policy: String,

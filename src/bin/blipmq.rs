@@ -56,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
             start_broker(
                 &cfg.server.bind_addr,
                 cfg.delivery.max_batch,
-                cfg.queues.default_ttl_ms,
                 cfg.queues.max_queue_depth,
             )
             .await?;

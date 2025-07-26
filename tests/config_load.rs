@@ -8,7 +8,6 @@ fn load_config_matches_toml() {
     assert_eq!(cfg.server.bind_addr, "127.0.0.1:8080");
     assert_eq!(cfg.server.max_connections, 100);
     assert_eq!(cfg.auth.api_keys, vec!["supersecretkey".to_string()]);
-    assert_eq!(cfg.queues.default_ttl_ms, 30000);
     assert_eq!(cfg.queues.max_queue_depth, 1000);
     assert_eq!(cfg.queues.overflow_policy, "drop_oldest");
     assert_eq!(cfg.wal.directory, "./wal");

@@ -11,4 +11,5 @@ message ClientCommand {
   Action action = 1;
   string topic = 2;
   bytes payload = 3;
+  uint64 ttl_ms = 4;
 }

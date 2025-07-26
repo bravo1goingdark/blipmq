@@ -7,7 +7,7 @@
 
 use crate::core::{
     command::{decode_command, Action, ClientCommand},
-    message::{current_timestamp, encode_message, new_message, Message},
+    message::{current_timestamp, encode_message, new_message_with_ttl, Message},
     subscriber::{Subscriber, SubscriberId},
     topics::TopicRegistry,
 };
@@ -26,7 +26,6 @@ use tracing::{error, info};
 pub async fn serve(
     bind_addr: &str,
     max_batch: usize,
-    ttl_ms: u64,
     queue_capacity: usize,
 ) -> anyhow::Result<()> {
     info!("Starting BlipMQ broker on {}", bind_addr);
@@ -36,6 +35,7 @@ pub async fn serve(
 
     loop {
         let (socket, peer) = listener.accept().await?;
+        socket.set_nodelay(true).expect("Failed to disable Nagle Algorithm");
         let registry = Arc::clone(&registry);
         info!("Client connected: {}", peer);
 
@@ -43,7 +43,6 @@ pub async fn serve(
             socket,
             registry,
             max_batch,
-            ttl_ms,
             queue_capacity,
         ));
     }
@@ -53,7 +52,6 @@ async fn handle_client(
     stream: TcpStream,
     registry: Arc<TopicRegistry>,
     max_batch: usize,
-    ttl_ms: u64,
     queue_capacity: usize,
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
@@ -92,7 +90,7 @@ async fn handle_client(
                 match Action::try_from(cmd.action).ok() {
                     Some(Action::Pub) => {
                         let topic = cmd.topic;
-                        let msg = Arc::new(new_message(cmd.payload));
+                        let msg = Arc::new(new_message_with_ttl(cmd.payload,cmd.ttl_ms));
                         if let Some(t) = registry.get_topic(&topic) {
                             t.publish(msg).await;
                             writer.write_all(b"OK PUB\n").await?;
@@ -130,7 +128,7 @@ async fn handle_client(
             }
 
             Some(msg) = async_rx.recv() => {
-                if current_timestamp().saturating_sub(msg.timestamp) > ttl_ms {
+                if msg.ttl_ms != 0 && current_timestamp().saturating_sub(msg.timestamp) > msg.ttl_ms {
                     continue;
                 }
 
@@ -144,7 +142,7 @@ async fn handle_client(
                 while count < max_batch && Instant::now() < deadline {
                     match async_rx.try_recv() {
                         Ok(next_msg) => {
-                            if current_timestamp().saturating_sub(next_msg.timestamp) <= ttl_ms {
+                            if next_msg.ttl_ms == 0 || current_timestamp().saturating_sub(next_msg.timestamp) <= next_msg.ttl_ms {
                                 let enc = encode_message(&next_msg);
                                 send_buf.extend_from_slice(&(enc.len() as u32).to_be_bytes());
                                 send_buf.extend_from_slice(&enc);

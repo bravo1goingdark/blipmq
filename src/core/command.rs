@@ -7,12 +7,22 @@ pub mod proto {
 
 pub use proto::{client_command::Action, ClientCommand};
 
-/// Convenience constructor for a publish command.
+//// Convenience constructor for a publish command.
 pub fn new_pub(topic: impl Into<String>, payload: impl Into<Vec<u8>>) -> ClientCommand {
+    new_pub_with_ttl(topic, payload, 0)
+}
+
+/// Convenience constructor for a publish command with TTL.
+pub fn new_pub_with_ttl(
+    topic: impl Into<String>,
+    payload: impl Into<Vec<u8>>,
+    ttl_ms: u64,
+) -> ClientCommand {
     ClientCommand {
         action: Action::Pub as i32,
         topic: topic.into(),
         payload: payload.into(),
+        ttl_ms,
     }
 }
 
@@ -22,6 +32,7 @@ pub fn new_sub(topic: impl Into<String>) -> ClientCommand {
         action: Action::Sub as i32,
         topic: topic.into(),
         payload: Vec::new(),
+        ttl_ms : 0,
     }
 }
 
@@ -31,6 +42,7 @@ pub fn new_unsub(topic: impl Into<String>) -> ClientCommand {
         action: Action::Unsub as i32,
         topic: topic.into(),
         payload: Vec::new(),
+        ttl_ms : 0,
     }
 }
 
@@ -40,6 +52,7 @@ pub fn new_quit() -> ClientCommand {
         action: Action::Quit as i32,
         topic: String::new(),
         payload: Vec::new(),
+        ttl_ms : 0,
     }
 }
 

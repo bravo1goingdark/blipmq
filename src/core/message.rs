@@ -14,10 +14,16 @@ pub use proto::Message;
 
 /// Utility to create a new `Message` with payload.
 pub fn new_message(payload: impl Into<Bytes>) -> Message {
+    new_message_with_ttl(payload, 0)
+}
+
+/// Create a new `Message` with a specific TTL in milliseconds.
+pub fn new_message_with_ttl(payload: impl Into<Bytes>, ttl_ms: u64) -> Message {
     Message {
         id: generate_id(),
         payload: payload.into().to_vec(),
         timestamp: current_timestamp(),
+        ttl_ms,
     }
 }
 
@@ -31,11 +37,17 @@ pub fn current_timestamp() -> u64 {
 }
 
 /// Utility to create a custom message with fixed ID/timestamp
-pub fn with_custom_message(id: u64, payload: impl Into<Bytes>, timestamp: u64) -> Message {
+pub fn with_custom_message(
+    id: u64,
+    payload: impl Into<Bytes>,
+    timestamp: u64,
+    ttl_ms: u64,
+) -> Message {
     Message {
         id,
         payload: payload.into().to_vec(),
         timestamp,
+        ttl_ms,
     }
 }
 
