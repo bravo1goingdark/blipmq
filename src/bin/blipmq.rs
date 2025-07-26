@@ -73,49 +73,58 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
     let mut rl: Editor<(), DefaultHistory> = DefaultEditor::new()?;
 
     // Connect to broker
-    let stream: TcpStream = TcpStream::connect(addr).await?;
+    let stream = TcpStream::connect(addr).await?;
     let (r, mut w) = stream.into_split();
     let mut raw_reader = BufReader::new(r);
 
     println!("Connected to {addr}. Type `help` for commands.");
 
-    // Spawn background task to read from broker
+    // Background task to receive and print messages from broker
     let printer: JoinHandle<()> = tokio::spawn(async move {
-        // ✅ Step 1: Read and print initial line (e.g., OK SUB chat)
-        let mut line = String::new();
-        if let Ok(n) = raw_reader.read_line(&mut line).await {
-            if n > 0 {
-                println!("> {}", line.trim());
-            }
-        }
-
-        // ✅ Step 2: Loop to read Protobuf-encoded messages
         loop {
-            let mut len_buf = [0u8; 4];
-            if raw_reader.read_exact(&mut len_buf).await.is_err() {
+            // Peek the first byte to determine framing
+            let mut first = [0u8; 1];
+            if raw_reader.read_exact(&mut first).await.is_err() {
                 break;
             }
 
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-            let mut msg_buf = vec![0u8; msg_len];
-
-            if raw_reader.read_exact(&mut msg_buf).await.is_err() {
-                break;
-            }
-
-            match decode_message(&msg_buf) {
-                Ok(msg) => {
-                    let payload = String::from_utf8_lossy(&msg.payload);
-                    println!("{} {} {}", msg.id, payload, msg.timestamp);
+            if first[0].is_ascii_graphic() || first[0] == b' ' {
+                // ASCII response (e.g., "OK SUB ...")
+                let mut line = Vec::from(first);
+                if raw_reader.read_until(b'\n', &mut line).await.is_err() {
+                    break;
                 }
-                Err(e) => {
-                    println!("❌ Failed to decode message: {e}");
+                if let Ok(text) = std::str::from_utf8(&line) {
+                    println!("> {}", text.trim_end());
+                }
+            } else {
+                // Protobuf-framed binary message with 4-byte length prefix
+                let mut len_buf = [0u8; 4];
+                len_buf[0] = first[0];
+                if raw_reader.read_exact(&mut len_buf[1..]).await.is_err() {
+                    break;
+                }
+
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                let mut msg_buf = vec![0u8; msg_len];
+                if raw_reader.read_exact(&mut msg_buf).await.is_err() {
+                    break;
+                }
+
+                match decode_message(&msg_buf) {
+                    Ok(msg) => {
+                        let payload = String::from_utf8_lossy(&msg.payload);
+                        println!("{} {} {}", msg.id, payload, msg.timestamp);
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to decode message: {e}");
+                    }
                 }
             }
         }
     });
 
-    // ✅ Main REPL loop
+    // Main interactive REPL loop
     loop {
         let Ok(line) = rl.readline("> ") else { break };
         let _ = rl.add_history_entry(line.as_str());
@@ -123,6 +132,7 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["help"] => println!("pub <topic> <msg> | sub <topic> | unsub <topic> | exit"),
             ["exit" | "quit"] => break,
+
             ["pub", topic, rest @ ..] => {
                 let cmd = new_pub((*topic).to_string(), rest.join(" "));
                 let encoded = encode_command(&cmd);
@@ -131,7 +141,17 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
                 w.write_all(&encoded).await?;
                 w.flush().await?;
             }
+
             ["sub", topic] => {
+                let cmd = new_sub((*topic).to_string());
+                let encoded = encode_command(&cmd);
+                let len = (encoded.len() as u32).to_be_bytes();
+                w.write_all(&len).await?;
+                w.write_all(&encoded).await?;
+                w.flush().await?;
+            }
+
+            ["unsub", topic] => {
                 let cmd = new_unsub((*topic).to_string());
                 let encoded = encode_command(&cmd);
                 let len = (encoded.len() as u32).to_be_bytes();
@@ -139,10 +159,7 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
                 w.write_all(&encoded).await?;
                 w.flush().await?;
             }
-            ["unsub", topic] => {
-                w.write_all(format!("UNSUB {topic}\n").as_bytes()).await?;
-                w.flush().await?;
-            }
+
             _ => println!("Unknown cmd. Type `help`."),
         }
     }

@@ -78,10 +78,9 @@ async fn main() -> anyhow::Result<()> {
     write_half.write_all(&encoded).await?;
     info!("Sent request: {:?}", cmd.action);
 
+    let mut lines = reader;
     // Handle subscription with binary Protobuf decoding
-    if matches!(cli.command, Command::Sub { .. }) {
-        let mut lines = reader;
-
+    if matches!(cli.command, Command::Pub { .. } | Command::Sub { .. }) {
         // ✅ Step 1: Read and print OK SUB line
         if let Ok(Some(line)) = lines.next_line().await {
             println!("> {}", line.trim());

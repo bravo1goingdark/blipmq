@@ -125,7 +125,7 @@ async fn handle_client(
                             write_half.write_all(b"BYE\n").await?;
                             break;
                         }
-                        
+
                     }
                 }
 
