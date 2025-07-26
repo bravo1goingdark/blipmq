@@ -1,3 +1,4 @@
+pub mod command;
 pub mod delivery_mode;
 pub mod error;
 pub mod message;

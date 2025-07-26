@@ -1,15 +1,16 @@
+use blipmq::core::command::{encode_command, new_pub, new_sub};
 use blipmq::start_broker;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use log::{error, info};
 use nats;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
-use log::{info, error};
 
-const NUM_SUBSCRIBERS: usize = 25;
-const NUM_MESSAGES: usize = 25000;
-const MAX_BATCH: usize = 64;
+const NUM_SUBSCRIBERS: usize = 30;
+const NUM_MESSAGES: usize = 30000;
+const MAX_BATCH: usize = 128;
 
 fn run_network_qos0_benchmark() -> (f64, f64) {
     let rt = Runtime::new().unwrap();
@@ -33,10 +34,11 @@ fn run_network_qos0_benchmark() -> (f64, f64) {
                 let stream = TcpStream::connect(addr).await.unwrap();
                 stream.set_nodelay(true).expect("Nagle couldnt be off");
                 let (read_half, mut write_half) = stream.into_split();
-                write_half
-                    .write_all(format!("SUB {}\n", topic).as_bytes())
-                    .await
-                    .unwrap();
+                let cmd = new_sub(topic.clone());
+                let encoded = encode_command(&cmd);
+                let len = (encoded.len() as u32).to_be_bytes();
+                write_half.write_all(&len).await.unwrap();
+                write_half.write_all(&encoded).await.unwrap();
                 let mut reader = BufReader::new(read_half);
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
@@ -68,6 +70,11 @@ fn run_network_qos0_benchmark() -> (f64, f64) {
         for i in 0..NUM_MESSAGES {
             let cmd = format!("PUB {} msg-{}\n", topic, i);
             pub_stream.write_all(cmd.as_bytes()).await.unwrap();
+            let cmd = new_pub(topic.clone(), format!("msg-{}", i));
+            let encoded = encode_command(&cmd);
+            let len = (encoded.len() as u32).to_be_bytes();
+            pub_stream.write_all(&len).await.unwrap();
+            pub_stream.write_all(&encoded).await.unwrap();
             if i % 10_000 == 0 {
                 info!("Published {}/{}", i, NUM_MESSAGES);
             }
@@ -100,7 +107,10 @@ fn run_nats_benchmark() -> (f64, f64) {
     info!("Connecting to NATS server on 127.0.0.1:4222...");
     let nc = nats::connect("127.0.0.1:4222").expect("failed to connect to NATS at localhost:4222");
 
-    info!("Subscribing {} NATS clients to 'bench.nats'...", NUM_SUBSCRIBERS);
+    info!(
+        "Subscribing {} NATS clients to 'bench.nats'...",
+        NUM_SUBSCRIBERS
+    );
     let subs: Vec<_> = (0..NUM_SUBSCRIBERS)
         .map(|_| nc.subscribe("bench.nats").unwrap())
         .collect();
@@ -145,7 +155,9 @@ fn run_nats_benchmark() -> (f64, f64) {
 
 fn qos0_network_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("qos0_network");
-    group.throughput(Throughput::Elements((NUM_MESSAGES * NUM_SUBSCRIBERS) as u64));
+    group.throughput(Throughput::Elements(
+        (NUM_MESSAGES * NUM_SUBSCRIBERS) as u64,
+    ));
 
     let (tp_blip, lat_blip) = run_network_qos0_benchmark();
     group.bench_function("blipmq_qos0_network", |b| b.iter(|| tp_blip));

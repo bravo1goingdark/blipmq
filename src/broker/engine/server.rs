@@ -1,10 +1,11 @@
 //! Server engine for BlipMQ broker.
 //!
-//! Listens for TCP connections, parses line-based client commands, and integrates
-//! with the core pub/sub engine (TopicRegistry). Implements PRODUCE/SUBSCRIBE/UNSUBSCRIBE
-//! operations and streams messages back to subscribed clients.
-
+//! Listens for TCP connections using a length-prefixed Protobuf command protocol
+//! and integrates with the core pub/sub engine (TopicRegistry). Implements
+//! PRODUCE/SUBSCRIBE/UNSUBSCRIBE operations and streams messages back to
+//! subscribed clients.
 use crate::core::{
+    command::{decode_command, Action, ClientCommand},
     message::{current_timestamp, encode_message, new_message, Message},
     subscriber::{Subscriber, SubscriberId},
     topics::TopicRegistry,
@@ -12,7 +13,7 @@ use crate::core::{
 use bytes::BytesMut;
 use std::sync::Arc;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc::Receiver,
     task,
@@ -50,34 +51,44 @@ async fn handle_client(
     stream: TcpStream,
     registry: Arc<TopicRegistry>,
     max_batch: usize,
-    ttl_ms : u64,
-    queue_capacity : usize
+    ttl_ms: u64,
+    queue_capacity: usize,
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
-    let (read_half, mut write_half) = stream.into_split();
-    let reader = BufReader::new(read_half);
-    let mut lines = reader.lines();
+    let (mut read_half, mut write_half) = stream.into_split();
 
     let subscriber_id = SubscriberId::from(peer.to_string());
     let (subscriber, mut async_rx): (Subscriber, Receiver<Arc<Message>>) =
-        Subscriber::new_with_receiver_capacity(subscriber_id.clone(),queue_capacity);
+        Subscriber::new_with_receiver_capacity(subscriber_id.clone(), queue_capacity);
     let mut subscriptions = Vec::new();
     let mut buffer = BytesMut::with_capacity(4096);
+    let mut len_buf = [0u8; 4];
 
     loop {
         tokio::select! {
-                line_result = lines.next_line() => {
-                    let line = match line_result? {
-                        Some(l) => l,
-                        None => break,
+                read_res = read_half.read_exact(&mut len_buf) => {
+                    if read_res.is_err() {
+                        break;
+                    }
+                    let msg_len = u32::from_be_bytes(len_buf) as usize;
+                    let mut msg_buf = vec![0u8; msg_len];
+                    if read_half.read_exact(&mut msg_buf).await.is_err() {
+                        break;
+                    }
+
+                    let cmd: ClientCommand = match decode_command(&msg_buf) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            write_half.write_all(b"ERR MALFORMED\n").await?;
+                            write_half.flush().await?;
+                            continue;
+                        }
                     };
 
-                    let parts: Vec<String> = line.trim().splitn(3, ' ').map(|s| s.to_string()).collect();
-
-                    match parts.as_slice() {
-                        [cmd, topic, body] if cmd == "PUB" => {
-                            let topic = topic.clone();
-                            let msg = Arc::new(new_message(body.clone().into_bytes()));
+                     match Action::try_from(cmd.action).ok() {
+                        Some(Action::Pub) => {
+                            let topic = cmd.topic;
+                            let msg = Arc::new(new_message(cmd.payload));
                             if let Some(t) = registry.get_topic(&topic) {
                                 t.publish(msg).await;
                                 write_half.write_all(b"OK PUB\n").await?;
@@ -89,8 +100,8 @@ async fn handle_client(
                                 debug!("Publish to unknown topic: {}", topic);
                             }
                         }
-                        [cmd, topic] if cmd == "SUB" => {
-                            let topic = topic.clone();
+                        Some(Action::Sub) => {
+                            let topic = cmd.topic;
                             let topic_obj = registry.create_or_get_topic(&topic);
                             topic_obj.subscribe(subscriber.clone()).await;
                             subscriptions.push(topic.clone());
@@ -98,8 +109,8 @@ async fn handle_client(
                             write_half.flush().await?;
                             debug!("{} subscribed to {}", subscriber_id, topic);
                         }
-                        [cmd, topic] if cmd == "UNSUB" => {
-                            let topic = topic.clone();
+                         Some(Action::Unsub) => {
+                            let topic = cmd.topic;
                             if let Some(t) = registry.get_topic(&topic) {
                                 t.unsubscribe(&subscriber_id).await;
                                 write_half.write_all(format!("OK UNSUB {topic}\n").as_bytes()).await?;
@@ -110,16 +121,11 @@ async fn handle_client(
                                 write_half.flush().await?;
                             }
                         }
-                        [cmd] if cmd == "QUIT" || cmd == "EXIT" => {
+                        Some(Action::Quit) | None => {
                             write_half.write_all(b"BYE\n").await?;
                             break;
                         }
-                        _ => {
-                            let err_msg = format!("ERR UNKNOWN COMMAND: {}\n", line.trim());
-                            write_half.write_all(err_msg.as_bytes()).await?;
-                            write_half.flush().await?;
-                            debug!("Unknown command from {}: {}", subscriber_id, line.trim());
-                        }
+                        
                     }
                 }
 

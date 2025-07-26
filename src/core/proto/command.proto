@@ -1,0 +1,14 @@
+syntax = "proto3";
+package blipmq;
+
+message ClientCommand {
+  enum Action {
+    PUB = 0;
+    SUB = 1;
+    UNSUB = 2;
+    QUIT = 3;
+  }
+  Action action = 1;
+  string topic = 2;
+  bytes payload = 3;
+}

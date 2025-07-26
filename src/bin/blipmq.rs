@@ -6,7 +6,7 @@
 //  > pub chat hello
 //  > sub chat
 //  > [msg-id] hello @ timestamp
-
+use blipmq::core::command::{encode_command, new_pub, new_sub, new_unsub};
 use blipmq::core::message::decode_message;
 use blipmq::{load_config, start_broker, Config};
 
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.queues.default_ttl_ms,
                 cfg.queues.max_queue_depth,
             )
-                .await?;
+            .await?;
         }
         Command::Connect { addr } => repl(addr).await?,
     }
@@ -124,12 +124,19 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
             ["help"] => println!("pub <topic> <msg> | sub <topic> | unsub <topic> | exit"),
             ["exit" | "quit"] => break,
             ["pub", topic, rest @ ..] => {
-                w.write_all(format!("PUB {topic} {}\n", rest.join(" ")).as_bytes())
-                    .await?;
+                let cmd = new_pub((*topic).to_string(), rest.join(" "));
+                let encoded = encode_command(&cmd);
+                let len = (encoded.len() as u32).to_be_bytes();
+                w.write_all(&len).await?;
+                w.write_all(&encoded).await?;
                 w.flush().await?;
             }
             ["sub", topic] => {
-                w.write_all(format!("SUB {topic}\n").as_bytes()).await?;
+                let cmd = new_unsub((*topic).to_string());
+                let encoded = encode_command(&cmd);
+                let len = (encoded.len() as u32).to_be_bytes();
+                w.write_all(&len).await?;
+                w.write_all(&encoded).await?;
                 w.flush().await?;
             }
             ["unsub", topic] => {

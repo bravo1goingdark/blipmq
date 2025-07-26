@@ -6,7 +6,7 @@ max_connections = 100
 api_keys = ["supersecretkey"]
 
 [queues]
-default_ttl_ms = 60000
+default_ttl_ms = 30000
 max_queue_depth = 1000
 overflow_policy = "drop_oldest"
 

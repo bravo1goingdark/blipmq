@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::info;
 
+use blipmq::core::command::{encode_command, new_pub, new_sub, new_unsub};
 use blipmq::core::message::decode_message;
 
 /// Command-line interface for BlipMQ.
@@ -64,17 +65,18 @@ async fn main() -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.split();
     let reader = BufReader::new(read_half).lines();
 
-    // Send request line
-    let request = match &cli.command {
-        Command::Pub { topic, message } => {
-            format!("PUB {} {}\n", topic, message)
-        }
-        Command::Sub { topic } => format!("SUB {}\n", topic),
-        Command::Unsub { topic } => format!("UNSUB {}\n", topic),
+    // Send command in protobuf format
+    let cmd = match &cli.command {
+        Command::Pub { topic, message } => new_pub(topic.clone(), message.clone()),
+        Command::Sub { topic } => new_sub(topic.clone()),
+        Command::Unsub { topic } => new_unsub(topic.clone()),
     };
 
-    write_half.write_all(request.as_bytes()).await?;
-    info!("Sent request: {}", request.trim());
+    let encoded = encode_command(&cmd);
+    let len_prefix = (encoded.len() as u32).to_be_bytes();
+    write_half.write_all(&len_prefix).await?;
+    write_half.write_all(&encoded).await?;
+    info!("Sent request: {:?}", cmd.action);
 
     // Handle subscription with binary Protobuf decoding
     if matches!(cli.command, Command::Sub { .. }) {
