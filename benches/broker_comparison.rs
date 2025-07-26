@@ -10,6 +10,7 @@ use blipmq::core::subscriber::{Subscriber, SubscriberId};
 use blipmq::core::topics::registry::TopicRegistry;
 use hdrhistogram::Histogram;
 use tokio::runtime::Runtime;
+use tokio::task;
 
 const NUM_MESSAGES: usize = 100000;
 const NUM_SUBSCRIBERS: usize = 25;
@@ -32,8 +33,8 @@ fn run_blipmq_ordered() -> (f64, f64, Histogram<u64>) {
         let mut receivers = Vec::with_capacity(NUM_SUBSCRIBERS);
         for i in 0..NUM_SUBSCRIBERS {
             let subscriber_id = SubscriberId::from(format!("sub-{}", i));
-            let subscriber = Subscriber::new(subscriber_id);
-            receivers.push(subscriber.receiver().clone());
+            let (subscriber, rx) = Subscriber::new(subscriber_id);
+            receivers.push(rx);
             topic.subscribe(subscriber).await;
         }
 
@@ -45,29 +46,32 @@ fn run_blipmq_ordered() -> (f64, f64, Histogram<u64>) {
         let publish_duration = start.elapsed();
 
         let histogram = Arc::new(Mutex::new(Histogram::<u64>::new_with_bounds(1, 10_000_000, 5).unwrap()));
-        let mut handles = vec![];
-        let total_received = Arc::new(Mutex::new(0u64));
 
-        for rx in receivers {
+        let total_received = Arc::new(Mutex::new(0u64));
+        let mut handles = Vec::new();
+
+        for mut rx in receivers {
             let hist = Arc::clone(&histogram);
             let count = Arc::clone(&total_received);
-            let handle = thread::spawn(move || {
+             handles.push(task::spawn(async move {
                 let mut received = 0;
                 while received < NUM_MESSAGES {
                     let t0 = Instant::now();
-                    if let Ok(_) = rx.recv_timeout(Duration::from_millis(500)) {
-                        let latency = t0.elapsed().as_micros() as u64;
-                        hist.lock().unwrap().record(latency).unwrap();
-                        received += 1;
-                        *count.lock().unwrap() += 1;
+                    match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                        Ok(Some(_)) => {
+                            let latency = t0.elapsed().as_micros() as u64;
+                            hist.lock().unwrap().record(latency).unwrap();
+                            received += 1;
+                            *count.lock().unwrap() += 1;
+                        }
+                        _ => {}
                     }
                 }
-            });
-            handles.push(handle);
+            }));
         }
 
         for h in handles {
-            h.join().unwrap();
+            let _ = h.await;
         }
 
         let total_duration = start.elapsed();

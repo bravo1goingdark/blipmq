@@ -4,10 +4,10 @@ use blipmq::core::publisher::{Publisher, PublisherConfig};
 use blipmq::core::subscriber::{Subscriber, SubscriberId};
 use blipmq::core::topics::registry::TopicRegistry;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use crossbeam_channel::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::Receiver;
 
 const NUM_SUBSCRIBERS: usize = 100;
 const NUM_MESSAGES: usize = 100_000;
@@ -32,8 +32,8 @@ fn run_qos0_delivery_test() -> (f64, f64) {
         let mut receivers: Vec<Receiver<Arc<Message>>> = Vec::with_capacity(NUM_SUBSCRIBERS);
         for i in 0..NUM_SUBSCRIBERS {
             let subscriber_id = SubscriberId::from(format!("sub-{i}"));
-            let subscriber = Subscriber::new(subscriber_id);
-            receivers.push(subscriber.receiver().clone());
+            let (subscriber, rx) = Subscriber::new(subscriber_id);
+            receivers.push(rx);
             topic.subscribe(subscriber).await;
         }
 
@@ -46,12 +46,17 @@ fn run_qos0_delivery_test() -> (f64, f64) {
         let publish_duration = start.elapsed();
 
         // Receive from each subscriber
-        for rx in &receivers {
+        for rx in &mut receivers {
             let mut received = 0;
             while received < NUM_MESSAGES {
-                match rx.recv_timeout(Duration::from_millis(RECV_TIMEOUT_MS)) {
-                    Ok(_) => received += 1,
-                    Err(_) => break, // Timeout
+                match tokio::time::timeout(
+                    Duration::from_millis(RECV_TIMEOUT_MS),
+                    rx.recv(),
+                )
+                    .await
+                {
+                    Ok(Some(_)) => received += 1,
+                    _ => break,
                 }
             }
         }
