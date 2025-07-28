@@ -1,168 +1,115 @@
 //! Server engine for BlipMQ broker.
 //!
-//! Listens for TCP connections using a length-prefixed Protobuf command protocol
-//! and integrates with the core pub/sub engine (TopicRegistry). Implements
-//! PRODUCE/SUBSCRIBE/UNSUBSCRIBE operations and streams messages back to
-//! subscribed clients.
+//! Uses length-prefixed Protobuf frames for both SUB-ACK and published messages.
 
+use crate::config::CONFIG;
 use crate::core::{
     command::{decode_command, Action, ClientCommand},
-    message::{current_timestamp, encode_message, new_message_with_ttl, Message},
+    message::{new_message_with_ttl, encode_frame_into, ServerFrame, SubAck},
     subscriber::{Subscriber, SubscriberId},
     topics::TopicRegistry,
 };
+use crate::core::message::proto::server_frame::Body as FrameBody;
 use bytes::BytesMut;
 use std::sync::Arc;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    io::{AsyncReadExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
-    sync::mpsc::Receiver,
+    sync::Mutex,
     task,
-    time::{Duration, Instant},
 };
+use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
 
-/// Starts the BlipMQ broker server.
-pub async fn serve(
-    bind_addr: &str,
-    max_batch: usize,
-    queue_capacity: usize,
-) -> anyhow::Result<()> {
+/// Starts the BlipMQ broker server, with settings from `blipmq.toml`.
+pub async fn serve() -> anyhow::Result<()> {
+    let bind_addr = &CONFIG.server.bind_addr;
     info!("Starting BlipMQ broker on {}", bind_addr);
 
     let listener = TcpListener::bind(bind_addr).await?;
     let registry = Arc::new(TopicRegistry::new());
 
     loop {
-        let (socket, peer) = listener.accept().await?;
-        socket.set_nodelay(true).expect("Failed to disable Nagle Algorithm");
+        let (socket, peer_addr) = listener.accept().await?;
+        socket.set_nodelay(true)?;
         let registry = Arc::clone(&registry);
-        info!("Client connected: {}", peer);
+        info!("Client connected: {}", peer_addr);
 
-        task::spawn(handle_client(
-            socket,
-            registry,
-            max_batch,
-            queue_capacity,
-        ));
+        task::spawn(async move {
+            if let Err(e) = handle_client(socket, registry).await {
+                error!("Error handling {}: {:?}", peer_addr, e);
+            }
+        });
     }
 }
 
-async fn handle_client(
-    stream: TcpStream,
-    registry: Arc<TopicRegistry>,
-    max_batch: usize,
-    queue_capacity: usize,
-) -> anyhow::Result<()> {
+async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
-    let (mut reader, writer) = stream.into_split();
-    let mut writer = BufWriter::new(writer);
+    let (reader_half, writer_half) = stream.into_split();
+    let mut reader = BufReader::new(reader_half);
 
+    let shared_writer = Arc::new(Mutex::new(BufWriter::new(writer_half)));
+
+    // Subscriber flush task
     let subscriber_id = SubscriberId::from(peer.to_string());
-    let (subscriber, mut async_rx): (Subscriber, Receiver<Arc<Message>>) =
-        Subscriber::new_with_receiver_capacity(subscriber_id.clone(), queue_capacity);
-    let mut subscriptions = Vec::new();
+    let subscriber = Subscriber::new(subscriber_id.clone(), shared_writer.clone());
+
     let mut len_buf = [0u8; 4];
-    let mut msg_buf = Vec::with_capacity(4096);
-    let mut send_buf = BytesMut::with_capacity(8192);
+    let mut cmd_buf = Vec::with_capacity(4096);
+    let mut subscriptions = Vec::new();
 
     loop {
-        tokio::select! {
-            read_res = reader.read_exact(&mut len_buf) => {
-                if read_res.is_err() {
-                    break;
-                }
-                let msg_len = u32::from_be_bytes(len_buf) as usize;
-                msg_buf.resize(msg_len, 0);
-                if reader.read_exact(&mut msg_buf).await.is_err() {
-                    break;
-                }
+        // Read length-prefixed command
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        cmd_buf.resize(len, 0);
+        if reader.read_exact(&mut cmd_buf).await.is_err() {
+            break;
+        }
 
-                let cmd: ClientCommand = match decode_command(&msg_buf) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        writer.write_all(b"ERR MALFORMED\n").await?;
-                        writer.flush().await?;
-                        continue;
-                    }
-                };
+        let cmd: ClientCommand = match decode_command(&cmd_buf) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
 
-                match Action::try_from(cmd.action).ok() {
-                    Some(Action::Pub) => {
-                        let topic = cmd.topic;
-                        let msg = Arc::new(new_message_with_ttl(cmd.payload,cmd.ttl_ms));
-                        if let Some(t) = registry.get_topic(&topic) {
-                            t.publish(msg).await;
-                            writer.write_all(b"OK PUB\n").await?;
-                            writer.flush().await?;
-                        } else {
-                            writer.write_all(b"ERR NO SUCH TOPIC\n").await?;
-                            writer.flush().await?;
-                        }
-                    }
-                    Some(Action::Sub) => {
-                        let topic = cmd.topic;
-                        let topic_obj = registry.create_or_get_topic(&topic);
-                        topic_obj.subscribe(subscriber.clone()).await;
-                        subscriptions.push(topic.clone());
-                        writer.write_all(format!("OK SUB {topic}\n").as_bytes()).await?;
-                        writer.flush().await?;
-                    }
-                    Some(Action::Unsub) => {
-                        let topic = cmd.topic;
-                        if let Some(t) = registry.get_topic(&topic) {
-                            t.unsubscribe(&subscriber_id).await;
-                            writer.write_all(format!("OK UNSUB {topic}\n").as_bytes()).await?;
-                            writer.flush().await?;
-                        } else {
-                            writer.write_all(b"ERR NO SUCH TOPIC\n").await?;
-                            writer.flush().await?;
-                        }
-                    }
-                    Some(Action::Quit) | None => {
-                        writer.write_all(b"BYE\n").await?;
-                        writer.flush().await?;
-                        break;
-                    }
+        match Action::try_from(cmd.action).ok() {
+            Some(Action::Pub) => {
+                if let Some(topic) = registry.get_topic(&cmd.topic) {
+                    topic.publish(Arc::new(new_message_with_ttl(cmd.payload, cmd.ttl_ms))).await;
                 }
             }
 
-            Some(msg) = async_rx.recv() => {
-                if msg.ttl_ms != 0 && current_timestamp().saturating_sub(msg.timestamp) > msg.ttl_ms {
-                    continue;
+            Some(Action::Sub) => {
+                // Send SubAck frame
+                let ack = SubAck { topic: cmd.topic.clone(), info: "subscribed".into() };
+                let frame = ServerFrame { body: Some(FrameBody::SubAck(ack)) };
+                let mut buf = BytesMut::new();
+                encode_frame_into(&frame, &mut buf);
+                {
+                    let mut w = shared_writer.lock().await;
+                    w.write_all(&buf).await?;
+                    w.flush().await?;
                 }
 
-                send_buf.clear();
-                let encoded = encode_message(&msg);
-                send_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-                send_buf.extend_from_slice(&encoded);
-
-                let mut count = 1;
-                let deadline = Instant::now() + Duration::from_micros(50);
-                while count < max_batch && Instant::now() < deadline {
-                    match async_rx.try_recv() {
-                        Ok(next_msg) => {
-                            if next_msg.ttl_ms == 0 || current_timestamp().saturating_sub(next_msg.timestamp) <= next_msg.ttl_ms {
-                                let enc = encode_message(&next_msg);
-                                send_buf.extend_from_slice(&(enc.len() as u32).to_be_bytes());
-                                send_buf.extend_from_slice(&enc);
-                                count += 1;
-                            }
-                        }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                    }
-                }
-
-                if let Err(e) = writer.write_all(&send_buf).await {
-                    error!("Write failed to {}: {:?}", subscriber_id, e);
-                    break;
-                }
-                writer.flush().await?;
+                // Register subscription
+                let t = registry.create_or_get_topic(&cmd.topic);
+                t.subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity).await;
+                subscriptions.push(cmd.topic.clone());
             }
+
+            Some(Action::Unsub) => {
+                if let Some(topic) = registry.get_topic(&cmd.topic) {
+                    topic.unsubscribe(&subscriber_id).await;
+                }
+            }
+
+            Some(Action::Quit) | None => break,
         }
     }
 
+    // Cleanup
     for topic in subscriptions {
         if let Some(t) = registry.get_topic(&topic) {
             t.unsubscribe(&subscriber_id).await;

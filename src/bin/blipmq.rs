@@ -3,12 +3,16 @@
 //
 //  $ blipmq start --config blipmq.toml
 //  $ blipmq connect 127.0.0.1:8080
-//  > pub chat hello
+//  > pub chat 5000 hello everyone  # custom TTL 5000ms
+//  > pub chat hello everyone       # default TTL from config
 //  > sub chat
-//  > [msg-id] hello @ timestamp
-use blipmq::core::command::{encode_command, new_pub, new_sub, new_unsub};
+//  > unsub chat
+//  > exit
+
+use blipmq::config::CONFIG;
+use blipmq::core::command::{encode_command, new_pub_with_ttl, new_sub, new_unsub};
 use blipmq::core::message::decode_message;
-use blipmq::{load_config, start_broker, Config};
+use blipmq::{load_config, start_broker};
 
 use clap::{Parser, Subcommand};
 use rustyline::history::DefaultHistory;
@@ -51,23 +55,15 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Command::Start { config } => {
             let cfg_path: String = std::env::var("BLIPMQ_CONFIG").unwrap_or(config);
-            let cfg: Config = load_config(&cfg_path)?;
+            let cfg = load_config(&cfg_path)?;
             println!("📡 BlipMQ broker listening on {}", cfg.server.bind_addr);
-            start_broker(
-                &cfg.server.bind_addr,
-                cfg.delivery.max_batch,
-                cfg.queues.max_queue_depth,
-            )
-            .await?;
+            start_broker().await?;
         }
         Command::Connect { addr } => repl(addr).await?,
     }
     Ok(())
 }
 
-// ───────────────────────────────────────────────────────────
-// Interactive REPL shell
-// ───────────────────────────────────────────────────────────
 async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
     let mut rl: Editor<(), DefaultHistory> = DefaultEditor::new()?;
 
@@ -76,19 +72,21 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
     let (r, mut w) = stream.into_split();
     let mut raw_reader = BufReader::new(r);
 
+    // Pull default TTL from config
+    let default_ttl = CONFIG.delivery.default_ttl_ms;
+
     println!("Connected to {addr}. Type `help` for commands.");
 
-    // Background task to receive and print messages from broker
+    // Spawn a task to print responses and inbound messages
     let printer: JoinHandle<()> = tokio::spawn(async move {
         loop {
-            // Peek the first byte to determine framing
             let mut first = [0u8; 1];
             if raw_reader.read_exact(&mut first).await.is_err() {
                 break;
             }
 
             if first[0].is_ascii_graphic() || first[0] == b' ' {
-                // ASCII response (e.g., "OK SUB ...")
+                // ASCII response
                 let mut line = Vec::from(first);
                 if raw_reader.read_until(b'\n', &mut line).await.is_err() {
                     break;
@@ -97,69 +95,84 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
                     println!("> {}", text.trim_end());
                 }
             } else {
-                // Protobuf-framed binary message with 4-byte length prefix
+                // Binary message
                 let mut len_buf = [0u8; 4];
                 len_buf[0] = first[0];
                 if raw_reader.read_exact(&mut len_buf[1..]).await.is_err() {
                     break;
                 }
-
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 let mut msg_buf = vec![0u8; msg_len];
                 if raw_reader.read_exact(&mut msg_buf).await.is_err() {
                     break;
                 }
-
                 match decode_message(&msg_buf) {
                     Ok(msg) => {
                         let payload = String::from_utf8_lossy(&msg.payload);
-                        println!("{} {} {}", msg.id, payload, msg.timestamp);
+                        println!("{} {} @{}", msg.id, payload, msg.timestamp);
                     }
                     Err(e) => {
-                        println!("❌ Failed to decode message: {e}");
+                        eprintln!("❌ Decode error: {}", e);
                     }
                 }
             }
         }
     });
 
-    // Main interactive REPL loop
-    loop {
-        let Ok(line) = rl.readline("> ") else { break };
-        let _ = rl.add_history_entry(line.as_str());
+    // REPL loop
+    while let Ok(line) = rl.readline("> ") {
+        rl.add_history_entry(line.as_str())?;
 
-        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["help"] => println!("pub <topic> <msg> | sub <topic> | unsub <topic> | exit"),
+        let parts: Vec<_> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            ["help"] => {
+                println!("Commands:\n  pub <topic> [ttl_ms] <msg...>\n  sub <topic>\n  unsub <topic>\n  exit");
+            }
+
             ["exit" | "quit"] => break,
 
-            ["pub", topic, rest @ ..] => {
-                let cmd = new_pub((*topic).to_string(), rest.join(" "));
-                let encoded = encode_command(&cmd);
-                let len = (encoded.len() as u32).to_be_bytes();
-                w.write_all(&len).await?;
-                w.write_all(&encoded).await?;
+            // custom TTL: three+ words
+            ["pub", topic, ttl_str, rest @ ..]
+                if ttl_str.parse::<u64>().is_ok() && !rest.is_empty() =>
+            {
+                let ttl = ttl_str.parse()?;
+                let payload = rest.join(" ");
+                let cmd = new_pub_with_ttl(topic.to_string(), payload, ttl);
+                let enc = encode_command(&cmd);
+                w.write_all(&(enc.len() as u32).to_be_bytes()).await?;
+                w.write_all(&enc).await?;
+                w.flush().await?;
+            }
+
+            // default TTL
+            ["pub", topic, rest @ ..] if !rest.is_empty() => {
+                let payload = rest.join(" ");
+                let cmd = new_pub_with_ttl(topic.to_string(), payload, default_ttl);
+                let enc = encode_command(&cmd);
+                w.write_all(&(enc.len() as u32).to_be_bytes()).await?;
+                w.write_all(&enc).await?;
                 w.flush().await?;
             }
 
             ["sub", topic] => {
-                let cmd = new_sub((*topic).to_string());
-                let encoded = encode_command(&cmd);
-                let len = (encoded.len() as u32).to_be_bytes();
-                w.write_all(&len).await?;
-                w.write_all(&encoded).await?;
+                let cmd = new_sub(topic.to_string());
+                let enc = encode_command(&cmd);
+                w.write_all(&(enc.len() as u32).to_be_bytes()).await?;
+                w.write_all(&enc).await?;
                 w.flush().await?;
             }
 
             ["unsub", topic] => {
-                let cmd = new_unsub((*topic).to_string());
-                let encoded = encode_command(&cmd);
-                let len = (encoded.len() as u32).to_be_bytes();
-                w.write_all(&len).await?;
-                w.write_all(&encoded).await?;
+                let cmd = new_unsub(topic.to_string());
+                let enc = encode_command(&cmd);
+                w.write_all(&(enc.len() as u32).to_be_bytes()).await?;
+                w.write_all(&enc).await?;
                 w.flush().await?;
             }
 
-            _ => println!("Unknown cmd. Type `help`."),
+            _ => {
+                println!("Unknown command (type `help`)");
+            }
         }
     }
 

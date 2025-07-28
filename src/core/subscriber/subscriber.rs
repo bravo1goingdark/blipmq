@@ -1,27 +1,24 @@
-use std::fmt;
-use std::ops::Deref;
-use std::sync::Arc;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+//! Subscriber module: manages per-subscriber queue and background reactive flush loop.
 
-/// Default capacity for per-subscriber message queues
-pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
-
+use crate::config::CONFIG;
+use crate::core::message::{Message, encode_message_into, current_timestamp};
 use crate::core::error::BlipError;
-use crate::core::message::Message;
+use crate::core::queue::qos0::Queue;
+use crate::core::queue::QueueBehavior;
+
+use bytes::BytesMut;
+use std::sync::Arc;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::BufWriter;
+use tokio::sync::{Mutex, Notify};
 
 /// Unique identifier for a subscriber.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubscriberId(pub String);
 
-impl fmt::Display for SubscriberId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<&str> for SubscriberId {
-    fn from(s: &str) -> Self {
-        SubscriberId(s.to_owned())
+impl std::fmt::Display for SubscriberId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -37,82 +34,105 @@ impl From<SubscriberId> for String {
     }
 }
 
-impl AsRef<str> for SubscriberId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
+/// Represents a connected subscriber with its own message queue,
+/// a notification primitive, and a background flush task.
+#[derive(Debug)]
+pub struct Subscriber {
+    id: SubscriberId,
+    queue: Arc<Queue>,
+    notifier: Arc<Notify>,
 }
 
-impl Deref for SubscriberId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
 impl Clone for Subscriber {
     fn clone(&self) -> Self {
-        Self {
+        Subscriber {
             id: self.id.clone(),
-            sender: self.sender.clone(),
+            queue: Arc::clone(&self.queue),
+            notifier: Arc::clone(&self.notifier),
         }
     }
 }
 
-/// Represents a connected subscriber to a topic.
-#[derive(Debug)]
-pub struct Subscriber {
-    id: SubscriberId,
-    sender: Sender<Arc<Message>>,
-}
-
 impl Subscriber {
-    /// Create a new subscriber and return its receiver.
-    #[inline(always)]
-    pub fn new(id: SubscriberId) -> (Self, Receiver<Arc<Message>>) {
-        Self::with_capacity(id, DEFAULT_QUEUE_CAPACITY)
+    /// Creates a new subscriber and spawns its reactive flush loop using global config.
+    ///
+    /// # Arguments
+    /// * `id` - Subscriber identifier.
+    /// * `writer` - Shared, async-locked buffered writer for sending batches.
+    pub fn new<W>(id: SubscriberId, writer: Arc<Mutex<BufWriter<W>>>) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let capacity = CONFIG.queues.subscriber_capacity;
+        let max_batch = CONFIG.delivery.max_batch;
+
+        // Create bounded SPSC queue and notifier
+        let queue = Arc::new(Queue::new(id.0.clone(), capacity));
+        let notifier = Arc::new(Notify::new());
+        let queue_clone = Arc::clone(&queue);
+        let notifier_clone = Arc::clone(&notifier);
+        let id_clone = id.clone();
+        let writer_clone = Arc::clone(&writer);
+
+        // Spawn the reactive flush task
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::with_capacity(max_batch * 64);
+            loop {
+                // Wait for at least one notification
+                notifier_clone.notified().await;
+
+                // Batch up to `max_batch` messages
+                let mut count = 0;
+                while count < max_batch {
+                    match queue_clone.dequeue() {
+                        Some(msg) => {
+                            // Enforce TTL: drop if expired
+                            let now = current_timestamp();
+                            if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
+                                continue;
+                            }
+                            encode_message_into(&msg, &mut buffer);
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+
+                // Write and flush the batch
+                let mut w = writer_clone.lock().await;
+                if let Err(e) = w.write_all(&buffer).await {
+                    tracing::error!("Subscriber {} write error: {:?}", id_clone, e);
+                    break;
+                }
+                if let Err(e) = w.flush().await {
+                    tracing::error!("Subscriber {} flush error: {:?}", id_clone, e);
+                    break;
+                }
+
+                buffer.clear();
+            }
+            tracing::info!("Flush task ended for subscriber {}", id_clone);
+        });
+
+        Subscriber { id, queue, notifier }
     }
 
-    /// Use bounded channel version (currently unused)
-    pub fn new_bounded(id: SubscriberId, capacity: usize) -> (Self, Receiver<Arc<Message>>) {
-        Self::with_capacity(id, capacity)
+    /// Enqueues a message into this subscriber's queue and notifies the flush task.
+    ///
+    /// Returns `Err(BlipError::QueueFull)` if the queue is at capacity.
+    pub fn enqueue(&self, msg: Arc<Message>) -> Result<(), BlipError> {
+        self.queue.enqueue(msg)?;
+        self.notifier.notify_one();
+        Ok(())
     }
 
-    /// Internal helper to create a subscriber with specified capacity.
-    fn with_capacity(id: SubscriberId, capacity: usize) -> (Self, Receiver<Arc<Message>>) {
-        let (tx, rx) = mpsc::channel(capacity);
-        (Self { id, sender: tx }, rx)
-    }
-
-    #[inline(always)]
+    /// Returns the subscriber's ID.
     pub fn id(&self) -> &SubscriberId {
         &self.id
     }
 
-    #[inline(always)]
-    pub fn sender(&self) -> &Sender<Arc<Message>> {
-        &self.sender
-    }
-
-    #[inline(always)]
-    pub fn try_send(&self, msg: Arc<Message>) -> Result<(), BlipError> {
-        self.sender.try_send(msg).map_err(|_| BlipError::QueueFull)
-    }
-
-    // Creates a subscriber and returns the receiver separately
-    pub fn new_with_receiver(id: SubscriberId) -> (Self, Receiver<Arc<Message>>) {
-        Self::new(id)
-    }
-    /// Creates a subscriber with a custom queue capacity and returns the receiver.
-    pub fn new_with_receiver_capacity(
-        id: SubscriberId,
-        capacity: usize,
-    ) -> (Self, Receiver<Arc<Message>>) {
-        Self::with_capacity(id, capacity)
-    }
-
-    /// Returns `true` if the subscriber's channel is closed.
-    pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+    /// Expose the internal queue so the broker can push into it.
+    pub fn queue(&self) -> Arc<Queue> {
+        Arc::clone(&self.queue)
     }
 }

@@ -1,22 +1,27 @@
 [server]
-bind_addr = "127.0.0.1:8080"
-max_connections = 100
+bind_addr        = "127.0.0.1:8080"
+max_connections  = 100
 
 [auth]
 api_keys = ["supersecretkey"]
 
 [queues]
-max_queue_depth = 1000
-overflow_policy = "drop_oldest"
+# How many messages each topic’s flume channel can buffer
+topic_capacity       = 1000
+# How many messages each subscriber’s SPSC queue can buffer
+subscriber_capacity  = 512
+overflow_policy      = "drop_oldest"
 
 [wal]
-directory = "./wal"
-segment_size_bytes = 1048576
-flush_interval_ms = 5000
+directory            = "./wal"
+segment_size_bytes   = 1048576
+flush_interval_ms    = 5000
 
 [metrics]
-bind_addr = "127.0.0.1:9090"
+bind_addr            = "127.0.0.1:9090"
 
 [delivery]
 # Maximum number of messages to coalesce per subscriber flush
-max_batch = 64
+max_batch        = 64
+# Default TTL for every new message (milliseconds)
+default_ttl_ms   = 60000

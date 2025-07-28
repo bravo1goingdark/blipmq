@@ -2,64 +2,42 @@
 //!
 //! Loads a structured TOML file into strongly‐typed structs (`Config`, `ServerConfig`, etc.)
 //! using `serde` + `toml`.
-//!
-//! # Example `blipmq.toml`
-//! ```toml
-//! [server]
-//! bind_addr        = "0.0.0.0:6379"
-//! max_connections  = 10_000
-//!
-//! [auth]
-//! api_keys = ["secret-key-1", "secret-key-2"]
-//!
-//! [queues]
-//! max_queue_depth   = 1_000_000
-//! overflow_policy   = "drop_oldest"
-//!
-//! [wal]
-//! directory          = "./data/wal"
-//! segment_size_bytes = 134_217_728   # 128 MiB
-//! flush_interval_ms  = 50            # ms
-//!
-//! [metrics]
-//! bind_addr = "127.0.0.1:9100"
-//!
-//! [delivery]
-//! max_batch = 32             # maximum messages per flush
-//! ```
-//! # Usage
-//! ```rust
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let cfg = blipmq::config::load_config("./blipmq.toml")?;
-//!     println!("Broker listening on {}", cfg.server.bind_addr);
-//!     println!("Delivery max_batch = {}", cfg.delivery.max_batch);
-//!     Ok(())
-//! }
-//! ```
+//! Default values are provided via `#[serde(default)]` and `impl Default` where appropriate.
 
 use serde::Deserialize;
 use std::{fs, path::Path};
+use once_cell::sync::Lazy;
 
+/// Server listen address & connection limits
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub max_connections: usize,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// API‐key based authentication
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct AuthConfig {
     /// API keys allowed to publish/subscribe. Empty = no auth.
-    #[serde(default)]
     pub api_keys: Vec<String>,
 }
 
+/// Topic‐level & subscriber‐level queue settings
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueueConfig {
-    pub max_queue_depth: usize,
-    /// Overflow policy when queue is full: "drop_oldest" | "drop_new" | "block"
+    /// Flume capacity for each topic input queue
+    #[serde(alias = "max_queue_depth")]
+    pub topic_capacity: usize,
+
+    /// ArrayQueue capacity for each subscriber
+    pub subscriber_capacity: usize,
+
+    /// Overflow policy: "drop_oldest" | "drop_new" | "block"
     pub overflow_policy: String,
 }
 
+/// Write‐Ahead‐Log settings
 #[derive(Debug, Deserialize, Clone)]
 pub struct WalConfig {
     pub directory: String,
@@ -67,42 +45,54 @@ pub struct WalConfig {
     pub flush_interval_ms: u64,
 }
 
+/// Metrics endpoint
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetricsConfig {
     pub bind_addr: String,
 }
 
-/// Controls batching and flush behavior in subscriber delivery.
+/// Subscriber flush parameters & per‐message TTL
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct DeliveryConfig {
-    /// Maximum number of messages to coalesce per flush.
+    /// Max messages per flush batch
     pub max_batch: usize,
+
+    /// Default TTL for each new message (ms)
+    pub default_ttl_ms: u64,
 }
 
 impl Default for DeliveryConfig {
     fn default() -> Self {
-        DeliveryConfig { max_batch: 64 }
+        DeliveryConfig {
+            max_batch: 64,
+            default_ttl_ms: 0,
+        }
     }
 }
 
+/// Top‐level BlipMQ configuration
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub server: ServerConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     pub queues: QueueConfig,
     pub wal: WalConfig,
     pub metrics: MetricsConfig,
-
-    /// Subscriber delivery tuning parameters.
-    /// If omitted in TOML, defaults will be applied.
     #[serde(default)]
     pub delivery: DeliveryConfig,
 }
 
-/// Load configuration from a TOML file into `Config`.
+/// Global, lazily‐loaded config instance from `blipmq.toml`
+pub static CONFIG: Lazy<Config> = Lazy::new(|| {
+    let toml_str = fs::read_to_string("blipmq.toml")
+        .expect("Could not find blipmq.toml in working directory");
+    toml::from_str(&toml_str).expect("Invalid blipmq.toml format")
+});
+
+/// Convenience loader if you need a custom path
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config, anyhow::Error> {
-    let raw: String = fs::read_to_string(&path)?;
-    let cfg: Config = toml::from_str(&raw)?;
-    Ok(cfg)
+    let raw = fs::read_to_string(path)?;
+    Ok(toml::from_str(&raw)?)
 }

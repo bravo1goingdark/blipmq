@@ -1,56 +1,60 @@
+use crate::core::queue::QueueBehavior;
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
 
-use crate::core::message::Message;
-use crate::core::queue::{qos0, QueueBehavior};
+pub enum QoS {
+    QoS0,
+    QoS1,
+}
 
-/// A thread-safe manager for per-subscriber queues.
-///
-/// Uses Tokio mpsc senders for QoS 0 queues (non-blocking, high-throughput).
 #[derive(Debug, Default)]
 pub struct QueueManager {
-    queues: DashMap<String, Arc<dyn QueueBehavior>>,
+    queues: DashMap<String, Arc<dyn QueueBehavior + Send + Sync>>,
 }
 
 impl QueueManager {
-    #[inline]
     pub fn new() -> Self {
         Self {
             queues: DashMap::new(),
         }
     }
 
-    /// Gets or creates a queue for a given subscriber ID using an async sender.
-    ///
-    /// If a queue already exists for the subscriber, returns it.
+    /// Get or create a queue for this subscriber with the given QoS and capacity.
     pub fn get_or_create(
         &self,
-        subscriber_id: &str,
-        sender: Sender<Arc<Message>>,
-    ) -> Arc<dyn QueueBehavior> {
-        if let Some(existing) = self.queues.get(subscriber_id) {
-            return Arc::clone(&*existing);
-        }
+        subscriber_id: impl Into<String>,
+        qos: QoS,
+        capacity: usize,
+    ) -> Arc<dyn QueueBehavior + Send + Sync> {
+        let key = subscriber_id.into();
 
-        let queue: Arc<dyn QueueBehavior> =
-            Arc::new(qos0::Queue::new(subscriber_id.to_string(), sender));
-
-        let entry = self
-            .queues
-            .entry(subscriber_id.to_string())
-            .or_insert_with(|| Arc::clone(&queue));
+        // entry closure captures `qos`, `capacity`, and `key` by move
+        let entry = self.queues.entry(key.clone()).or_insert_with(|| {
+            // Build the concrete queue based on QoS
+            let queue: Arc<dyn QueueBehavior + Send + Sync> = match qos {
+                QoS::QoS0 => {
+                    let q = crate::core::queue::qos0::Queue::new(key.clone(), capacity);
+                    Arc::new(q)
+                }
+                QoS::QoS1 => {
+                    // TODO: once we implement qos1::Queue, swap this out
+                    let q = crate::core::queue::qos0::Queue::new(key.clone(), capacity);
+                    Arc::new(q)
+                }
+            };
+            queue
+        });
 
         Arc::clone(&*entry)
     }
 
     #[inline]
-    pub fn count(&self) -> usize {
-        self.queues.len()
+    pub fn remove(&self, subscriber_id: &str) {
+        self.queues.remove(subscriber_id);
     }
 
     #[inline]
-    pub fn remove(&self, subscriber_id: &str) {
-        self.queues.remove(subscriber_id);
+    pub fn count(&self) -> usize {
+        self.queues.len()
     }
 }

@@ -1,7 +1,8 @@
 //! CLI client for BlipMQ broker.
 //!
 //! Provides a convenient command-line interface for publishing, subscribing, and
-//! unsubscribing from topics on a running BlipMQ instance.
+//! unsubscribing from topics on a running BlipMQ instance, with support for
+//! configurable per-message TTLs via blipmq.toml.
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
@@ -9,7 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::info;
 
-use blipmq::core::command::{encode_command, new_pub, new_sub, new_unsub};
+use blipmq::config::CONFIG;
+use blipmq::core::command::{encode_command, new_pub_with_ttl, new_sub, new_unsub};
 use blipmq::core::message::decode_message;
 
 /// Command-line interface for BlipMQ.
@@ -17,10 +19,10 @@ use blipmq::core::message::decode_message;
 #[command(
     name = "blipmq-cli",
     version,
-    about = "BlipMQ CLI: pub/sub/unsub commands"
+    about = "BlipMQ CLI: pub/sub/unsub commands with TTL support"
 )]
 pub struct Cli {
-    /// Address of the BlipMQ broker (e.g. 127.0.0.1:6379)
+    /// Address of the BlipMQ broker (e.g. 127.0.0.1:8080)
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     pub addr: SocketAddr,
 
@@ -35,6 +37,9 @@ pub enum Command {
     Pub {
         /// Topic name
         topic: String,
+        /// Optional TTL in milliseconds (defaults to CONFIG.delivery.default_ttl_ms)
+        #[arg(short, long)]
+        ttl: Option<u64>,
         /// Message payload (enclose in quotes for spaces)
         message: String,
     },
@@ -52,7 +57,6 @@ pub enum Command {
     },
 }
 
-/// Entrypoint: parse CLI args and dispatch commands.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -63,50 +67,59 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", cli.addr, e))?;
 
     let (read_half, mut write_half) = stream.split();
-    let reader = BufReader::new(read_half).lines();
+    let mut lines = BufReader::new(read_half).lines();
 
-    // Send command in protobuf format
+    // Build the appropriate command, using TTL override or default
     let cmd = match &cli.command {
-        Command::Pub { topic, message } => new_pub(topic.clone(), message.clone()),
+        Command::Pub {
+            topic,
+            ttl,
+            message,
+        } => {
+            let ttl_ms = ttl.unwrap_or(CONFIG.delivery.default_ttl_ms);
+            new_pub_with_ttl(topic.clone(), message.clone(), ttl_ms)
+        }
         Command::Sub { topic } => new_sub(topic.clone()),
         Command::Unsub { topic } => new_unsub(topic.clone()),
     };
 
+    // Encode and send
     let encoded = encode_command(&cmd);
-    let len_prefix = (encoded.len() as u32).to_be_bytes();
-    write_half.write_all(&len_prefix).await?;
+    write_half
+        .write_all(&(encoded.len() as u32).to_be_bytes())
+        .await?;
     write_half.write_all(&encoded).await?;
-    info!("Sent request: {:?}", cmd.action);
+    info!("Sent request: action={}", cmd.action);
 
-    let mut lines = reader;
-    // Handle subscription with binary Protobuf decoding
+    // For Pub and Sub, read confirmation and then raw messages
     if matches!(cli.command, Command::Pub { .. } | Command::Sub { .. }) {
-        // ✅ Step 1: Read and print OK SUB line
         if let Ok(Some(line)) = lines.next_line().await {
             println!("> {}", line.trim());
         } else {
-            println!("> Failed to receive subscription confirmation");
+            eprintln!("> Failed to receive broker confirmation");
             return Ok(());
         }
 
-        // ✅ Step 2: Switch to raw binary mode
-        let mut raw_reader = lines.into_inner();
-
+        // Now switch to raw binary reading
+        let mut raw = lines.into_inner();
         loop {
             let mut len_buf = [0u8; 4];
-            if raw_reader.read_exact(&mut len_buf).await.is_err() {
+            if raw.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
             let msg_len = u32::from_be_bytes(len_buf) as usize;
-
             let mut msg_buf = vec![0u8; msg_len];
-            if raw_reader.read_exact(&mut msg_buf).await.is_err() {
+            if raw.read_exact(&mut msg_buf).await.is_err() {
                 break;
             }
-
-            if let Ok(message) = decode_message(&msg_buf) {
-                let payload = String::from_utf8_lossy(&message.payload);
-                println!("{} {} {}", message.id, payload, message.timestamp);
+            match decode_message(&msg_buf) {
+                Ok(msg) => {
+                    let payload = String::from_utf8_lossy(&msg.payload);
+                    println!("{} {} @{}", msg.id, payload, msg.timestamp);
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to decode message: {}", e);
+                }
             }
         }
 
