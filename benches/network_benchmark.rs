@@ -1,3 +1,4 @@
+use blipmq::config::CONFIG;
 use blipmq::core::command::{encode_command, new_pub, new_sub};
 use blipmq::start_broker;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -5,10 +6,12 @@ use log::{error, info};
 use nats;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{sink, BufWriter};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::Barrier;
+use tokio::sync::Mutex as TokioMutex;
 
 const NUM_SUBSCRIBERS: usize = 25;
 const NUM_MESSAGES: usize = 25000;

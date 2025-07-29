@@ -7,8 +7,6 @@ use flume::{Receiver, Sender};
 use crate::core::delivery_mode::DeliveryMode;
 use crate::core::error::BlipError;
 use crate::core::message::Message;
-use crate::core::queue::qos0::Queue as QoS0Queue;
-use crate::core::queue::QueueBehavior;
 use crate::core::subscriber::{Subscriber, SubscriberId};
 
 pub type TopicName = String;
@@ -20,7 +18,7 @@ pub type TopicName = String;
 #[derive(Debug)]
 pub struct Topic {
     name: TopicName,
-    subscribers: DashMap<SubscriberId, Arc<QoS0Queue>>,
+    subscribers: Arc<DashMap<SubscriberId, Subscriber>>,
     input_tx: Sender<Arc<Message>>,
 }
 
@@ -31,7 +29,7 @@ impl Topic {
         let (tx, rx) = flume::bounded(queue_capacity);
         let topic = Self {
             name: name.clone(),
-            subscribers: DashMap::new(),
+            subscribers: Arc::new(DashMap::new()),
             input_tx: tx,
         };
         topic.spawn_fanout_task(rx);
@@ -40,7 +38,7 @@ impl Topic {
 
     /// Starts the fanout loop: pulls from flume and sends to subscriber queues.
     fn spawn_fanout_task(&self, rx: Receiver<Arc<Message>>) {
-        let subscribers = self.subscribers.clone();
+        let subscribers = Arc::clone(&self.subscribers);
         let topic_name = self.name.clone();
 
         task::spawn(async move {
@@ -48,14 +46,20 @@ impl Topic {
                 let mut disconnected = vec![];
 
                 for entry in subscribers.iter() {
-                    let queue = entry.value();
+                    let subscriber = entry.value();
 
-                    if let Err(err) = queue.enqueue(message.clone()) {
-                        match err {
-                            BlipError::Disconnected | BlipError::QueueClosed => {
-                                disconnected.push(entry.key().clone());
+                    match subscriber.enqueue(message.clone()) {
+                        Ok(_) => {
+                            tracing::debug!(target="blipmq::topic", subscriber=%subscriber.id(), "enqueued");
+                        }
+                        Err(err) => {
+                            tracing::debug!(target="blipmq::topic", subscriber=%subscriber.id(), err=?err, "enqueue failed");
+                            match err {
+                                BlipError::Disconnected | BlipError::QueueClosed => {
+                                    disconnected.push(entry.key().clone());
+                                }
+                                _ => {} // other errors: ignore
                             }
-                            _ => {} // other errors: ignore
                         }
                     }
                 }
@@ -91,15 +95,11 @@ impl Topic {
     ///
     /// * `subscriber` – the new subscriber (owns its ID and TCP sender)
     /// * `capacity` – max number of messages this subscriber can buffer
-    pub async fn subscribe(&self, subscriber: Subscriber, capacity: usize) {
+    pub async fn subscribe(&self, subscriber: Subscriber, _capacity: usize) {
         // Clone the SubscriberId so we pass an owned String into QoS0Queue::new
         let subscriber_id = subscriber.id().clone();
 
-        // Create the per-subscriber SPSC queue
-        let queue = Arc::new(QoS0Queue::new(subscriber_id.clone(), capacity));
-
-        // Insert into our DashMap keyed by owned SubscriberId
-        self.subscribers.insert(subscriber_id, queue);
+        self.subscribers.insert(subscriber_id, subscriber);
     }
 
     /// Removes a subscriber from this topic.

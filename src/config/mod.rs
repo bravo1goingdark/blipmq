@@ -4,9 +4,9 @@
 //! using `serde` + `toml`.
 //! Default values are provided via `#[serde(default)]` and `impl Default` where appropriate.
 
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::{fs, path::Path};
-use once_cell::sync::Lazy;
 
 /// Server listen address & connection limits
 #[derive(Debug, Deserialize, Clone)]
@@ -86,8 +86,8 @@ pub struct Config {
 
 /// Global, lazily‐loaded config instance from `blipmq.toml`
 pub static CONFIG: Lazy<Config> = Lazy::new(|| {
-    let toml_str = fs::read_to_string("blipmq.toml")
-        .expect("Could not find blipmq.toml in working directory");
+    let toml_str =
+        fs::read_to_string("blipmq.toml").expect("Could not find blipmq.toml in working directory");
     toml::from_str(&toml_str).expect("Invalid blipmq.toml format")
 });
 

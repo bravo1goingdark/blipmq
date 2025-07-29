@@ -2,8 +2,8 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::core::topics::topic::{Topic, TopicName};
-use crate::config::CONFIG;  // <- import the global config
+use crate::config::CONFIG;
+use crate::core::topics::topic::{Topic, TopicName}; // <- import the global config
 
 /// [`TopicRegistry`] is a thread-safe store for managing active topics.
 ///

@@ -3,22 +3,23 @@
 //! Uses length-prefixed Protobuf frames for both SUB-ACK and published messages.
 
 use crate::config::CONFIG;
+use crate::core::message::proto::server_frame::Body as FrameBody;
 use crate::core::{
     command::{decode_command, Action, ClientCommand},
-    message::{new_message_with_ttl, encode_frame_into, ServerFrame, SubAck},
+    message::{encode_frame_into, new_message_with_ttl, ServerFrame, SubAck},
     subscriber::{Subscriber, SubscriberId},
     topics::TopicRegistry,
 };
-use crate::core::message::proto::server_frame::Body as FrameBody;
+
 use bytes::BytesMut;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::{
     io::{AsyncReadExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::Mutex,
     task,
 };
-use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
 
 /// Starts the BlipMQ broker server, with settings from `blipmq.toml`.
@@ -77,14 +78,21 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
         match Action::try_from(cmd.action).ok() {
             Some(Action::Pub) => {
                 if let Some(topic) = registry.get_topic(&cmd.topic) {
-                    topic.publish(Arc::new(new_message_with_ttl(cmd.payload, cmd.ttl_ms))).await;
+                    topic
+                        .publish(Arc::new(new_message_with_ttl(cmd.payload, cmd.ttl_ms)))
+                        .await;
                 }
             }
 
             Some(Action::Sub) => {
                 // Send SubAck frame
-                let ack = SubAck { topic: cmd.topic.clone(), info: "subscribed".into() };
-                let frame = ServerFrame { body: Some(FrameBody::SubAck(ack)) };
+                let ack = SubAck {
+                    topic: cmd.topic.clone(),
+                    info: "subscribed".into(),
+                };
+                let frame = ServerFrame {
+                    body: Some(FrameBody::SubAck(ack)),
+                };
                 let mut buf = BytesMut::new();
                 encode_frame_into(&frame, &mut buf);
                 {
@@ -95,7 +103,8 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
 
                 // Register subscription
                 let t = registry.create_or_get_topic(&cmd.topic);
-                t.subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity).await;
+                t.subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
+                    .await;
                 subscriptions.push(cmd.topic.clone());
             }
 

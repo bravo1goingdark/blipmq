@@ -1,15 +1,15 @@
 //! Subscriber module: manages per-subscriber queue and background reactive flush loop.
 
 use crate::config::CONFIG;
-use crate::core::message::{Message, encode_message_into, current_timestamp};
 use crate::core::error::BlipError;
+use crate::core::message::{current_timestamp, encode_message_into, Message};
 use crate::core::queue::qos0::Queue;
 use crate::core::queue::QueueBehavior;
 
 use bytes::BytesMut;
 use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::io::BufWriter;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 
 /// Unique identifier for a subscriber.
@@ -114,7 +114,11 @@ impl Subscriber {
             tracing::info!("Flush task ended for subscriber {}", id_clone);
         });
 
-        Subscriber { id, queue, notifier }
+        Subscriber {
+            id,
+            queue,
+            notifier,
+        }
     }
 
     /// Enqueues a message into this subscriber's queue and notifies the flush task.

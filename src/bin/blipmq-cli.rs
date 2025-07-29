@@ -12,7 +12,7 @@ use tracing::info;
 
 use blipmq::config::CONFIG;
 use blipmq::core::command::{encode_command, new_pub_with_ttl, new_sub, new_unsub};
-use blipmq::core::message::decode_message;
+use blipmq::core::message::{decode_frame, proto::server_frame::Body as FrameBody};
 
 /// Command-line interface for BlipMQ.
 #[derive(Debug, Parser)]
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", cli.addr, e))?;
 
     let (read_half, mut write_half) = stream.split();
-    let mut lines = BufReader::new(read_half).lines();
+    let lines = BufReader::new(read_half).lines();
 
     // Build the appropriate command, using TTL override or default
     let cmd = match &cli.command {
@@ -92,16 +92,37 @@ async fn main() -> anyhow::Result<()> {
     info!("Sent request: action={}", cmd.action);
 
     // For Pub and Sub, read confirmation and then raw messages
-    if matches!(cli.command, Command::Pub { .. } | Command::Sub { .. }) {
-        if let Ok(Some(line)) = lines.next_line().await {
-            println!("> {}", line.trim());
-        } else {
-            eprintln!("> Failed to receive broker confirmation");
+    if matches!(cli.command, Command::Sub { .. }) {
+        // Switch to raw reader for binary frames
+        let mut raw = lines.into_inner();
+
+        // Read the length-prefixed SubAck frame
+        let mut len_buf = [0u8; 4];
+        if raw.read_exact(&mut len_buf).await.is_err() {
+            eprintln!("> Failed to read SubAck length");
+        }
+        let ack_len = u32::from_be_bytes(len_buf) as usize;
+        let mut ack_buf = vec![0u8; ack_len];
+        if raw.read_exact(&mut ack_buf).await.is_err() {
+            eprintln!("> Failed to read SubAck payload");
             return Ok(());
         }
+        match decode_frame(&ack_buf) {
+            Ok(frame) => {
+                if let Some(FrameBody::SubAck(ack)) = frame.body {
+                    println!("> {}", ack.info);
+                } else {
+                    eprintln!("> Unexpected frame from broker");
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                eprintln!("> Failed to decode SubAck: {e}");
+                return Ok(());
+            }
+        }
 
-        // Now switch to raw binary reading
-        let mut raw = lines.into_inner();
+        // Now read streaming messages
         loop {
             let mut len_buf = [0u8; 4];
             if raw.read_exact(&mut len_buf).await.is_err() {
@@ -112,13 +133,18 @@ async fn main() -> anyhow::Result<()> {
             if raw.read_exact(&mut msg_buf).await.is_err() {
                 break;
             }
-            match decode_message(&msg_buf) {
-                Ok(msg) => {
-                    let payload = String::from_utf8_lossy(&msg.payload);
-                    println!("{} {} @{}", msg.id, payload, msg.timestamp);
+
+            match decode_frame(&msg_buf) {
+                Ok(frame) => {
+                    if let Some(FrameBody::Message(msg)) = frame.body {
+                        let payload = String::from_utf8_lossy(&msg.payload);
+                        println!("{} {} @{}", msg.id, payload, msg.timestamp);
+                    } else {
+                        eprintln!("⚠️ Unexpected frame: {:?}", frame);
+                    }
                 }
                 Err(e) => {
-                    eprintln!("❌ Failed to decode message: {}", e);
+                    eprintln!("❌ Failed to decode frame: {}", e);
                 }
             }
         }
