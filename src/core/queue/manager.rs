@@ -1,3 +1,4 @@
+use crate::config::CONFIG;
 use crate::core::queue::QueueBehavior;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -33,12 +34,20 @@ impl QueueManager {
             // Build the concrete queue based on QoS
             let queue: Arc<dyn QueueBehavior + Send + Sync> = match qos {
                 QoS::QoS0 => {
-                    let q = crate::core::queue::qos0::Queue::new(key.clone(), capacity);
+                    let q = crate::core::queue::qos0::Queue::new(
+                        key.clone(),
+                        capacity,
+                        CONFIG.queues.overflow_policy,
+                    );
                     Arc::new(q)
                 }
                 QoS::QoS1 => {
                     // TODO: once we implement qos1::Queue, swap this out
-                    let q = crate::core::queue::qos0::Queue::new(key.clone(), capacity);
+                    let q = crate::core::queue::qos0::Queue::new(
+                        key.clone(),
+                        capacity,
+                        CONFIG.queues.overflow_policy,
+                    );
                     Arc::new(q)
                 }
             };

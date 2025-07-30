@@ -51,12 +51,12 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
 
     let shared_writer = Arc::new(Mutex::new(BufWriter::new(writer_half)));
 
-    // Subscriber flush task
     let subscriber_id = SubscriberId::from(peer.to_string());
     let subscriber = Subscriber::new(subscriber_id.clone(), shared_writer.clone());
 
     let mut len_buf = [0u8; 4];
     let mut cmd_buf = Vec::with_capacity(4096);
+    let mut frame_buf = BytesMut::with_capacity(1024); // Reused for SubAck
     let mut subscriptions = Vec::new();
 
     loop {
@@ -65,6 +65,7 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
             break;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        cmd_buf.clear();
         cmd_buf.resize(len, 0);
         if reader.read_exact(&mut cmd_buf).await.is_err() {
             break;
@@ -85,7 +86,7 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
             }
 
             Some(Action::Sub) => {
-                // Send SubAck frame
+                // SubAck response
                 let ack = SubAck {
                     topic: cmd.topic.clone(),
                     info: "subscribed".into(),
@@ -93,17 +94,19 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
                 let frame = ServerFrame {
                     body: Some(FrameBody::SubAck(ack)),
                 };
-                let mut buf = BytesMut::new();
-                encode_frame_into(&frame, &mut buf);
+
+                frame_buf.clear();
+                encode_frame_into(&frame, &mut frame_buf);
                 {
                     let mut w = shared_writer.lock().await;
-                    w.write_all(&buf).await?;
+                    w.write_all(&frame_buf).await?;
                     w.flush().await?;
                 }
 
                 // Register subscription
-                let t = registry.create_or_get_topic(&cmd.topic);
-                t.subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
+                let topic = registry.create_or_get_topic(&cmd.topic);
+                topic
+                    .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
                     .await;
                 subscriptions.push(cmd.topic.clone());
             }

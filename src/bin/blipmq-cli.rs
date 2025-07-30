@@ -6,12 +6,14 @@
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::info;
 
 use blipmq::config::CONFIG;
-use blipmq::core::command::{encode_command, new_pub_with_ttl, new_sub, new_unsub};
+use blipmq::core::command::{
+    encode_command_with_len_prefix, new_pub_with_ttl, new_sub, new_unsub,
+};
 use blipmq::core::message::{decode_frame, proto::server_frame::Body as FrameBody};
 
 /// Command-line interface for BlipMQ.
@@ -67,9 +69,9 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", cli.addr, e))?;
 
     let (read_half, mut write_half) = stream.split();
-    let lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
 
-    // Build the appropriate command, using TTL override or default
+    // Build and send command
     let cmd = match &cli.command {
         Command::Pub {
             topic,
@@ -83,66 +85,60 @@ async fn main() -> anyhow::Result<()> {
         Command::Unsub { topic } => new_unsub(topic.clone()),
     };
 
-    // Encode and send
-    let encoded = encode_command(&cmd);
-    write_half
-        .write_all(&(encoded.len() as u32).to_be_bytes())
-        .await?;
-    write_half.write_all(&encoded).await?;
+    let frame = encode_command_with_len_prefix(&cmd);
+    write_half.write_all(&frame).await?;
     info!("Sent request: action={}", cmd.action);
 
-    // For Pub and Sub, read confirmation and then raw messages
+    // Only Sub needs to handle incoming frames
     if matches!(cli.command, Command::Sub { .. }) {
-        // Switch to raw reader for binary frames
-        let mut raw = lines.into_inner();
-
-        // Read the length-prefixed SubAck frame
+        // Read SubAck first
         let mut len_buf = [0u8; 4];
-        if raw.read_exact(&mut len_buf).await.is_err() {
+        if reader.read_exact(&mut len_buf).await.is_err() {
             eprintln!("> Failed to read SubAck length");
+            return Ok(());
         }
         let ack_len = u32::from_be_bytes(len_buf) as usize;
         let mut ack_buf = vec![0u8; ack_len];
-        if raw.read_exact(&mut ack_buf).await.is_err() {
+        if reader.read_exact(&mut ack_buf).await.is_err() {
             eprintln!("> Failed to read SubAck payload");
             return Ok(());
         }
+
         match decode_frame(&ack_buf) {
-            Ok(frame) => {
-                if let Some(FrameBody::SubAck(ack)) = frame.body {
-                    println!("> {}", ack.info);
-                } else {
-                    eprintln!("> Unexpected frame from broker");
+            Ok(frame) => match frame.body {
+                Some(FrameBody::SubAck(ack)) => println!("> {}", ack.info),
+                _ => {
+                    eprintln!("> Unexpected frame instead of SubAck");
                     return Ok(());
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("> Failed to decode SubAck: {e}");
                 return Ok(());
             }
         }
 
-        // Now read streaming messages
+        // Read message frames indefinitely
         loop {
-            let mut len_buf = [0u8; 4];
-            if raw.read_exact(&mut len_buf).await.is_err() {
+            if reader.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
             let msg_len = u32::from_be_bytes(len_buf) as usize;
             let mut msg_buf = vec![0u8; msg_len];
-            if raw.read_exact(&mut msg_buf).await.is_err() {
+            if reader.read_exact(&mut msg_buf).await.is_err() {
                 break;
             }
 
             match decode_frame(&msg_buf) {
-                Ok(frame) => {
-                    if let Some(FrameBody::Message(msg)) = frame.body {
+                Ok(frame) => match frame.body {
+                    Some(FrameBody::Message(msg)) => {
                         let payload = String::from_utf8_lossy(&msg.payload);
                         println!("{} {} @{}", msg.id, payload, msg.timestamp);
-                    } else {
+                    }
+                    _ => {
                         eprintln!("⚠️ Unexpected frame: {:?}", frame);
                     }
-                }
+                },
                 Err(e) => {
                     eprintln!("❌ Failed to decode frame: {}", e);
                 }

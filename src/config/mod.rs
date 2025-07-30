@@ -8,6 +8,8 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
+use crate::core::queue::qos0::OverflowPolicy;
+
 /// Server listen address & connection limits
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
@@ -34,7 +36,7 @@ pub struct QueueConfig {
     pub subscriber_capacity: usize,
 
     /// Overflow policy: "drop_oldest" | "drop_new" | "block"
-    pub overflow_policy: String,
+    pub overflow_policy: OverflowPolicy,
 }
 
 /// Write‐Ahead‐Log settings

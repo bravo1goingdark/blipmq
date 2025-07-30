@@ -67,7 +67,11 @@ impl Subscriber {
         let max_batch = CONFIG.delivery.max_batch;
 
         // Create bounded SPSC queue and notifier
-        let queue = Arc::new(Queue::new(id.0.clone(), capacity));
+        let queue = Arc::new(Queue::new(
+            id.0.clone(),
+            capacity,
+            CONFIG.queues.overflow_policy,
+        ));
         let notifier = Arc::new(Notify::new());
         let queue_clone = Arc::clone(&queue);
         let notifier_clone = Arc::clone(&notifier);
@@ -81,21 +85,15 @@ impl Subscriber {
                 // Wait for at least one notification
                 notifier_clone.notified().await;
 
-                // Batch up to `max_batch` messages
-                let mut count = 0;
-                while count < max_batch {
-                    match queue_clone.dequeue() {
-                        Some(msg) => {
-                            // Enforce TTL: drop if expired
-                            let now = current_timestamp();
-                            if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
-                                continue;
-                            }
-                            encode_message_into(&msg, &mut buffer);
-                            count += 1;
-                        }
-                        None => break,
+                let now = current_timestamp();
+                let messages = queue_clone.drain(max_batch);
+
+                for msg in messages {
+                    // Enforce TTL
+                    if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
+                        continue;
                     }
+                    encode_message_into(&msg, &mut buffer);
                 }
 
                 // Write and flush the batch

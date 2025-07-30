@@ -3,4 +3,5 @@
 pub enum DeliveryMode {
     /// Guarantees in-order delivery (default).
     Ordered,
+    Parallel,
 }
