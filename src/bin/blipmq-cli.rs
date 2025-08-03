@@ -11,10 +11,8 @@ use tokio::net::TcpStream;
 use tracing::info;
 
 use blipmq::config::CONFIG;
-use blipmq::core::command::{
-    encode_command_with_len_prefix, new_pub_with_ttl, new_sub, new_unsub,
-};
-use blipmq::core::message::{decode_frame, proto::server_frame::Body as FrameBody};
+use blipmq::core::command::{encode_command_with_len_prefix, new_pub_with_ttl, new_sub, new_unsub};
+use blipmq::core::message::{decode_frame, ServerFrame};
 
 /// Command-line interface for BlipMQ.
 #[derive(Debug, Parser)]
@@ -87,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let frame = encode_command_with_len_prefix(&cmd);
     write_half.write_all(&frame).await?;
-    info!("Sent request: action={}", cmd.action);
+    info!("Sent request: action={:?}", cmd.action);
 
     // Only Sub needs to handle incoming frames
     if matches!(cli.command, Command::Sub { .. }) {
@@ -105,13 +103,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         match decode_frame(&ack_buf) {
-            Ok(frame) => match frame.body {
-                Some(FrameBody::SubAck(ack)) => println!("> {}", ack.info),
-                _ => {
-                    eprintln!("> Unexpected frame instead of SubAck");
-                    return Ok(());
-                }
-            },
+            Ok(ServerFrame::SubAck(ack)) => println!("> {}", ack.info),
+            Ok(_) => {
+                eprintln!("> Unexpected frame instead of SubAck");
+                return Ok(());
+            }
             Err(e) => {
                 eprintln!("> Failed to decode SubAck: {e}");
                 return Ok(());
@@ -130,15 +126,13 @@ async fn main() -> anyhow::Result<()> {
             }
 
             match decode_frame(&msg_buf) {
-                Ok(frame) => match frame.body {
-                    Some(FrameBody::Message(msg)) => {
-                        let payload = String::from_utf8_lossy(&msg.payload);
-                        println!("{} {} @{}", msg.id, payload, msg.timestamp);
-                    }
-                    _ => {
-                        eprintln!("⚠️ Unexpected frame: {:?}", frame);
-                    }
-                },
+                Ok(ServerFrame::Message(msg)) => {
+                    let payload = String::from_utf8_lossy(&msg.payload);
+                    println!("{} {} @{}", msg.id, payload, msg.timestamp);
+                }
+                Ok(_) => {
+                    eprintln!("⚠️ Unexpected frame");
+                }
                 Err(e) => {
                     eprintln!("❌ Failed to decode frame: {}", e);
                 }

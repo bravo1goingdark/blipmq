@@ -1,9 +1,8 @@
 //! Server engine for BlipMQ broker.
 //!
-//! Uses length-prefixed Protobuf frames for both SUB-ACK and published messages.
+//! Uses length-prefixed FlatBuffers for all protocol messages.
 
 use crate::config::CONFIG;
-use crate::core::message::proto::server_frame::Body as FrameBody;
 use crate::core::{
     command::{decode_command, Action, ClientCommand},
     message::{encode_frame_into, new_message_with_ttl, ServerFrame, SubAck},
@@ -76,8 +75,8 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
             Err(_) => continue,
         };
 
-        match Action::try_from(cmd.action).ok() {
-            Some(Action::Pub) => {
+        match cmd.action {
+            Action::Pub => {
                 if let Some(topic) = registry.get_topic(&cmd.topic) {
                     topic
                         .publish(Arc::new(new_message_with_ttl(cmd.payload, cmd.ttl_ms)))
@@ -85,15 +84,13 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
                 }
             }
 
-            Some(Action::Sub) => {
+            Action::Sub => {
                 // SubAck response
                 let ack = SubAck {
                     topic: cmd.topic.clone(),
                     info: "subscribed".into(),
                 };
-                let frame = ServerFrame {
-                    body: Some(FrameBody::SubAck(ack)),
-                };
+                let frame = ServerFrame::SubAck(ack);
 
                 frame_buf.clear();
                 encode_frame_into(&frame, &mut frame_buf);
@@ -111,13 +108,13 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
                 subscriptions.push(cmd.topic.clone());
             }
 
-            Some(Action::Unsub) => {
+            Action::Unsub => {
                 if let Some(topic) = registry.get_topic(&cmd.topic) {
                     topic.unsubscribe(&subscriber_id).await;
                 }
             }
 
-            Some(Action::Quit) | None => break,
+            Action::Quit => break,
         }
     }
 

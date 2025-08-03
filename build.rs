@@ -1,20 +1,9 @@
-use std::env;
-use std::path::PathBuf;
+use flatbuffers_build::BuilderOptions;
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/core/proto/message.proto");
-    println!("cargo:rerun-if-changed=src/core/proto/command.proto");
+    println!("cargo:rerun-if-changed=src/core/fbs/blipmq.fbs");
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-    prost_build::Config::new()
-        .out_dir(&out_dir)
-        .compile_protos(
-            &[
-                "src/core/proto/message.proto",
-                "src/core/proto/command.proto",
-            ],
-            &["src/core/proto"],
-        )
-        .expect("Failed to compile .proto");
+    BuilderOptions::new_with_files(["src/core/fbs/blipmq.fbs"])
+        .compile()
+        .expect("Failed to compile FlatBuffers schema");
 }

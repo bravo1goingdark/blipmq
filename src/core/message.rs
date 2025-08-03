@@ -1,20 +1,37 @@
-//! Protobuf-backed types and serialization utilities for BlipMQ.
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use prost::Message as ProstMessage;
+use flatbuffers::{root, FlatBufferBuilder, InvalidFlatbuffer};
 
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/blipmq.rs"));
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
+}
+use generated::blipmq;
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub id: u64,
+    pub payload: Vec<u8>,
+    pub timestamp: u64,
+    pub ttl_ms: u64,
+}
+#[derive(Debug, Clone)]
+pub struct SubAck {
+    pub topic: String,
+    pub info: String,
 }
 
-pub use proto::{Message, ServerFrame, SubAck};
+#[derive(Debug, Clone)]
+pub enum ServerFrame {
+    SubAck(SubAck),
+    Message(Message),
+}
 
-/// Create a new `Message` with payload and default TTL (0).
+const FRAME_SUBACK: u8 = 0;
+const FRAME_MESSAGE: u8 = 1;
+
 pub fn new_message(payload: impl Into<Bytes>) -> Message {
     new_message_with_ttl(payload, 0)
 }
 
-/// Create a new `Message` with a specific TTL in milliseconds.
 pub fn new_message_with_ttl(payload: impl Into<Bytes>, ttl_ms: u64) -> Message {
     Message {
         id: generate_id(),
@@ -24,7 +41,6 @@ pub fn new_message_with_ttl(payload: impl Into<Bytes>, ttl_ms: u64) -> Message {
     }
 }
 
-/// Returns current UNIX timestamp in milliseconds.
 pub fn current_timestamp() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -33,7 +49,6 @@ pub fn current_timestamp() -> u64 {
         .as_millis() as u64
 }
 
-/// Create a custom `Message` with fixed ID/timestamp/TTL.
 pub fn with_custom_message(
     id: u64,
     payload: impl Into<Bytes>,
@@ -58,48 +73,105 @@ fn generate_id() -> u64 {
 
 /// Serialize a raw `Message` (no length-prefix).
 pub fn encode_message(msg: &Message) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(msg.encoded_len());
-    msg.encode(&mut buf).expect("Failed to encode Message");
-    buf
+    let mut builder = FlatBufferBuilder::new();
+    let payload = builder.create_vector(&msg.payload);
+    let args = blipmq::MessageArgs {
+        id: msg.id,
+        payload: Some(payload),
+        timestamp: msg.timestamp,
+        ttl_ms: msg.ttl_ms,
+    };
+    let offset = blipmq::Message::create(&mut builder, &args);
+    builder.finish(offset, None);
+    builder.finished_data().to_vec()
 }
 
 /// Deserialize a raw `Message` (no length-prefix).
-pub fn decode_message(bytes: &[u8]) -> Result<Message, prost::DecodeError> {
-    Message::decode(bytes)
+pub fn decode_message(bytes: &[u8]) -> Result<Message, InvalidFlatbuffer> {
+    let m = root::<blipmq::Message>(bytes)?;
+    Ok(Message {
+        id: m.id(),
+        payload: m
+            .payload()
+            .map(|v| v.iter().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        timestamp: m.timestamp(),
+        ttl_ms: m.ttl_ms(),
+    })
 }
 
 /// Encodes a `Message` with 4-byte length prefix into buffer.
 pub fn encode_message_into(msg: &Message, buf: &mut BytesMut) {
-    let len = msg.encoded_len() as u32;
-    buf.reserve(len as usize + 4);
-    buf.put_u32(len);
-    msg.encode(buf)
-        .expect("encoding Message into buffer failed");
+    let data = encode_message(msg);
+    buf.reserve(4 + data.len());
+    buf.put_u32(data.len() as u32);
+    buf.extend_from_slice(&data);
 }
 
 /// Encodes a `SubAck` with length prefix into buffer.
-pub fn encode_suback_into(ack: &SubAck, buf: &mut BytesMut) {
-    let len = ack.encoded_len() as u32;
-    buf.reserve(len as usize + 4);
-    buf.put_u32(len);
-    ack.encode(buf).expect("encoding SubAck failed");
+pub fn encode_suback(ack: &SubAck) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let topic = builder.create_string(&ack.topic);
+    let info = builder.create_string(&ack.info);
+    let args = blipmq::SubAckArgs {
+        topic: Some(topic),
+        info: Some(info),
+    };
+    let offset = blipmq::SubAck::create(&mut builder, &args);
+    builder.finish(offset, None);
+    builder.finished_data().to_vec()
 }
 
+fn decode_suback(bytes: &[u8]) -> Result<SubAck, InvalidFlatbuffer> {
+    let s = root::<blipmq::SubAck>(bytes)?;
+    Ok(SubAck {
+        topic: s.topic().unwrap_or("").to_string(),
+        info: s.info().unwrap_or("").to_string(),
+    })
+}
 /// Encodes a `ServerFrame` with length prefix into buffer.
 pub fn encode_frame_into(frame: &ServerFrame, buf: &mut BytesMut) {
-    let len = frame.encoded_len() as u32;
-    buf.reserve(len as usize + 4);
-    buf.put_u32(len);
-    frame.encode(buf).expect("encoding ServerFrame failed");
+    match frame {
+        ServerFrame::SubAck(ack) => {
+            let data = encode_suback(ack);
+            buf.reserve(4 + 1 + data.len());
+            buf.put_u32((1 + data.len()) as u32);
+            buf.put_u8(FRAME_SUBACK);
+            buf.extend_from_slice(&data);
+        }
+        ServerFrame::Message(msg) => {
+            let data = encode_message(msg);
+            buf.reserve(4 + 1 + data.len());
+            buf.put_u32((1 + data.len()) as u32);
+            buf.put_u8(FRAME_MESSAGE);
+            buf.extend_from_slice(&data);
+        }
+    }
 }
 
 /// Deserialize a `ServerFrame` from raw bytes.
-pub fn decode_frame(bytes: &[u8]) -> Result<ServerFrame, prost::DecodeError> {
-    ServerFrame::decode(bytes)
+pub fn decode_frame(bytes: &[u8]) -> Result<ServerFrame, InvalidFlatbuffer> {
+    if bytes.is_empty() {
+        return Err(InvalidFlatbuffer::MissingRequiredField {
+            required: "frame".into(),
+            error_trace: Default::default(),
+        });
+    }
+    let t = bytes[0];
+    let payload = &bytes[1..];
+    match t {
+        FRAME_SUBACK => decode_suback(payload).map(ServerFrame::SubAck),
+        FRAME_MESSAGE => decode_message(payload).map(ServerFrame::Message),
+        _ => Err(InvalidFlatbuffer::InconsistentUnion {
+            field: "frame".into(),
+            field_type: "type".into(),
+            error_trace: Default::default(),
+        }),
+    }
 }
 
 /// Extracts a length-prefixed `ServerFrame` from a buffer.
-pub fn extract_frame(buf: &mut BytesMut) -> Option<Result<ServerFrame, prost::DecodeError>> {
+pub fn extract_frame(buf: &mut BytesMut) -> Option<Result<ServerFrame, InvalidFlatbuffer>> {
     if buf.len() < 4 {
         return None;
     }
@@ -111,6 +183,6 @@ pub fn extract_frame(buf: &mut BytesMut) -> Option<Result<ServerFrame, prost::De
 
     // Remove length prefix
     buf.advance(4);
-    let mut payload = buf.split_to(len);
-    Some(ServerFrame::decode(&mut payload))
+    let payload = buf.split_to(len);
+    Some(decode_frame(&payload))
 }

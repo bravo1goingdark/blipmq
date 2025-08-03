@@ -1,0 +1,24 @@
+namespace blipmq;
+
+enum Action : byte { PUB = 0, SUB = 1, UNSUB = 2, QUIT = 3 }
+
+table ClientCommand {
+  action: Action;
+  topic: string;
+  payload: [ubyte];
+  ttl_ms: ulong;
+}
+
+table Message {
+  id: ulong;
+  payload: [ubyte];
+  timestamp: ulong;
+  ttl_ms: ulong;
+}
+
+table SubAck {
+  topic: string;
+  info: string;
+}
+
+root_type Message;

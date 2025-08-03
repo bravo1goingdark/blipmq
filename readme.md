@@ -37,7 +37,7 @@
 ### 🔌 Core Broker
 
 * ✅ Single static binary (no runtime deps)
-* ✅ TCP-based protobuf protocol
+* ✅ TCP-based FlatBuffers protocol
 * ✅ Topic-based publish/subscribe
 * ✅ QoS 0 delivery
 * ⬜ QoS 1 support

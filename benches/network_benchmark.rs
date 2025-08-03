@@ -1,7 +1,7 @@
-use blipmq::core::command::{encode_command, new_pub, new_sub};
-use blipmq::core::message::{decode_frame, proto::server_frame::Body as FrameBody};
-use blipmq::start_broker;
 use blipmq::config::CONFIG;
+use blipmq::core::command::{encode_command, new_pub, new_sub};
+use blipmq::core::message::{decode_frame, ServerFrame};
+use blipmq::start_broker;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use log::{error, info};
@@ -14,8 +14,8 @@ use tokio::{
     sync::Barrier,
 };
 
-const NUM_SUBSCRIBERS: usize = 30;
-const NUM_MESSAGES: usize = 30000;
+const NUM_SUBSCRIBERS: usize = 100;
+const NUM_MESSAGES: usize = 10000;
 
 fn run_network_qos0_benchmark() -> (f64, f64) {
     let rt = Runtime::new().unwrap();
@@ -57,10 +57,8 @@ fn run_network_qos0_benchmark() -> (f64, f64) {
                 reader.read_exact(&mut buf).await.unwrap();
 
                 match decode_frame(&buf) {
-                    Ok(frame) => match frame.body {
-                        Some(FrameBody::SubAck(_)) => {}
-                        _ => panic!("[Sub {}] Invalid SubAck frame", i),
-                    },
+                    Ok(ServerFrame::SubAck(_)) => {}
+                    Ok(_) => panic!("[Sub {}] Invalid SubAck frame", i),
                     Err(e) => panic!("[Sub {}] Decode SubAck failed: {}", i, e),
                 }
 
@@ -164,9 +162,11 @@ fn run_nats_benchmark() -> (f64, f64) {
 
 fn qos0_network_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("qos0_network_tcp");
-    group.throughput(Throughput::Elements((NUM_MESSAGES * NUM_SUBSCRIBERS) as u64));
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(500));
+    group.throughput(Throughput::Elements(
+        (NUM_MESSAGES * NUM_SUBSCRIBERS) as u64,
+    ));
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(110));
 
     let mut latency_blip = 0.0;
     group.bench_function("blipmq_qos0_tcp", |b| {
