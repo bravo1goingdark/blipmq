@@ -14,8 +14,8 @@ use tokio::{
     sync::Barrier,
 };
 
-const NUM_SUBSCRIBERS: usize = 100;
-const NUM_MESSAGES: usize = 10000;
+const NUM_SUBSCRIBERS: usize = 48;
+const NUM_MESSAGES: usize = 48000;
 
 fn run_network_qos0_benchmark() -> (f64, f64) {
     let rt = Runtime::new().unwrap();
