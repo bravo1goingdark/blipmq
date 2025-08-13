@@ -4,13 +4,14 @@ use crate::config::CONFIG;
 use crate::core::error::BlipError;
 use crate::core::message::{current_timestamp, encode_message_into, Message};
 use crate::core::queue::qos0::Queue;
-use crate::core::queue::QueueBehavior;
 
+use crate::core::queue::QueueBehavior;
 use bytes::BytesMut;
 use std::sync::Arc;
 use tokio::io::BufWriter;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
+use tracing::{error, info};
 
 /// Unique identifier for a subscriber.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -64,7 +65,7 @@ impl Subscriber {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let capacity = CONFIG.queues.subscriber_capacity;
-        let max_batch = CONFIG.delivery.max_batch;
+        let max_batch = CONFIG.delivery.max_batch.max(1); // always >= 1
 
         // Create bounded SPSC queue and notifier
         let queue = Arc::new(Queue::new(
@@ -73,44 +74,78 @@ impl Subscriber {
             CONFIG.queues.overflow_policy,
         ));
         let notifier = Arc::new(Notify::new());
-        let queue_clone = Arc::clone(&queue);
-        let notifier_clone = Arc::clone(&notifier);
-        let id_clone = id.clone();
-        let writer_clone = Arc::clone(&writer);
 
         // Spawn the reactive flush task
-        tokio::spawn(async move {
-            let mut buffer = BytesMut::with_capacity(max_batch * 64);
-            loop {
-                // Wait for at least one notification
-                notifier_clone.notified().await;
+        {
+            let queue = Arc::clone(&queue);
+            let notifier = Arc::clone(&notifier);
+            let id_s = id.clone();
+            let writer = Arc::clone(&writer);
 
-                let now = current_timestamp();
-                let messages = queue_clone.drain(max_batch);
+            tokio::spawn(async move {
+                // Reuse one big buffer; 64 bytes per msg is a decent lower bound for framing.
+                let mut out = BytesMut::with_capacity(max_batch * 64);
 
-                for msg in messages {
-                    // Enforce TTL
-                    if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
+                loop {
+                    // Wait to be notified that at least one message arrived.
+                    notifier.notified().await;
+
+                    let now = current_timestamp();
+                    let mut encoded = 0usize;
+
+                    // Drain as much as available up to max_batch, *coalescing* multiple wakeups.
+                    // We loop until either we hit max_batch or the queue is empty right now.
+                    loop {
+                        // Pull a chunk (implementation-defined, but up to `remaining`)
+                        let remaining = max_batch - encoded;
+                        let msgs = queue.drain(remaining);
+                        if msgs.is_empty() {
+                            break;
+                        }
+
+                        for msg in msgs {
+                            // TTL check (fast path)
+                            if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
+                                continue;
+                            }
+                            encode_message_into(&msg, &mut out);
+                            encoded += 1;
+                        }
+
+                        if encoded >= max_batch {
+                            break;
+                        }
+                        // Keep looping immediately to gather any additional messages that arrived
+                        // between the last drain and now. This minimizes syscalls.
+                    }
+
+                    if encoded == 0 {
+                        // Nothing to write (all expired or queue raced to empty). Go back to waiting.
+                        out.truncate(0);
                         continue;
                     }
-                    encode_message_into(&msg, &mut buffer);
+
+                    // Single critical section: perform exactly one write (and one flush) per batch.
+                    // Using BufWriter keeps this efficient; we avoid holding the lock longer than needed.
+                    if let Err(e) = async {
+                        let mut w = writer.lock().await;
+                        w.write_all(&out).await?;
+                        // Flushing here maintains low tail latency for subscribers while still batching.
+                        w.flush().await
+                    }
+                    .await
+                    {
+                        error!("Subscriber {} write/flush error: {:?}", id_s, e);
+                        break;
+                    }
+
+                    // Reset buffer without freeing capacity.
+                    out.truncate(0);
                 }
 
-                // Write and flush the batch
-                let mut w = writer_clone.lock().await;
-                if let Err(e) = w.write_all(&buffer).await {
-                    tracing::error!("Subscriber {} write error: {:?}", id_clone, e);
-                    break;
-                }
-                if let Err(e) = w.flush().await {
-                    tracing::error!("Subscriber {} flush error: {:?}", id_clone, e);
-                    break;
-                }
-
-                buffer.clear();
-            }
-            tracing::info!("Flush task ended for subscriber {}", id_clone);
-        });
+                info!("Flush task ended for subscriber {}", id_s);
+            });
+        }
 
         Subscriber {
             id,
@@ -124,6 +159,7 @@ impl Subscriber {
     /// Returns `Err(BlipError::QueueFull)` if the queue is at capacity.
     pub fn enqueue(&self, msg: Arc<Message>) -> Result<(), BlipError> {
         self.queue.enqueue(msg)?;
+        // Wake exactly one waiter (the flush loop). Since it's single consumer, notify_one is ideal.
         self.notifier.notify_one();
         Ok(())
     }

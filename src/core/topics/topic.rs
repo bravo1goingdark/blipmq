@@ -1,13 +1,13 @@
 use dashmap::DashMap;
-use flume::{Receiver, Sender};
+use flume::{Receiver, Sender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use tokio::task;
 
 use crate::core::delivery_mode::DeliveryMode;
 use crate::core::error::BlipError;
-use crate::core::message::Message;
+use crate::core::message::{current_timestamp, Message};
 use crate::core::subscriber::{Subscriber, SubscriberId};
-use futures::stream::{FuturesUnordered, StreamExt};
+use tracing::{debug, info, warn};
 
 pub type TopicName = String;
 
@@ -40,48 +40,74 @@ impl Topic {
         let topic_name = self.name.clone();
 
         task::spawn(async move {
-            while let Ok(message) = rx.recv_async().await {
-                // Snapshot subscribers (avoid DashMap lock during loop)
-                let subs: Vec<Subscriber> = subscribers
-                    .iter()
-                    .map(|entry| entry.value().clone())
-                    .collect();
+            // Prefetch up to this many messages per loop (reduces recv syscalls & snapshots).
+            // Reuse delivery.max_batch as a sensible default knob.
+            let prefetch = crate::config::CONFIG.delivery.max_batch.max(1);
 
-                // Concurrently attempt to enqueue message to each subscriber
-                let mut fanout = FuturesUnordered::new();
-                for subscriber in subs {
-                    let msg = message.clone();
-                    fanout.push(async move {
-                        let id = subscriber.id().clone();
-                        let res = subscriber.enqueue(msg);
-                        (id, res)
-                    });
-                }
+            // Local buffers reused each loop to avoid allocs.
+            let mut batch: Vec<Arc<Message>> = Vec::with_capacity(prefetch);
+            let mut disconnected: Vec<SubscriberId> = Vec::with_capacity(8);
 
-                // Collect disconnected subscribers
-                let mut disconnected = Vec::new();
-                while let Some((id, res)) = fanout.next().await {
-                    match res {
-                        Ok(_) => {
-                            tracing::debug!(target="blipmq::topic", subscriber=%id, "enqueued");
-                        }
-                        Err(BlipError::Disconnected | BlipError::QueueClosed) => {
-                            tracing::debug!(target="blipmq::topic", subscriber=%id, ?res, "enqueue failed - disconnect");
-                            disconnected.push(id);
-                        }
-                        Err(e) => {
-                            tracing::debug!(target="blipmq::topic", subscriber=%id, ?e, "enqueue failed - ignored");
+            loop {
+                // Block for at least one message.
+                let first = match rx.recv_async().await {
+                    Ok(m) => m,
+                    Err(_) => break, // channel closed: topic shutting down
+                };
+                batch.push(first);
+
+                // Opportunistically drain more (up to `prefetch - 1`).
+                while batch.len() < prefetch {
+                    match rx.try_recv() {
+                        Ok(m) => batch.push(m),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            // No more messages will arrive.
+                            break;
                         }
                     }
                 }
 
-                // Remove disconnected subscribers from registry
-                for id in disconnected {
+                // Snapshot subscribers once for the whole batch.
+                let subs: Vec<Subscriber> = subscribers.iter().map(|e| e.value().clone()).collect();
+                if subs.is_empty() {
+                    batch.clear();
+                    continue;
+                }
+
+                let now = current_timestamp();
+
+                // Fanout each message to all subscribers.
+                for msg in batch.drain(..) {
+                    // Early TTL drop (saves per-sub queue work)
+                    if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
+                        continue;
+                    }
+
+                    for sub in &subs {
+                        match sub.enqueue(msg.clone()) {
+                            Ok(_) => {
+                                debug!(target:"blipmq::topic", subscriber=%sub.id(), "enqueued");
+                            }
+                            Err(BlipError::Disconnected | BlipError::QueueClosed) => {
+                                debug!(target:"blipmq::topic", subscriber=%sub.id(), "enqueue failed - disconnect");
+                                disconnected.push(sub.id().clone());
+                            }
+                            Err(e) => {
+                                // QoS0: ignore soft failures (e.g., full when policy is DropNew)
+                                debug!(target:"blipmq::topic", subscriber=%sub.id(), ?e, "enqueue failed - ignored");
+                            }
+                        }
+                    }
+                }
+
+                // Prune disconnected subscribers (dedupe not required; multiple removes are cheap).
+                for id in disconnected.drain(..) {
                     subscribers.remove(&id);
                 }
             }
 
-            tracing::info!("Fanout task exited for topic: {}", topic_name);
+            info!("Fanout task exited for topic: {}", topic_name);
         });
     }
 
@@ -94,16 +120,28 @@ impl Topic {
     pub async fn publish_with_mode(&self, message: Arc<Message>, mode: DeliveryMode) {
         match mode {
             DeliveryMode::Ordered => {
-                if let Err(_) = self.input_tx.send_async(message).await {
-                    tracing::warn!(
-                        "Topic '{}' dropped message: input channel closed",
-                        self.name
-                    );
+                // Fast path: try non-blocking first to avoid await in hot path.
+                match self.input_tx.try_send(message) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(m)) => {
+                        if let Err(_) = self.input_tx.send_async(m).await {
+                            warn!(
+                                "Topic '{}' dropped message: input channel closed",
+                                self.name
+                            );
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        warn!(
+                            "Topic '{}' dropped message: input channel closed",
+                            self.name
+                        );
+                    }
                 }
             }
             DeliveryMode::Parallel => {
-                // Future: support alternate path for parallel fanout logic
-                tracing::warn!(
+                // Future: parallel fanout lane
+                warn!(
                     "Parallel delivery mode not yet supported for topic '{}'",
                     self.name
                 );
