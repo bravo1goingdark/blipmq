@@ -1,0 +1,102 @@
+# BlipMQ alerting rules
+groups:
+  - name: blipmq_alerts
+    rules:
+      # High latency alert
+      - alert: BlipMQHighLatency
+        expr: blipmq_latency_p99_milliseconds > 100
+        for: 2m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ high latency detected"
+          description: "P99 latency is {{ $value }}ms for instance {{ $labels.instance }}"
+
+      # Critical latency alert
+      - alert: BlipMQCriticalLatency
+        expr: blipmq_latency_p99_milliseconds > 500
+        for: 30s
+        labels:
+          severity: critical
+          service: blipmq
+        annotations:
+          summary: "BlipMQ critical latency detected"
+          description: "P99 latency is {{ $value }}ms for instance {{ $labels.instance }}"
+
+      # High memory usage
+      - alert: BlipMQHighMemoryUsage
+        expr: (blipmq_memory_used_bytes / (1024 * 1024 * 1024)) > 2
+        for: 5m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ high memory usage"
+          description: "Memory usage is {{ $value }}GB for instance {{ $labels.instance }}"
+
+      # Connection limit approaching
+      - alert: BlipMQHighConnectionUsage
+        expr: (blipmq_connections_active / 10000) > 0.8
+        for: 2m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ connection usage high"
+          description: "{{ $value }}% of connection limit used on {{ $labels.instance }}"
+
+      # Message drops
+      - alert: BlipMQMessageDrops
+        expr: rate(blipmq_messages_dropped_total[5m]) > 100
+        for: 1m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ dropping messages"
+          description: "{{ $value }} messages/sec being dropped on {{ $labels.instance }}"
+
+      # Instance down
+      - alert: BlipMQInstanceDown
+        expr: up{job=~"blipmq.*"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: blipmq
+        annotations:
+          summary: "BlipMQ instance is down"
+          description: "Instance {{ $labels.instance }} has been down for more than 30 seconds"
+
+      # Low throughput
+      - alert: BlipMQLowThroughput
+        expr: blipmq_throughput_messages_per_second < 100
+        for: 10m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ low throughput"
+          description: "Throughput is {{ $value }} msg/s on {{ $labels.instance }}"
+
+      # Buffer pool low hit rate
+      - alert: BlipMQBufferPoolLowHitRate
+        expr: blipmq_buffer_pool_hit_rate < 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ buffer pool efficiency low"
+          description: "Buffer pool hit rate is {{ $value }} on {{ $labels.instance }}"
+
+      # CPU usage high
+      - alert: BlipMQHighCPUUsage
+        expr: blipmq_cpu_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+          service: blipmq
+        annotations:
+          summary: "BlipMQ high CPU usage"
+          description: "CPU usage is {{ $value }}% on {{ $labels.instance }}"

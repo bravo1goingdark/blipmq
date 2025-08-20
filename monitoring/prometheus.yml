@@ -1,0 +1,53 @@
+# Prometheus configuration for BlipMQ monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "blipmq_alerts.yml"
+
+scrape_configs:
+  # BlipMQ Low Latency Instance
+  - job_name: 'blipmq-low-latency'
+    static_configs:
+      - targets: ['blipmq-low-latency:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+  # BlipMQ High Throughput Instance
+  - job_name: 'blipmq-high-throughput'
+    static_configs:
+      - targets: ['blipmq-high-throughput:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # BlipMQ Health Endpoints
+  - job_name: 'blipmq-health'
+    static_configs:
+      - targets: 
+        - 'blipmq-low-latency:9090'
+        - 'blipmq-high-throughput:9090'
+    metrics_path: '/health'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # Self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Load Balancer Stats
+  - job_name: 'haproxy'
+    static_configs:
+      - targets: ['load-balancer:8404']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
