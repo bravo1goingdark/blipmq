@@ -29,6 +29,11 @@ path = "src/bin/blipmq.rs"
 name = "blipmq-cli"      # `cargo run --bin blipmq-cli -- …`
 path = "src/bin/blipmq-cli.rs"
 
+# Production-optimized broker
+[[bin]]
+name = "blipmq-optimized"
+path = "src/bin/blipmq-optimized.rs"
+
 
 
 [[bench]]
