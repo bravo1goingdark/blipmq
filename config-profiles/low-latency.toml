@@ -1,0 +1,96 @@
+# BlipMQ Low Latency Configuration Profile
+# Optimized for financial trading, gaming, real-time applications
+# Target: < 1ms latency, high connection density
+
+[profile]
+type = "LowLatency"
+
+[server]
+bind_addr = "0.0.0.0:8080"
+max_connections = 5000
+max_connections_per_ip = 50
+connection_timeout_ms = 5000
+idle_timeout_ms = 30000
+tcp_nodelay = true           # Critical for latency
+tcp_keepalive = true
+tcp_keepalive_interval_ms = 1000
+socket_recv_buffer_size = 262144  # 256KB
+socket_send_buffer_size = 262144  # 256KB
+backlog = 1024
+reuse_port = true
+
+[memory]
+enable_memory_pooling = true  # Critical for latency
+small_buffer_pool_size = 200
+medium_buffer_pool_size = 100
+large_buffer_pool_size = 50
+small_buffer_capacity = 2048
+medium_buffer_capacity = 8192
+large_buffer_capacity = 32768
+message_pool_size = 2000
+enable_zero_copy = true      # Minimize copying
+max_message_size = 65536     # 64KB
+memory_limit_mb = 2048
+
+[networking]
+enable_vectored_io = true
+max_batch_size = 8192        # Small batches for latency
+max_batch_count = 4          # Small batches for latency
+write_buffer_size = 16384
+read_buffer_size = 16384
+enable_compression = false   # Disabled for latency
+compression_threshold = 0
+enable_tls = false           # Disabled for latency
+
+[performance]
+worker_threads = 0           # Auto-detect (use all cores)
+enable_thread_affinity = true  # Pin threads to cores
+thread_stack_size_kb = 512
+enable_numa_awareness = true   # NUMA optimization
+gc_threshold_mb = 512
+enable_jemalloc = true        # Better allocator
+prefetch_distance = 64
+enable_branch_prediction = true
+
+[monitoring]
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+enable_tracing = false       # Disabled for performance
+tracing_level = "error"
+enable_profiling = false     # Disabled for performance
+profiling_sample_rate = 0.01
+metrics_collection_interval_ms = 1000
+enable_health_checks = true
+health_check_interval_ms = 5000
+
+[security]
+enable_authentication = false  # Often disabled for latency
+api_keys = []
+enable_rate_limiting = true
+rate_limit_per_connection = 10000  # High limit
+rate_limit_per_ip = 50000
+rate_limit_window_ms = 1000
+enable_ddos_protection = true
+max_payload_size = 65536     # 64KB
+enable_audit_logging = false
+
+# Legacy compatibility
+[queues]
+topic_capacity = 1000
+subscriber_capacity = 512
+overflow_policy = "drop_oldest"
+
+[wal]
+directory = "./wal"
+segment_size_bytes = 1048576
+flush_interval_ms = 5000
+
+[delivery]
+max_batch = 64
+default_ttl_ms = 60000
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[auth]
+api_keys = []

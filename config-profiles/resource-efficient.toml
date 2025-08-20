@@ -1,0 +1,96 @@
+# BlipMQ Resource Efficient Configuration Profile
+# Optimized for cloud deployments, containers, limited resources
+# Target: Minimal memory/CPU usage, cost optimization
+
+[profile]
+type = "ResourceEfficient"
+
+[server]
+bind_addr = "0.0.0.0:8080"
+max_connections = 2000       # Conservative limit
+max_connections_per_ip = 20
+connection_timeout_ms = 10000
+idle_timeout_ms = 120000     # 2 minutes
+tcp_nodelay = true
+tcp_keepalive = true
+tcp_keepalive_interval_ms = 30000
+socket_recv_buffer_size = 65536   # 64KB
+socket_send_buffer_size = 65536   # 64KB
+backlog = 512
+reuse_port = false           # Simpler setup
+
+[memory]
+enable_memory_pooling = true
+small_buffer_pool_size = 50  # Small pools
+medium_buffer_pool_size = 25
+large_buffer_pool_size = 10
+small_buffer_capacity = 1024
+medium_buffer_capacity = 4096
+large_buffer_capacity = 16384
+message_pool_size = 500
+enable_zero_copy = false     # Simpler but more CPU
+max_message_size = 65536     # 64KB
+memory_limit_mb = 512        # 512MB total
+
+[networking]
+enable_vectored_io = false   # Simpler I/O
+max_batch_size = 8192
+max_batch_count = 4
+write_buffer_size = 8192
+read_buffer_size = 8192
+enable_compression = true    # Save bandwidth
+compression_threshold = 512
+enable_tls = false
+
+[performance]
+worker_threads = 2           # Fixed small number
+enable_thread_affinity = false
+thread_stack_size_kb = 256  # Smaller stacks
+enable_numa_awareness = false
+gc_threshold_mb = 128
+enable_jemalloc = false      # System allocator
+prefetch_distance = 32
+enable_branch_prediction = false
+
+[monitoring]
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+enable_tracing = false       # Minimal tracing
+tracing_level = "warn"
+enable_profiling = false
+profiling_sample_rate = 0.001
+metrics_collection_interval_ms = 30000  # Less frequent
+enable_health_checks = true
+health_check_interval_ms = 60000
+
+[security]
+enable_authentication = true
+api_keys = ["supersecretkey"]
+enable_rate_limiting = true
+rate_limit_per_connection = 100  # Conservative limits
+rate_limit_per_ip = 500
+rate_limit_window_ms = 1000
+enable_ddos_protection = false   # Simpler setup
+max_payload_size = 32768     # 32KB
+enable_audit_logging = false
+
+# Legacy compatibility
+[queues]
+topic_capacity = 500         # Smaller queues
+subscriber_capacity = 256
+overflow_policy = "drop_oldest"
+
+[wal]
+directory = "./wal"
+segment_size_bytes = 524288  # 512KB segments
+flush_interval_ms = 15000    # Less frequent
+
+[delivery]
+max_batch = 32               # Small batches
+default_ttl_ms = 60000
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[auth]
+api_keys = ["supersecretkey"]

@@ -1,0 +1,96 @@
+# BlipMQ High Throughput Configuration Profile
+# Optimized for data processing, analytics, bulk messaging
+# Target: Millions of messages per second, high efficiency
+
+[profile]
+type = "HighThroughput"
+
+[server]
+bind_addr = "0.0.0.0:8080"
+max_connections = 20000
+max_connections_per_ip = 200
+connection_timeout_ms = 30000
+idle_timeout_ms = 300000     # 5 minutes
+tcp_nodelay = false          # Enable batching with Nagle
+tcp_keepalive = true
+tcp_keepalive_interval_ms = 10000
+socket_recv_buffer_size = 1048576  # 1MB
+socket_send_buffer_size = 1048576  # 1MB
+backlog = 4096
+reuse_port = true
+
+[memory]
+enable_memory_pooling = true
+small_buffer_pool_size = 500
+medium_buffer_pool_size = 200
+large_buffer_pool_size = 100
+small_buffer_capacity = 4096
+medium_buffer_capacity = 16384
+large_buffer_capacity = 65536
+message_pool_size = 5000
+enable_zero_copy = true
+max_message_size = 1048576   # 1MB
+memory_limit_mb = 8192       # 8GB
+
+[networking]
+enable_vectored_io = true
+max_batch_size = 262144      # 256KB - large batches
+max_batch_count = 64         # Many items per batch
+write_buffer_size = 131072   # 128KB
+read_buffer_size = 131072    # 128KB
+enable_compression = true    # Save bandwidth
+compression_threshold = 1024
+enable_tls = false
+
+[performance]
+worker_threads = 0           # Auto-detect * 2
+enable_thread_affinity = true
+thread_stack_size_kb = 1024
+enable_numa_awareness = true
+gc_threshold_mb = 2048
+enable_jemalloc = true
+prefetch_distance = 256      # Aggressive prefetch
+enable_branch_prediction = true
+
+[monitoring]
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+enable_tracing = true
+tracing_level = "info"
+enable_profiling = true
+profiling_sample_rate = 0.1
+metrics_collection_interval_ms = 5000
+enable_health_checks = true
+health_check_interval_ms = 30000
+
+[security]
+enable_authentication = true
+api_keys = ["default-key"]
+enable_rate_limiting = true
+rate_limit_per_connection = 5000
+rate_limit_per_ip = 25000
+rate_limit_window_ms = 1000
+enable_ddos_protection = true
+max_payload_size = 1048576   # 1MB
+enable_audit_logging = true
+
+# Legacy compatibility
+[queues]
+topic_capacity = 2000        # Larger queues for throughput
+subscriber_capacity = 1024
+overflow_policy = "drop_oldest"
+
+[wal]
+directory = "./wal"
+segment_size_bytes = 16777216  # 16MB segments
+flush_interval_ms = 10000      # Less frequent flushing
+
+[delivery]
+max_batch = 256              # Large batches
+default_ttl_ms = 300000      # 5 minutes
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[auth]
+api_keys = ["default-key"]
