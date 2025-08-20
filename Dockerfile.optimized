@@ -1,0 +1,86 @@
+# Multi-stage Dockerfile for production-optimized BlipMQ
+
+# Build stage
+FROM rust:1.75-bullseye as builder
+
+# Install additional build dependencies
+RUN apt-get update && apt-get install -y \
+    cmake \
+    clang \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy dependency files
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+
+# Copy source code
+COPY src/ src/
+COPY benches/ benches/
+COPY tests/ tests/
+
+# Build optimized binary
+ENV CARGO_TARGET_DIR=/tmp/target
+ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3"
+RUN cargo build --release --bin blipmq-optimized
+
+# Copy binary to final location
+RUN cp /tmp/target/release/blipmq-optimized /usr/local/bin/
+
+# Runtime stage
+FROM debian:bullseye-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1001 blipmq
+
+# Create app directory with proper permissions
+RUN mkdir -p /app/wal /app/logs /app/config && \
+    chown -R blipmq:blipmq /app
+
+# Copy binary from builder
+COPY --from=builder /usr/local/bin/blipmq-optimized /usr/local/bin/
+
+# Copy configuration files
+COPY production.toml /app/config/
+COPY config-profiles/ /app/config/profiles/
+
+# Set working directory
+WORKDIR /app
+
+# Switch to non-root user
+USER blipmq
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9090/health || exit 1
+
+# Expose ports
+EXPOSE 8080 9090
+
+# Default command with production profile
+CMD ["blipmq-optimized", "--config", "/app/config/production.toml", "--auto-tune"]
+
+# Environment variables for runtime configuration
+ENV BLIPMQ_PROFILE=balanced
+ENV BLIPMQ_BIND_ADDR=0.0.0.0:8080
+ENV BLIPMQ_METRICS_ADDR=0.0.0.0:9090
+ENV BLIPMQ_LOG_LEVEL=info
+ENV RUST_LOG=blipmq=info
+ENV RUST_BACKTRACE=1
+
+# Metadata
+LABEL maintainer="blipmq@emergent.dev"
+LABEL version="1.0.0"
+LABEL description="Production-optimized BlipMQ message broker"
+LABEL org.opencontainers.image.source="https://github.com/bravo1goingdark/blipmq"
+LABEL org.opencontainers.image.documentation="https://blipmq.dev/docs"
+LABEL org.opencontainers.image.licenses="MIT"

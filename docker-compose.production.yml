@@ -1,0 +1,143 @@
+# Production Docker Compose for BlipMQ with monitoring stack
+version: '3.8'
+
+services:
+  # BlipMQ Broker - Low Latency Profile
+  blipmq-low-latency:
+    build:
+      context: .
+      dockerfile: Dockerfile.optimized
+    image: blipmq:optimized-latest
+    container_name: blipmq-low-latency
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - BLIPMQ_PROFILE=low-latency
+      - BLIPMQ_BIND_ADDR=0.0.0.0:8080
+      - BLIPMQ_METRICS_ADDR=0.0.0.0:9090
+      - RUST_LOG=info
+    volumes:
+      - ./config-profiles/low-latency.toml:/app/config/production.toml:ro
+      - blipmq-wal:/app/wal
+      - blipmq-logs:/app/logs
+    command: ["blipmq-optimized", "--config", "/app/config/production.toml", "--auto-tune", "--verbose"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 2G
+        reservations:
+          cpus: '2.0'
+          memory: 1G
+    networks:
+      - blipmq-network
+
+  # BlipMQ Broker - High Throughput Profile  
+  blipmq-high-throughput:
+    build:
+      context: .
+      dockerfile: Dockerfile.optimized
+    image: blipmq:optimized-latest
+    container_name: blipmq-high-throughput
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    environment:
+      - BLIPMQ_PROFILE=high-throughput
+      - BLIPMQ_BIND_ADDR=0.0.0.0:8080
+      - BLIPMQ_METRICS_ADDR=0.0.0.0:9090
+      - RUST_LOG=info
+    volumes:
+      - ./config-profiles/high-throughput.toml:/app/config/production.toml:ro
+      - blipmq-wal-ht:/app/wal
+      - blipmq-logs-ht:/app/logs
+    command: ["blipmq-optimized", "--config", "/app/config/production.toml", "--auto-tune"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 8G
+        reservations:
+          cpus: '4.0'
+          memory: 4G
+    networks:
+      - blipmq-network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: blipmq-prometheus
+    ports:
+      - "9092:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - blipmq-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: blipmq-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    networks:
+      - blipmq-network
+
+  # Load balancer (HAProxy)
+  load-balancer:
+    image: haproxy:latest
+    container_name: blipmq-lb
+    ports:
+      - "8082:8080"  # Load balanced endpoint
+      - "8404:8404"  # HAProxy stats
+    volumes:
+      - ./monitoring/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - blipmq-low-latency
+      - blipmq-high-throughput
+    restart: unless-stopped
+    networks:
+      - blipmq-network
+
+volumes:
+  blipmq-wal:
+    driver: local
+  blipmq-logs:
+    driver: local
+  blipmq-wal-ht:
+    driver: local
+  blipmq-logs-ht:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  blipmq-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
