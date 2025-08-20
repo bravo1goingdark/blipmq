@@ -81,6 +81,7 @@ flatbuffers-build = { version = "0.2.2+flatc-25.2.10", features = ["vendored"] }
 criterion = "0.7.0"
 nats = "0.25.0"
 hdrhistogram = "7"
+tokio-test = "0.4.3"
 
 [profile.release]
 opt-level = 3
