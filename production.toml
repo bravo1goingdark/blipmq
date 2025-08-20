@@ -1,0 +1,102 @@
+# BlipMQ Production Configuration
+# This file contains production-optimized settings for high-performance message queuing
+
+[profile]
+# Available profiles: "LowLatency", "HighThroughput", "Balanced", "ResourceEfficient", "Custom"
+type = "Balanced"
+
+[server]
+bind_addr = "0.0.0.0:8080"
+max_connections = 10000
+max_connections_per_ip = 100
+connection_timeout_ms = 15000
+idle_timeout_ms = 180000
+tcp_nodelay = true
+tcp_keepalive = true
+tcp_keepalive_interval_ms = 5000
+socket_recv_buffer_size = 524288  # 512KB
+socket_send_buffer_size = 524288  # 512KB
+backlog = 2048
+reuse_port = true
+
+[memory]
+enable_memory_pooling = true
+small_buffer_pool_size = 150
+medium_buffer_pool_size = 75
+large_buffer_pool_size = 25
+small_buffer_capacity = 2048
+medium_buffer_capacity = 8192
+large_buffer_capacity = 32768
+message_pool_size = 1500
+enable_zero_copy = true
+max_message_size = 262144  # 256KB
+memory_limit_mb = 4096
+
+[networking]
+enable_vectored_io = true
+max_batch_size = 65536  # 64KB
+max_batch_count = 16
+write_buffer_size = 65536  # 64KB
+read_buffer_size = 65536   # 64KB
+enable_compression = true
+compression_threshold = 4096
+enable_tls = false
+# tls_cert_path = "/path/to/cert.pem"
+# tls_key_path = "/path/to/key.pem"
+
+[performance]
+worker_threads = 0  # 0 means auto-detect based on CPU cores
+enable_thread_affinity = false
+thread_stack_size_kb = 512
+enable_numa_awareness = false
+gc_threshold_mb = 1024
+enable_jemalloc = false
+prefetch_distance = 64
+enable_branch_prediction = false
+
+[monitoring]
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+enable_tracing = true
+tracing_level = "info"
+enable_profiling = false
+profiling_sample_rate = 0.01
+metrics_collection_interval_ms = 10000
+enable_health_checks = true
+health_check_interval_ms = 30000
+
+[security]
+enable_authentication = true
+api_keys = ["supersecretkey"]
+enable_rate_limiting = true
+rate_limit_per_connection = 1000
+rate_limit_per_ip = 5000
+rate_limit_window_ms = 1000
+enable_ddos_protection = true
+max_payload_size = 262144  # 256KB
+enable_audit_logging = false
+
+# Legacy queue configuration for backward compatibility
+[queues]
+topic_capacity = 1000
+subscriber_capacity = 512
+overflow_policy = "drop_oldest"
+
+# Legacy WAL configuration
+[wal]
+directory = "./wal"
+segment_size_bytes = 1048576
+flush_interval_ms = 5000
+
+# Legacy delivery configuration  
+[delivery]
+max_batch = 64
+default_ttl_ms = 60000
+
+# Legacy metrics configuration (for backward compatibility)
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+# Legacy auth configuration
+[auth]
+api_keys = ["supersecretkey"]
