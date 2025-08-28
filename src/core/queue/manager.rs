@@ -21,6 +21,7 @@ impl QueueManager {
     }
 
     /// Get or create a queue for this subscriber with the given QoS and capacity.
+    /// Note: Currently, QoS1 is not fully implemented and will default to QoS0 behavior.
     pub fn get_or_create(
         &self,
         subscriber_id: impl Into<String>,
@@ -42,7 +43,8 @@ impl QueueManager {
                     Arc::new(q)
                 }
                 QoS::QoS1 => {
-                    // TODO: once we implement qos1::Queue, swap this out
+                    // TODO: QoS1 is not yet implemented. Falling back to QoS0.
+                    // This should be replaced with a proper QoS1 queue implementation.
                     let q = crate::core::queue::qos0::Queue::new(
                         key.clone(),
                         capacity,

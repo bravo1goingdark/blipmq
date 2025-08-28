@@ -3,8 +3,7 @@ use crate::core::message::Message;
 use crate::core::queue::QueueBehavior;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+// Removed `std::thread` and `std::time::Duration` as `Block` policy is being removed.
 
 use serde::Deserialize;
 
@@ -14,7 +13,7 @@ use serde::Deserialize;
 pub enum OverflowPolicy {
     DropNew,
     DropOldest,
-    Block,
+    // Removed Block policy for async compatibility and performance.
 }
 
 impl Default for OverflowPolicy {
@@ -73,20 +72,15 @@ impl QueueBehavior for Queue {
                     Err(BlipError::QueueFull)
                 }
                 OverflowPolicy::DropOldest => {
-                    // Drop one and try again
-                    let _ = self.queue.pop();
+                    // Drop the oldest message and try to enqueue the new one.
+                    // This isn't strictly atomic, but `ArrayQueue` is lock-free.
+                    // If the queue is still full after popping, it implies contention
+                    // or a very small queue where even after popping, it's immediately filled again.
+                    // For now, this is a reasonable best-effort.
+                    let _ = self.queue.pop(); // Attempt to make space
                     self.queue.push(message).map_err(|_| BlipError::QueueFull)
                 }
-                OverflowPolicy::Block => {
-                    // BLOCKING ONLY: caution — not async-compatible
-                    // Useful for internal test paths or controlled environments
-                    loop {
-                        if self.queue.push(message.clone()).is_ok() {
-                            return Ok(());
-                        }
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                }
+                // Removed OverflowPolicy::Block
             },
         }
     }

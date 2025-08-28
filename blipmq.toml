@@ -1,6 +1,7 @@
 [server]
 bind_addr        = "127.0.0.1:8080"
 max_connections  = 100
+max_message_size_bytes = 1048576
 
 [auth]
 api_keys = ["supersecretkey"]

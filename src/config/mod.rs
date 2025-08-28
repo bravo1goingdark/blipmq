@@ -12,9 +12,21 @@ use crate::core::queue::qos0::OverflowPolicy;
 
 /// Server listen address & connection limits
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub max_connections: usize,
+    pub max_message_size_bytes: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            bind_addr: "127.0.0.1:7878".into(),
+            max_connections: 256,
+            max_message_size_bytes: 1024 * 1024, // 1MB default
+        }
+    }
 }
 
 /// API‐key based authentication
@@ -76,6 +88,7 @@ impl Default for DeliveryConfig {
 /// Top‐level BlipMQ configuration
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
     pub auth: AuthConfig,

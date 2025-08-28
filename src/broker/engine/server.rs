@@ -19,7 +19,7 @@ use tokio::{
     sync::Mutex,
     task,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Starts the BlipMQ broker server, with settings from `blipmq.toml`.
 pub async fn serve() -> anyhow::Result<()> {
@@ -37,7 +37,9 @@ pub async fn serve() -> anyhow::Result<()> {
 
         task::spawn(async move {
             if let Err(e) = handle_client(socket, registry).await {
-                error!("Error handling {}: {:?}", peer_addr, e);
+                error!("Error handling client {}: {:?}", peer_addr, e);
+            } else {
+                info!("Client disconnected: {}", peer_addr);
             }
         });
     }
@@ -60,19 +62,33 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
 
     loop {
         // Read length-prefixed command
-        if reader.read_exact(&mut len_buf).await.is_err() {
+        let bytes_read = reader.read_exact(&mut len_buf).await;
+        if let Err(e) = bytes_read {
+            info!("Client {} disconnected during length read: {}", peer, e);
             break;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+
+        // Prevent excessively large allocations or potential attacks
+        if len > CONFIG.server.max_message_size_bytes {
+            warn!("Client {} sent oversized message ({} bytes), disconnecting.", peer, len);
+            break;
+        }
+
         cmd_buf.clear();
         cmd_buf.resize(len, 0);
-        if reader.read_exact(&mut cmd_buf).await.is_err() {
+        let bytes_read = reader.read_exact(&mut cmd_buf).await;
+        if let Err(e) = bytes_read {
+            info!("Client {} disconnected during command read: {}", peer, e);
             break;
         }
 
         let cmd: ClientCommand = match decode_command(&cmd_buf) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("Client {} sent malformed command: {:?}, disconnecting.", peer, e);
+                break; // Disconnect client on malformed command
+            }
         };
 
         match cmd.action {
@@ -114,7 +130,10 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
                 }
             }
 
-            Action::Quit => break,
+            Action::Quit => {
+                info!("Client {} sent Quit command.", peer);
+                break;
+            },
         }
     }
 

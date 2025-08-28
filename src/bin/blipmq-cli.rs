@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::info;
+use tracing::{error, info};
 
 use blipmq::config::CONFIG;
 use blipmq::core::command::{encode_command_with_len_prefix, new_pub_with_ttl, new_sub, new_unsub};
@@ -76,6 +76,15 @@ async fn main() -> anyhow::Result<()> {
             ttl,
             message,
         } => {
+            // Check message size against server's max_message_size_bytes
+            if message.as_bytes().len() > CONFIG.server.max_message_size_bytes {
+                error!(
+                    "Message size ({}) exceeds server's maximum allowed size ({}), aborting.",
+                    message.as_bytes().len(),
+                    CONFIG.server.max_message_size_bytes
+                );
+                return Err(anyhow::anyhow!("Message too large"));
+            }
             let ttl_ms = ttl.unwrap_or(CONFIG.delivery.default_ttl_ms);
             new_pub_with_ttl(topic.clone(), message.clone(), ttl_ms)
         }
@@ -96,6 +105,12 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         let ack_len = u32::from_be_bytes(len_buf) as usize;
+
+        if ack_len > CONFIG.server.max_message_size_bytes {
+            error!("Server sent oversized SubAck ({} bytes), disconnecting.", ack_len);
+            return Err(anyhow::anyhow!("Server sent oversized SubAck"));
+        }
+
         let mut ack_buf = vec![0u8; ack_len];
         if reader.read_exact(&mut ack_buf).await.is_err() {
             eprintln!("> Failed to read SubAck payload");
@@ -120,6 +135,12 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+            if msg_len > CONFIG.server.max_message_size_bytes {
+                error!("Server sent oversized message ({} bytes), disconnecting.", msg_len);
+                break;
+            }
+
             let mut msg_buf = vec![0u8; msg_len];
             if reader.read_exact(&mut msg_buf).await.is_err() {
                 break;
