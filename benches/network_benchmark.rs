@@ -216,37 +216,40 @@ fn qos0_network_benchmark(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(110));
 
-    let mut latency_blip = 0.0;
+    let mut blipmq_latencies = Vec::new();
     group.bench_function("blipmq_qos0_tcp", |b| {
         b.iter_custom(|iters| {
             let mut total_throughput = 0.0;
             for _ in 0..iters {
                 let (tp, lat) = run_network_qos0_benchmark();
-                latency_blip = lat; // Capture last latency
+                blipmq_latencies.push(lat); 
                 total_throughput += tp;
             }
             total_throughput / iters as f64
         })
     });
 
-    let mut latency_nats = 0.0;
+    let mut nats_latencies = Vec::new();
     group.bench_function("nats_tcp", |b| {
         b.iter_custom(|iters| {
             let mut total_throughput = 0.0;
             for _ in 0..iters {
                 let (tp, lat) = run_nats_benchmark();
-                latency_nats = lat; // Capture last latency
+                nats_latencies.push(lat); 
                 total_throughput += tp;
             }
             total_throughput / iters as f64
         })
     });
 
+    let mean_blipmq_latency = blipmq_latencies.iter().sum::<f64>() / blipmq_latencies.len() as f64;
+    let mean_nats_latency = nats_latencies.iter().sum::<f64>() / nats_latencies.len() as f64;
+
     group.finish();
 
     println!("\n=== Latency Summary ===");
-    println!("BlipMQ mean latency: {:.2} µs", latency_blip);
-    println!("NATS mean latency: {:.2} µs", latency_nats);
+    println!("BlipMQ mean latency: {:.2} µs", mean_blipmq_latency);
+    println!("NATS mean latency: {:.2} µs", mean_nats_latency);
 }
 
 criterion_group!(benches, qos0_network_benchmark);
