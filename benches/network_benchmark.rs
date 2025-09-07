@@ -245,9 +245,7 @@ fn qos0_network_benchmark(c: &mut Criterion) {
                 last_hist = Some(hist);
 
                 // Optional: print per-iteration summary
-                println!(
-                    "BlipMQ iter: elapsed={elapsed:?}, throughput≈{tp:.2} msg/s"
-                );
+                println!("BlipMQ iter: elapsed={elapsed:?}, throughput≈{tp:.2} msg/s");
                 if quick {
                     break;
                 }
@@ -259,9 +257,7 @@ fn qos0_network_benchmark(c: &mut Criterion) {
     group.finish();
 
     println!("\n=== Latency Summary (BlipMQ) ===");
-    println!(
-        "Mean latency (throughput-derived): {latency_blip_mean:.2} µs"
-    );
+    println!("Mean latency (throughput-derived): {latency_blip_mean:.2} µs");
     if let Some(h) = last_hist {
         println!(
             "p50={}µs, p95={}µs, p99={}µs",
