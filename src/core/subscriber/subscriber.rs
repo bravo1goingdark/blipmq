@@ -113,13 +113,16 @@ impl Subscriber {
                     let chunk: Bytes = buffer.split().freeze();
                     crate::metrics::inc_flush_bytes(chunk.len() as u64);
                     crate::metrics::inc_flush_batches(1);
-                    if let Err(_e) = writer_tx.try_send(chunk) {
-                        // If channel is full, fall back to await
-                        let chunk2: Bytes = buffer.split().freeze();
-                        crate::metrics::inc_flush_bytes(chunk2.len() as u64);
-                        crate::metrics::inc_flush_batches(1);
-                        if let Err(e) = writer_tx.send(chunk2).await {
-                            tracing::error!("Subscriber {} writer channel closed: {:?}", id_clone, e);
+                    match writer_tx.try_send(chunk) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
+                            if let Err(e) = writer_tx.send(chunk).await {
+                                tracing::error!("Subscriber {} writer channel closed: {:?}", id_clone, e);
+                                break 'outer;
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_chunk)) => {
+                            tracing::error!("Subscriber {} writer channel closed", id_clone);
                             break 'outer;
                         }
                     }

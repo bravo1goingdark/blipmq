@@ -148,14 +148,13 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
                 // Register subscription
                 let topic = registry.create_or_get_topic(&cmd.topic);
                 topic
-                    .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
-                    .await;
+                    .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity);
                 subscriptions.push(cmd.topic.clone());
             }
 
             Action::Unsub => {
                 if let Some(topic) = registry.get_topic(&cmd.topic) {
-                    topic.unsubscribe(&subscriber_id).await;
+                    topic.unsubscribe(&subscriber_id);
                 }
             }
 
@@ -169,7 +168,7 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
     // Cleanup
     for topic in subscriptions {
         if let Some(t) = registry.get_topic(&topic) {
-            t.unsubscribe(&subscriber_id).await;
+            t.unsubscribe(&subscriber_id);
         }
     }
 

@@ -10,7 +10,7 @@ use crate::core::subscriber::{Subscriber, SubscriberId};
 use crate::config::CONFIG;
 use tokio::sync::mpsc;
 use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
+use ahash::AHasher;
 
 pub type TopicName = String;
 
@@ -56,9 +56,10 @@ impl Topic {
 
             // Worker task for this shard
             task::spawn(async move {
-                // Best-effort: attempt to pin this worker to a specific core
+                // Best-effort: attempt to pin this worker to a specific core (no-op on non-Windows)
 crate::util::affinity::set_current_thread_affinity(shard_index);
                 // Reuse buffers locally in the worker as needed
+                let mut disconnected: Vec<SubscriberId> = Vec::with_capacity(16);
                 loop {
                     match s_rx.recv().await {
                         Some(wire) => {
@@ -69,13 +70,13 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
                                 continue;
                             }
 
-                            // Snapshot this shard's subscribers
-                            let subs_snapshot: Vec<Subscriber> = shard_subs_for_task
-                                .iter()
-                                .map(|e| e.value().clone())
-                                .collect();
+                            // Snapshot this shard's subscribers (pre-size to reduce reallocations)
+                            let mut subs_snapshot: Vec<Subscriber> = Vec::with_capacity(shard_subs_for_task.len());
+                            for e in shard_subs_for_task.iter() {
+                                subs_snapshot.push(e.value().clone());
+                            }
 
-                            let mut disconnected = Vec::new();
+                            disconnected.clear();
                             for subscriber in subs_snapshot.iter() {
                                 let id = subscriber.id().clone();
                                 let res = subscriber.enqueue(wire.clone());
@@ -175,7 +176,7 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
     }
 
     /// Registers a subscriber.
-    pub async fn subscribe(&self, subscriber: Subscriber, _capacity: usize) {
+    pub fn subscribe(&self, subscriber: Subscriber, _capacity: usize) {
         let subscriber_id = subscriber.id().clone();
         // Insert into global registry
         self.subscribers.insert(subscriber_id.clone(), subscriber.clone());
@@ -185,7 +186,7 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
     }
 
     /// Removes a subscriber from this topic.
-    pub async fn unsubscribe(&self, subscriber_id: &SubscriberId) {
+    pub fn unsubscribe(&self, subscriber_id: &SubscriberId) {
         self.subscribers.remove(subscriber_id);
         let idx = self.shard_index(subscriber_id);
         self.shards[idx].subs.remove(subscriber_id);
@@ -197,7 +198,7 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
 
     #[inline]
     fn shard_index(&self, id: &SubscriberId) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         id.hash(&mut hasher);
         let h = hasher.finish() as usize;
         let n = self.shards.len().max(1);

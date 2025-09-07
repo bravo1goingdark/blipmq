@@ -16,8 +16,7 @@ async fn expired_message_is_dropped() {
     let tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
     let subscriber = Subscriber::new(SubscriberId::from("sub_ttl".to_string()), tx);
     topic
-        .subscribe(subscriber, blipmq::config::CONFIG.queues.subscriber_capacity)
-        .await;
+        .subscribe(subscriber, blipmq::config::CONFIG.queues.subscriber_capacity);
 
     // Create an already-expired message: ts + ttl <= now
     let now = current_timestamp();

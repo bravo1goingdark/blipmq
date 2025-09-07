@@ -28,8 +28,7 @@ async fn publish_to_existing_topic_delivers_message() {
     let writer_tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
     let subscriber = Subscriber::new(SubscriberId::from("sub1".to_string()), writer_tx);
     topic
-        .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
-        .await;
+        .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity);
 
     let payload = "hello";
     let msg = Arc::new(new_message(payload));
@@ -59,8 +58,7 @@ async fn publish_to_nonexistent_topic_is_dropped() {
     let writer_tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
     let subscriber = Subscriber::new(SubscriberId::from("s1".to_string()), writer_tx);
     topic_a
-        .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
-        .await;
+        .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity);
 
     let msg = Arc::new(new_message("ignored"));
     publisher.publish(&"b".to_string(), msg).await;

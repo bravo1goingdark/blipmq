@@ -107,4 +107,89 @@
 
 ---
 
+## ⚙️ Quick Start
+
+- Build (Linux recommended):
+  - `cargo build --release --features mimalloc`
+- Start broker:
+  - `cargo run --release --bin blipmq -- start --config blipmq.toml`
+- Subscribe with CLI:
+  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 sub chat`
+- Publish a message (with TTL in ms):
+  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 pub chat --ttl 5000 "hello world"`
+- Publish a file:
+  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 pubfile chat --ttl 0 ./message.bin`
+- Publish from stdin:
+  - `echo "streamed data" | cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 pub chat --ttl 0 -`
+- Subscribe and stop after N messages:
+  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 sub chat --count 10`
+
+## 🧭 CLI Reference
+
+- `pub <topic> [--ttl <ms>] <message | ->`
+  - Sends a message to a topic. Use `-` to read from STDIN.
+- `pubfile <topic> [--ttl <ms>] <path>`
+  - Sends the contents of a file (binary safe).
+- `sub <topic> [--count N]`
+  - Subscribes to a topic. Optionally exits after N messages.
+- `unsub <topic>`
+  - Unsubscribes from a topic.
+
+All sizes are validated against `server.max_message_size_bytes` from `blipmq.toml`.
+
+## 🧩 Configuration (blipmq.toml)
+
+Minimal example:
+
+```
+[server]
+bind_addr = "127.0.0.1:7878"
+max_connections = 256
+max_message_size_bytes = 1048576
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[queues]
+topic_capacity = 1024
+subscriber_capacity = 512
+overflow_policy = "drop_oldest"
+
+[delivery]
+max_batch = 64
+max_batch_bytes = 262144 # 256 KiB
+flush_interval_ms = 1
+fanout_shards = 0 # auto
+default_ttl_ms = 0
+```
+
+## 📊 Metrics
+
+A minimal HTTP server exposes counters on `metrics.bind_addr` (plain text):
+- blipmq_published
+- blipmq_enqueued
+- blipmq_dropped_ttl
+- blipmq_dropped_sub_queue_full
+- blipmq_flush_bytes
+- blipmq_flush_batches
+
+## 🏎️ Performance Notes
+
+- Fast hashing for shard selection via `ahash` (AHasher) on hot paths.
+- Bounded queues end-to-end (`flume` for topics, lock-free `ArrayQueue` for subscribers) to apply backpressure.
+- Per-connection writer task batches frames and uses a reactive timer that only fires when there is pending data.
+- Nagle’s algorithm disabled (TCP_NODELAY) for low-latency flushes.
+- Release profile uses `lto = true`, `codegen-units = 1`, `panic = "abort"`.
+- Optional allocator: build with `--features mimalloc` (works on Linux).
+- For maximum throughput on your CPU, you can use `RUSTFLAGS="-C target-cpu=native"`.
+
+## 🌀 Reactive by Design (No Polling)
+
+- All network reads/writes are async and await readiness.
+- Topic fanout workers block on async channels; no spin loops.
+- Subscriber flush loops are wake-driven via `Notify` and drain until empty; no busy waiting when idle.
+- The writer’s time-based flush is gated by buffer non-emptiness to avoid periodic wakeups with no data.
+
+---
+
 > 📄 Licensed under BSD-3-Clause — see [LICENSE](./LICENSE)
