@@ -5,8 +5,9 @@ use blipmq::start_broker;
 
 use anyhow::Context;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use hdrhistogram::Histogram;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -15,13 +16,29 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const NUM_SUBSCRIBERS: usize = 48;
-const NUM_MESSAGES: usize = 48000;
+fn bench_params() -> (usize, usize, bool) {
+    let quick = std::env::var("BLIPMQ_QUICK_BENCH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    if quick {
+        // lighter params for fast validation
+        (8, 2_000, true)
+    } else {
+        (48, 48_000, false)
+    }
+}
 
-async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64)> {
+// helper fn to get a timestamp (µs since UNIX epoch)
+fn now_micros() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros()
+}
+
+async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64, Histogram<u64>)> {
+    let (num_subs, num_msgs, _) = bench_params();
     let addr = CONFIG.server.bind_addr.as_str();
     let topic = "bench_topic".to_string();
-    let barrier = Arc::new(Barrier::new(NUM_SUBSCRIBERS + 1));
+    let barrier = Arc::new(Barrier::new(num_subs + 1));
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = start_broker().await {
@@ -29,10 +46,11 @@ async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64)> {
         }
     });
 
+    // brief warmup to let the broker bind
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let mut sub_handles = Vec::new();
-    for i in 0..NUM_SUBSCRIBERS {
+    let mut sub_handles = Vec::with_capacity(num_subs);
+    for i in 0..num_subs {
         let addr = addr.to_string();
         let topic = topic.clone();
         let barrier = barrier.clone();
@@ -41,31 +59,43 @@ async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64)> {
             let stream = TcpStream::connect(&addr)
                 .await
                 .with_context(|| format!("Subscriber {} failed to connect to {}", i, addr))?;
-            stream.set_nodelay(true).context("Failed to set no_delay for subscriber stream")?;
+            stream
+                .set_nodelay(true)
+                .context("Failed to set no_delay for subscriber stream")?;
             let (read_half, mut write_half) = stream.into_split();
 
             let cmd = new_sub(topic.clone());
             let enc = encode_command(&cmd);
-            write_half.write_all(&(enc.len() as u32).to_be_bytes()).await
+            write_half
+                .write_all(&(enc.len() as u32).to_be_bytes())
+                .await
                 .context("Subscriber failed to write length prefix")?;
-            write_half.write_all(&enc).await
+            write_half
+                .write_all(&enc)
+                .await
                 .context("Subscriber failed to write command")?;
-            write_half.flush().await
+            write_half
+                .flush()
+                .await
                 .context("Subscriber failed to flush command")?;
 
             let mut reader = BufReader::new(read_half);
 
             // Read SubAck
             let mut len_buf = [0u8; 4];
-            reader.read_exact(&mut len_buf).await
+            reader
+                .read_exact(&mut len_buf)
+                .await
                 .context("Subscriber failed to read SubAck length")?;
             let frame_len = u32::from_be_bytes(len_buf) as usize;
             let mut buf = vec![0u8; frame_len];
-            reader.read_exact(&mut buf).await
+            reader
+                .read_exact(&mut buf)
+                .await
                 .context("Subscriber failed to read SubAck payload")?;
 
             match decode_frame(&buf) {
-                Ok(ServerFrame::SubAck(_)) => {},
+                Ok(ServerFrame::SubAck(_)) => {}
                 Ok(_) => anyhow::bail!("Subscriber {} received invalid SubAck frame", i),
                 Err(e) => anyhow::bail!("Subscriber {} failed to decode SubAck: {}", i, e),
             }
@@ -73,23 +103,43 @@ async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64)> {
             barrier.wait().await;
 
             let mut received = 0;
-            while received < NUM_MESSAGES {
+            let mut hist = Histogram::<u64>::new(3).unwrap(); // per-subscriber histogram (µs)
+            while received < num_msgs {
                 let mut len_buf = [0u8; 4];
                 if reader.read_exact(&mut len_buf).await.is_err() {
-                    warn!("Subscriber {} disconnected prematurely or failed to read message length.", i);
+                    warn!("Subscriber {} disconnected or failed to read length.", i);
                     break;
                 }
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 let mut msg_buf = vec![0u8; msg_len];
                 if reader.read_exact(&mut msg_buf).await.is_err() {
-                    warn!("Subscriber {} disconnected prematurely or failed to read message payload.", i);
+                    warn!("Subscriber {} failed to read payload.", i);
                     break;
                 }
+
+                // parse timestamp from payload: "<seq>|<micros_since_epoch>"
+                let payload = String::from_utf8_lossy(&msg_buf);
+                if let Some(ts_str) = payload.split('|').nth(1) {
+                    if let Ok(sent_micros) = ts_str.parse::<u128>() {
+                        let now_us = now_micros(); // avoid shadowing the fn name
+                        if now_us > sent_micros {
+                            let latency_us = (now_us - sent_micros) as u64;
+                            let _ = hist.record(latency_us);
+                        }
+                    }
+                }
+
                 received += 1;
             }
 
-            anyhow::ensure!(received == NUM_MESSAGES, "Subscriber {} message loss: expected {}, got {}", i, NUM_MESSAGES, received);
-            Ok(received)
+            anyhow::ensure!(
+                received == num_msgs,
+                "Subscriber {} message loss: expected {}, got {}",
+                i,
+                num_msgs,
+                received
+            );
+            Ok(hist)
         }));
     }
 
@@ -98,155 +148,126 @@ async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64)> {
     let mut pub_stream = TcpStream::connect(addr)
         .await
         .context("Publisher failed to connect to broker")?;
-    pub_stream.set_nodelay(true).context("Failed to set no_delay for publisher stream")?;
+    pub_stream
+        .set_nodelay(true)
+        .context("Failed to set no_delay for publisher stream")?;
 
     let start = Instant::now();
-    for i in 0..NUM_MESSAGES {
-        let cmd = new_pub(topic.clone(), format!("msg-{}", i));
+    for i in 0..num_msgs {
+        let payload = format!("{}|{}", i, now_micros()); // include timestamp
+        let cmd = new_pub(topic.clone(), payload);
         let enc = encode_command(&cmd);
-        pub_stream.write_all(&(enc.len() as u32).to_be_bytes()).await
+        pub_stream
+            .write_all(&(enc.len() as u32).to_be_bytes())
+            .await
             .context("Publisher failed to write length prefix")?;
-        pub_stream.write_all(&enc).await
+        pub_stream
+            .write_all(&enc)
+            .await
             .context("Publisher failed to write command")?;
     }
-    pub_stream.flush().await
+    pub_stream
+        .flush()
+        .await
         .context("Publisher failed to flush commands")?;
     let publish_duration = start.elapsed();
 
+    let mut merged_hist = Histogram::<u64>::new(3)?; // µs histogram
     for h in sub_handles {
-        h.await.context("Subscriber task failed")??;
+        let sub_hist = h.await.context("Subscriber task failed")??;
+        merged_hist.add(&sub_hist)?; // merge histograms
     }
 
     server_handle.abort();
     let _ = server_handle.await;
 
     let total_duration = start.elapsed();
-    let total_fanout = NUM_MESSAGES * NUM_SUBSCRIBERS;
+    let total_fanout = num_msgs * num_subs;
     let throughput = total_fanout as f64 / total_duration.as_secs_f64();
     let mean_latency_us = total_duration.as_secs_f64() / total_fanout as f64 * 1e6;
 
     info!(
-        "✅ BlipMQ → pub_time={:?}, total_time={:?}, throughput={:.2} msg/s, mean_latency={:.2}µs",
-        publish_duration, total_duration, throughput, mean_latency_us
+        "✅ BlipMQ → pub_time={:?}, total_time={:?}, throughput={:.2} msg/s, mean_latency={:.2}µs, p50={}µs, p95={}µs, p99={}µs",
+        publish_duration,
+        total_duration,
+        throughput,
+        mean_latency_us,
+        merged_hist.value_at_quantile(0.5),
+        merged_hist.value_at_quantile(0.95),
+        merged_hist.value_at_quantile(0.99)
     );
 
-    Ok((throughput, mean_latency_us))
+    Ok((throughput, mean_latency_us, merged_hist))
 }
 
-fn run_network_qos0_benchmark() -> (f64, f64) {
+fn run_network_qos0_benchmark() -> (f64, f64, Histogram<u64>) {
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
-        match run_network_qos0_benchmark_inner().await {
-            Ok(metrics) => metrics,
-            Err(e) => {
+        run_network_qos0_benchmark_inner()
+            .await
+            .unwrap_or_else(|e| {
                 error!("BlipMQ benchmark failed: {:?}", e);
-                (0.0, 0.0) // Return zero metrics on failure
-            }
-        }
+                (0.0, 0.0, Histogram::<u64>::new(3).unwrap())
+            })
     })
 }
 
-async fn run_nats_benchmark_inner() -> anyhow::Result<(f64, f64)> {
-    let nc = nats::connect("127.0.0.1:4222")
-        .context("Failed to connect to NATS. Is NATS server running on 127.0.0.1:4222?")?;
-
-    let mut subs = Vec::new();
-    for i in 0..NUM_SUBSCRIBERS {
-        subs.push(nc.subscribe("bench.nats")
-            .with_context(|| format!("NATS Sub {} failed to subscribe", i))?);
-    }
-
-    let start = Instant::now();
-    for i in 0..NUM_MESSAGES {
-        nc.publish("bench.nats", format!("msg-{}", i))
-            .with_context(|| format!("NATS Pub failed to publish message {}", i))?;
-    }
-    nc.flush()
-        .context("NATS Pub failed to flush messages")?;
-
-    for (i, sub) in subs.iter().enumerate() {
-        let mut received = 0;
-        while received < NUM_MESSAGES {
-            match sub.next_timeout(Duration::from_millis(60)) {
-                Ok(_) => received += 1,
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    warn!("NATS Sub {} timed out waiting for messages. Received {} of {}", i, received, NUM_MESSAGES);
-                    break; // Exit loop if timeout occurs, report what was received
-                }
-                Err(e) => {
-                    error!("NATS Sub {} error: {:?}", i, e);
-                    anyhow::bail!("NATS Sub {} encountered an error: {:?}", i, e);
-                }
-            }
-        }
-        anyhow::ensure!(received == NUM_MESSAGES, "NATS Sub {} message loss: expected {}, got {}", i, NUM_MESSAGES, received);
-    }
-
-    let total_duration = start.elapsed();
-    let total_fanout = NUM_MESSAGES * NUM_SUBSCRIBERS;
-    let throughput = total_fanout as f64 / total_duration.as_secs_f64();
-    let mean_latency_us = total_duration.as_secs_f64() / total_fanout as f64 * 1e6;
-
-    info!(
-        "📦 NATS → total_time={:?}, throughput={:.2} msg/s, mean_latency={:.2}µs",
-        total_duration, throughput, mean_latency_us
-    );
-
-    Ok((throughput, mean_latency_us))
-}
-
-fn run_nats_benchmark() -> (f64, f64) {
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async {
-        match run_nats_benchmark_inner().await {
-            Ok(metrics) => metrics,
-            Err(e) => {
-                error!("NATS benchmark failed: {:?}", e);
-                (0.0, 0.0) // Return zero metrics on failure
-            }
-        }
-    })
-}
+// NOTE: Apply the same timestamp+hist approach to NATS when you wire that in.
 
 fn qos0_network_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("qos0_network_tcp");
-    group.throughput(Throughput::Elements(
-        (NUM_MESSAGES * NUM_SUBSCRIBERS) as u64,
-    ));
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(110));
+    let (num_subs, num_msgs, quick) = bench_params();
+    group.throughput(Throughput::Elements((num_msgs * num_subs) as u64));
+    if quick {
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(5));
+    } else {
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(60));
+    }
 
-    let mut latency_blip = 0.0;
+    let mut last_hist: Option<Histogram<u64>> = None;
+    let mut latency_blip_mean = 0.0;
+
     group.bench_function("blipmq_qos0_tcp", |b| {
         b.iter_custom(|iters| {
-            let mut total_throughput = 0.0;
+            // iter_custom MUST return a Duration (total time for `iters` runs)
+            let mut total_elapsed = Duration::ZERO;
             for _ in 0..iters {
-                let (tp, lat) = run_network_qos0_benchmark();
-                latency_blip = lat; // Capture last latency
-                total_throughput += tp;
-            }
-            total_throughput / iters as f64
-        })
-    });
+                let start = Instant::now();
+                let (tp, mean_lat, hist) = run_network_qos0_benchmark();
+                let elapsed = start.elapsed();
+                total_elapsed += elapsed;
 
-    let mut latency_nats = 0.0;
-    group.bench_function("nats_tcp", |b| {
-        b.iter_custom(|iters| {
-            let mut total_throughput = 0.0;
-            for _ in 0..iters {
-                let (tp, lat) = run_nats_benchmark();
-                latency_nats = lat; // Capture last latency
-                total_throughput += tp;
+                latency_blip_mean = mean_lat;
+                last_hist = Some(hist);
+
+                // Optional: print per-iteration summary
+                println!(
+                    "BlipMQ iter: elapsed={:?}, throughput≈{:.2} msg/s",
+                    elapsed, tp
+                );
+                if quick { break; }
             }
-            total_throughput / iters as f64
+            total_elapsed
         })
     });
 
     group.finish();
 
-    println!("\n=== Latency Summary ===");
-    println!("BlipMQ mean latency: {:.2} µs", latency_blip);
-    println!("NATS mean latency: {:.2} µs", latency_nats);
+    println!("\n=== Latency Summary (BlipMQ) ===");
+    println!(
+        "Mean latency (throughput-derived): {:.2} µs",
+        latency_blip_mean
+    );
+    if let Some(h) = last_hist {
+        println!(
+            "p50={}µs, p95={}µs, p99={}µs",
+            h.value_at_quantile(0.50),
+            h.value_at_quantile(0.95),
+            h.value_at_quantile(0.99)
+        );
+    }
 }
 
 criterion_group!(benches, qos0_network_benchmark);
