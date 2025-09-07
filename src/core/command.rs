@@ -1,9 +1,5 @@
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
-}
-
+use crate::generated::blipmq;
 use flatbuffers::{root, FlatBufferBuilder, InvalidFlatbuffer};
-use generated::blipmq;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -103,7 +99,7 @@ pub fn encode_command(cmd: &ClientCommand) -> Vec<u8> {
     builder.finished_data().to_vec()
 }
 
-/// Serialize a command to length-prefixed Protobuf frame.
+/// Serialize a command to length-prefixed FlatBuffers frame.
 pub fn encode_command_with_len_prefix(cmd: &ClientCommand) -> Vec<u8> {
     let data = encode_command(cmd);
     let mut buf = Vec::with_capacity(4 + data.len());

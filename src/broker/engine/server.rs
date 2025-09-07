@@ -10,13 +10,11 @@ use crate::core::{
     topics::TopicRegistry,
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::{
-    io::{AsyncReadExt, BufReader, BufWriter},
+    io::{AsyncReadExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
     task,
 };
 use tracing::{error, info, warn};
@@ -28,6 +26,14 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(bind_addr).await?;
     let registry = Arc::new(TopicRegistry::new());
+
+    // Spawn a very small HTTP metrics server on CONFIG.metrics.bind_addr
+    let metrics_addr = CONFIG.metrics.bind_addr.clone();
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(&metrics_addr).await {
+            warn!("metrics server error: {:?}", e);
+        }
+    });
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
@@ -45,18 +51,34 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 }
 
+async fn serve_metrics(addr: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let listener = TcpListener::bind(addr).await?;
+    info!("metrics listening on {}", addr);
+    loop {
+        let (mut sock, _peer) = listener.accept().await?;
+        let body = crate::metrics::snapshot();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        if let Err(e) = sock.write_all(resp.as_bytes()).await { warn!("metrics write error: {:?}", e); }
+    }
+}
+
 async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
     let (reader_half, writer_half) = stream.into_split();
     let mut reader = BufReader::new(reader_half);
 
-    let shared_writer = Arc::new(Mutex::new(BufWriter::new(writer_half)));
+    // Per-connection writer task: all frames go through this channel
+    let writer_tx = crate::core::subscriber::spawn_connection_writer(writer_half, 1024);
 
     let subscriber_id = SubscriberId::from(peer.to_string());
-    let subscriber = Subscriber::new(subscriber_id.clone(), shared_writer.clone());
+    let subscriber = Subscriber::new(subscriber_id.clone(), writer_tx.clone());
 
     let mut len_buf = [0u8; 4];
-    let mut cmd_buf = Vec::with_capacity(4096);
+    let mut cmd_buf = BytesMut::with_capacity(4096);
     let mut frame_buf = BytesMut::with_capacity(1024); // Reused for SubAck
     let mut subscriptions = Vec::new();
 
@@ -71,22 +93,28 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
 
         // Prevent excessively large allocations or potential attacks
         if len > CONFIG.server.max_message_size_bytes {
-            warn!("Client {} sent oversized message ({} bytes), disconnecting.", peer, len);
+            warn!(
+                "Client {} sent oversized message ({} bytes), disconnecting.",
+                peer, len
+            );
             break;
         }
 
         cmd_buf.clear();
         cmd_buf.resize(len, 0);
-        let bytes_read = reader.read_exact(&mut cmd_buf).await;
+        let bytes_read = reader.read_exact(&mut cmd_buf[..]).await;
         if let Err(e) = bytes_read {
             info!("Client {} disconnected during command read: {}", peer, e);
             break;
         }
 
-        let cmd: ClientCommand = match decode_command(&cmd_buf) {
+        let cmd: ClientCommand = match decode_command(&cmd_buf[..]) {
             Ok(c) => c,
             Err(e) => {
-                warn!("Client {} sent malformed command: {:?}, disconnecting.", peer, e);
+                warn!(
+                    "Client {} sent malformed command: {:?}, disconnecting.",
+                    peer, e
+                );
                 break; // Disconnect client on malformed command
             }
         };
@@ -94,6 +122,7 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
         match cmd.action {
             Action::Pub => {
                 if let Some(topic) = registry.get_topic(&cmd.topic) {
+                    crate::metrics::inc_published(1);
                     topic
                         .publish(Arc::new(new_message_with_ttl(cmd.payload, cmd.ttl_ms)))
                         .await;
@@ -110,10 +139,10 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
 
                 frame_buf.clear();
                 encode_frame_into(&frame, &mut frame_buf);
-                {
-                    let mut w = shared_writer.lock().await;
-                    w.write_all(&frame_buf).await?;
-                    w.flush().await?;
+                let frame_bytes: Bytes = frame_buf.split().freeze();
+                // Send SubAck via the writer channel
+                if writer_tx.send(frame_bytes).await.is_err() {
+                    break;
                 }
 
                 // Register subscription
@@ -133,7 +162,7 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
             Action::Quit => {
                 info!("Client {} sent Quit command.", peer);
                 break;
-            },
+            }
         }
     }
 

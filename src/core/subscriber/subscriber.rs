@@ -2,15 +2,14 @@
 
 use crate::config::CONFIG;
 use crate::core::error::BlipError;
-use crate::core::message::{current_timestamp, encode_message_into, Message};
+use crate::core::message::{current_timestamp, WireMessage};
 use crate::core::queue::qos0::Queue;
 use crate::core::queue::QueueBehavior;
 
 use bytes::BytesMut;
 use std::sync::Arc;
-use tokio::io::BufWriter;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, Notify};
+use bytes::Bytes;
+use tokio::sync::{mpsc, Notify};
 
 /// Unique identifier for a subscriber.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -58,11 +57,8 @@ impl Subscriber {
     ///
     /// # Arguments
     /// * `id` - Subscriber identifier.
-    /// * `writer` - Shared, async-locked buffered writer for sending batches.
-    pub fn new<W>(id: SubscriberId, writer: Arc<Mutex<BufWriter<W>>>) -> Self
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
+    /// * `writer_tx` - Channel to the dedicated connection writer task.
+    pub fn new(id: SubscriberId, writer_tx: mpsc::Sender<Bytes>) -> Self {
         let capacity = CONFIG.queues.subscriber_capacity;
         let max_batch = CONFIG.delivery.max_batch;
 
@@ -76,38 +72,61 @@ impl Subscriber {
         let queue_clone = Arc::clone(&queue);
         let notifier_clone = Arc::clone(&notifier);
         let id_clone = id.clone();
-        let writer_clone = Arc::clone(&writer);
+        let writer_tx = writer_tx.clone();
 
         // Spawn the reactive flush task
         tokio::spawn(async move {
             let mut buffer = BytesMut::with_capacity(max_batch * 64);
-            loop {
-                // Wait for at least one notification
+            'outer: loop {
+                // Wait for at least one notification that the queue transitioned
+                // from empty -> non-empty.
                 notifier_clone.notified().await;
 
-                let now = current_timestamp();
-                let messages = queue_clone.drain(max_batch);
-
-                for msg in messages {
-                    // Enforce TTL
-                    if msg.ttl_ms > 0 && now >= msg.timestamp + msg.ttl_ms {
-                        continue;
+                // Drain until the queue is empty; do not wait for another notify
+                // to avoid stalling when more than `max_batch` messages are queued.
+                loop {
+                    let now = current_timestamp();
+                    let messages = queue_clone.drain(max_batch);
+                    if messages.is_empty() {
+                        break;
                     }
-                    encode_message_into(&msg, &mut buffer);
-                }
 
-                // Write and flush the batch
-                let mut w = writer_clone.lock().await;
-                if let Err(e) = w.write_all(&buffer).await {
-                    tracing::error!("Subscriber {} write error: {:?}", id_clone, e);
-                    break;
-                }
-                if let Err(e) = w.flush().await {
-                    tracing::error!("Subscriber {} flush error: {:?}", id_clone, e);
-                    break;
-                }
+                    for wm in messages {
+                        // Enforce TTL
+                        if wm.is_expired(now) {
+                            continue;
+                        }
+                        buffer.extend_from_slice(&wm.frame);
+                    }
 
-                buffer.clear();
+                    // Skip I/O if nothing to flush (e.g., all messages expired)
+                    if buffer.is_empty() {
+                        // Check if more messages accumulated; if not, break
+                        if queue_clone.is_empty() {
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // Send the batch to the connection writer task
+                    let chunk: Bytes = buffer.split().freeze();
+                    crate::metrics::inc_flush_bytes(chunk.len() as u64);
+                    crate::metrics::inc_flush_batches(1);
+                    if let Err(_e) = writer_tx.try_send(chunk) {
+                        // If channel is full, fall back to await
+                        let chunk2: Bytes = buffer.split().freeze();
+                        crate::metrics::inc_flush_bytes(chunk2.len() as u64);
+                        crate::metrics::inc_flush_batches(1);
+                        if let Err(e) = writer_tx.send(chunk2).await {
+                            tracing::error!("Subscriber {} writer channel closed: {:?}", id_clone, e);
+                            break 'outer;
+                        }
+                    }
+
+                    // Continue inner loop to drain remaining messages (if any)
+                    // without waiting for another notify.
+                }
             }
             tracing::info!("Flush task ended for subscriber {}", id_clone);
         });
@@ -122,9 +141,12 @@ impl Subscriber {
     /// Enqueues a message into this subscriber's queue and notifies the flush task.
     ///
     /// Returns `Err(BlipError::QueueFull)` if the queue is at capacity.
-    pub fn enqueue(&self, msg: Arc<Message>) -> Result<(), BlipError> {
+    pub fn enqueue(&self, msg: Arc<WireMessage>) -> Result<(), BlipError> {
         self.queue.enqueue(msg)?;
-        self.notifier.notify_one();
+        // Notify only on transition from empty -> non-empty to reduce wakeups
+        if self.queue.len() == 1 {
+            self.notifier.notify_one();
+        }
         Ok(())
     }
 

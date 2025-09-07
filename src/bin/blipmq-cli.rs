@@ -77,10 +77,10 @@ async fn main() -> anyhow::Result<()> {
             message,
         } => {
             // Check message size against server's max_message_size_bytes
-            if message.as_bytes().len() > CONFIG.server.max_message_size_bytes {
+            if message.len() > CONFIG.server.max_message_size_bytes {
                 error!(
                     "Message size ({}) exceeds server's maximum allowed size ({}), aborting.",
-                    message.as_bytes().len(),
+                    message.len(),
                     CONFIG.server.max_message_size_bytes
                 );
                 return Err(anyhow::anyhow!("Message too large"));
@@ -107,7 +107,10 @@ async fn main() -> anyhow::Result<()> {
         let ack_len = u32::from_be_bytes(len_buf) as usize;
 
         if ack_len > CONFIG.server.max_message_size_bytes {
-            error!("Server sent oversized SubAck ({} bytes), disconnecting.", ack_len);
+            error!(
+                "Server sent oversized SubAck ({} bytes), disconnecting.",
+                ack_len
+            );
             return Err(anyhow::anyhow!("Server sent oversized SubAck"));
         }
 
@@ -137,7 +140,10 @@ async fn main() -> anyhow::Result<()> {
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if msg_len > CONFIG.server.max_message_size_bytes {
-                error!("Server sent oversized message ({} bytes), disconnecting.", msg_len);
+                error!(
+                    "Server sent oversized message ({} bytes), disconnecting.",
+                    msg_len
+                );
                 break;
             }
 
@@ -155,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("⚠️ Unexpected frame");
                 }
                 Err(e) => {
-                    eprintln!("❌ Failed to decode frame: {}", e);
+                    eprintln!("❌ Failed to decode frame: {e}");
                 }
             }
         }

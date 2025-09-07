@@ -72,6 +72,15 @@ pub struct DeliveryConfig {
     /// Max messages per flush batch
     pub max_batch: usize,
 
+    /// Byte budget for a single network flush from a writer task
+    pub max_batch_bytes: usize,
+
+    /// Time-based flush for writer tasks (milliseconds)
+    pub flush_interval_ms: u64,
+
+    /// Optional number of fanout shards per topic (0 = auto)
+    pub fanout_shards: usize,
+
     /// Default TTL for each new message (ms)
     pub default_ttl_ms: u64,
 }
@@ -80,6 +89,9 @@ impl Default for DeliveryConfig {
     fn default() -> Self {
         DeliveryConfig {
             max_batch: 64,
+            max_batch_bytes: 256 * 1024, // 256 KiB
+            flush_interval_ms: 1,        // ~1ms latency target
+            fanout_shards: 0,            // auto
             default_ttl_ms: 0,
         }
     }

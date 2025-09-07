@@ -1,5 +1,5 @@
 use crate::core::error::BlipError;
-use crate::core::message::Message;
+use crate::core::message::WireMessage;
 use crate::core::queue::QueueBehavior;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
@@ -8,18 +8,13 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 /// Defines how a QoS0 queue handles overflow.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowPolicy {
     DropNew,
+    #[default]
     DropOldest,
     // Removed Block policy for async compatibility and performance.
-}
-
-impl Default for OverflowPolicy {
-    fn default() -> Self {
-        OverflowPolicy::DropOldest
-    }
 }
 
 /// A single-subscriber, lock-free queue for QoS 0 delivery.
@@ -29,7 +24,7 @@ impl Default for OverflowPolicy {
 #[derive(Debug)]
 pub struct Queue {
     name: String,
-    queue: Arc<ArrayQueue<Arc<Message>>>,
+    queue: Arc<ArrayQueue<Arc<WireMessage>>>,
     policy: OverflowPolicy,
 }
 
@@ -44,12 +39,12 @@ impl Queue {
     }
 
     /// Returns a cloneable reference to the internal `ArrayQueue`.
-    pub fn queue(&self) -> Arc<ArrayQueue<Arc<Message>>> {
+    pub fn queue(&self) -> Arc<ArrayQueue<Arc<WireMessage>>> {
         Arc::clone(&self.queue)
     }
 
     /// Drains up to `max` messages for batch flushing.
-    pub fn drain(&self, max: usize) -> Vec<Arc<Message>> {
+    pub fn drain(&self, max: usize) -> Vec<Arc<WireMessage>> {
         let mut drained = Vec::with_capacity(max);
         for _ in 0..max {
             if let Some(msg) = self.queue.pop() {
@@ -63,7 +58,7 @@ impl Queue {
 }
 
 impl QueueBehavior for Queue {
-    fn enqueue(&self, message: Arc<Message>) -> Result<(), BlipError> {
+    fn enqueue(&self, message: Arc<WireMessage>) -> Result<(), BlipError> {
         match self.queue.push(message.clone()) {
             Ok(_) => Ok(()),
             Err(_) => match self.policy {
@@ -79,13 +74,12 @@ impl QueueBehavior for Queue {
                     // For now, this is a reasonable best-effort.
                     let _ = self.queue.pop(); // Attempt to make space
                     self.queue.push(message).map_err(|_| BlipError::QueueFull)
-                }
-                // Removed OverflowPolicy::Block
+                } // Removed OverflowPolicy::Block
             },
         }
     }
 
-    fn dequeue(&self) -> Option<Arc<Message>> {
+    fn dequeue(&self) -> Option<Arc<WireMessage>> {
         self.queue.pop()
     }
 

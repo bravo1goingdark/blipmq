@@ -11,7 +11,7 @@
 
 use blipmq::config::CONFIG;
 use blipmq::core::command::{encode_command_with_len_prefix, new_pub_with_ttl, new_sub, new_unsub};
-use blipmq::core::message::decode_message;
+use blipmq::core::message::{decode_frame, ServerFrame};
 use blipmq::{load_config, start_broker};
 
 use clap::{Parser, Subcommand};
@@ -86,13 +86,16 @@ async fn repl(addr: SocketAddr) -> anyhow::Result<()> {
             if reader.read_exact(&mut msg_buf).await.is_err() {
                 break;
             }
-            match decode_message(&msg_buf) {
-                Ok(msg) => {
+            match decode_frame(&msg_buf) {
+                Ok(ServerFrame::Message(msg)) => {
                     let payload = String::from_utf8_lossy(&msg.payload);
                     println!("{} {} @{}", msg.id, payload, msg.timestamp);
                 }
+                Ok(ServerFrame::SubAck(ack)) => {
+                    println!("> {}", ack.info);
+                }
                 Err(e) => {
-                    eprintln!("❌ Decode error: {}", e);
+                    eprintln!("❌ Decode error: {e}");
                 }
             }
         }

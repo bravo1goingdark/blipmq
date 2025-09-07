@@ -1,18 +1,33 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flatbuffers::{root, FlatBufferBuilder, InvalidFlatbuffer};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
-}
-use generated::blipmq;
+use crate::generated::blipmq;
 
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: u64,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub timestamp: u64,
     pub ttl_ms: u64,
 }
+
+/// Pre-encoded wire representation for a message frame.
+/// Holds the full frame bytes (4-byte length prefix + type + FlatBuffer payload)
+/// and the absolute expiration time in milliseconds since epoch (0 = never expire).
+#[derive(Debug, Clone)]
+pub struct WireMessage {
+    pub frame: Bytes,
+    pub expire_at: u64,
+}
+
+impl WireMessage {
+    #[inline]
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        self.expire_at != 0 && now_ms >= self.expire_at
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SubAck {
     pub topic: String,
@@ -26,7 +41,7 @@ pub enum ServerFrame {
 }
 
 const FRAME_SUBACK: u8 = 0;
-const FRAME_MESSAGE: u8 = 1;
+pub(crate) const FRAME_MESSAGE: u8 = 1;
 
 pub fn new_message(payload: impl Into<Bytes>) -> Message {
     new_message_with_ttl(payload, 0)
@@ -35,7 +50,7 @@ pub fn new_message(payload: impl Into<Bytes>) -> Message {
 pub fn new_message_with_ttl(payload: impl Into<Bytes>, ttl_ms: u64) -> Message {
     Message {
         id: generate_id(),
-        payload: payload.into().to_vec(),
+        payload: payload.into(),
         timestamp: current_timestamp(),
         ttl_ms,
     }
@@ -57,24 +72,22 @@ pub fn with_custom_message(
 ) -> Message {
     Message {
         id,
-        payload: payload.into().to_vec(),
+        payload: payload.into(),
         timestamp,
         ttl_ms,
     }
 }
 
-/// Generates a random u64 ID using UUID v4 (lower 64 bits).
+/// Generates a monotonically increasing u64 ID (fast, lock-free).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 fn generate_id() -> u64 {
-    use uuid::Uuid;
-    let uuid = Uuid::new_v4();
-    let bytes = uuid.as_u128().to_be_bytes();
-    u64::from_be_bytes(bytes[8..16].try_into().unwrap())
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Serialize a raw `Message` (no length-prefix).
 pub fn encode_message(msg: &Message) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
-    let payload = builder.create_vector(&msg.payload);
+    let payload = builder.create_vector(msg.payload.as_ref());
     let args = blipmq::MessageArgs {
         id: msg.id,
         payload: Some(payload),
@@ -93,8 +106,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, InvalidFlatbuffer> {
         id: m.id(),
         payload: m
             .payload()
-            .map(|v| v.iter().collect::<Vec<_>>())
-            .unwrap_or_default(),
+            .map(|v| bytes::Bytes::from(v.iter().collect::<Vec<_>>()))
+            .unwrap_or_else(Bytes::new),
         timestamp: m.timestamp(),
         ttl_ms: m.ttl_ms(),
     })
@@ -106,6 +119,34 @@ pub fn encode_message_into(msg: &Message, buf: &mut BytesMut) {
     buf.reserve(4 + data.len());
     buf.put_u32(data.len() as u32);
     buf.extend_from_slice(&data);
+}
+
+/// Encodes a `Message` as a typed ServerFrame::Message with 4-byte length prefix.
+pub fn encode_message_frame_into(msg: &Message, buf: &mut BytesMut) {
+    let data = encode_message(msg);
+    buf.reserve(4 + 1 + data.len());
+    buf.put_u32((1 + data.len()) as u32);
+    buf.put_u8(FRAME_MESSAGE);
+    buf.extend_from_slice(&data);
+}
+
+/// Builds and returns an owned frame (4-byte length prefix + type + payload) for a Message.
+#[inline]
+pub fn encode_message_frame(msg: &Message) -> Bytes {
+    let data = encode_message(msg);
+    let mut buf = BytesMut::with_capacity(4 + 1 + data.len());
+    buf.put_u32((1 + data.len()) as u32);
+    buf.put_u8(FRAME_MESSAGE);
+    buf.extend_from_slice(&data);
+    buf.freeze()
+}
+
+/// Converts a Message into a pre-encoded wire frame along with its expiration time.
+#[inline]
+pub fn to_wire_message(msg: &Message) -> WireMessage {
+    let frame = encode_message_frame(msg);
+    let expire_at = if msg.ttl_ms == 0 { 0 } else { msg.timestamp + msg.ttl_ms };
+    WireMessage { frame, expire_at }
 }
 
 /// Encodes a `SubAck` with length prefix into buffer.

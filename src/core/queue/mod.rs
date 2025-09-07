@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::core::error::BlipError;
-use crate::core::message::Message;
+use crate::core::message::WireMessage;
 
 /// Trait representing the common interface for all queue implementations.
 ///
@@ -28,12 +28,12 @@ use crate::core::message::Message;
 /// - Thread-safe (`Send + Sync`)
 /// - Clone-efficient (Arc<Message> based)
 pub trait QueueBehavior: Send + Sync + Debug {
-    /// Enqueue a message into the queue (fan-in).
+    /// Enqueue a pre-encoded wire message into the queue (fan-in).
     /// Returns Err if the subscriber is disconnected or the queue is closed.
-    fn enqueue(&self, message: Arc<Message>) -> Result<(), BlipError>;
+    fn enqueue(&self, message: Arc<WireMessage>) -> Result<(), BlipError>;
 
-    /// Attempt to dequeue a message (fan-out). Not used in QoS 0.
-    fn dequeue(&self) -> Option<Arc<Message>>;
+    /// Attempt to dequeue a wire message (fan-out). Not used in QoS 0.
+    fn dequeue(&self) -> Option<Arc<WireMessage>>;
 
     /// Return the current number of messages in the queue.
     fn len(&self) -> usize;

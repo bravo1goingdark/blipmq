@@ -5,9 +5,12 @@ use tokio::task;
 
 use crate::core::delivery_mode::DeliveryMode;
 use crate::core::error::BlipError;
-use crate::core::message::Message;
+use crate::core::message::{to_wire_message, Message, WireMessage};
 use crate::core::subscriber::{Subscriber, SubscriberId};
-use futures::stream::{FuturesUnordered, StreamExt};
+use crate::config::CONFIG;
+use tokio::sync::mpsc;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 pub type TopicName = String;
 
@@ -18,72 +21,132 @@ pub type TopicName = String;
 #[derive(Debug)]
 pub struct Topic {
     name: TopicName,
-    subscribers: Arc<DashMap<SubscriberId, Subscriber>>,
+    subscribers: Arc<DashMap<SubscriberId, Subscriber>>, // global view
+    shards: Vec<Shard>,
     input_tx: Sender<Arc<Message>>,
+}
+
+#[derive(Debug)]
+struct Shard {
+    subs: Arc<DashMap<SubscriberId, Subscriber>>, // partitioned subscribers
+    tx: mpsc::Sender<Arc<WireMessage>>,           // wire frames to process
 }
 
 impl Topic {
     pub fn new(name: impl Into<TopicName>, queue_capacity: usize) -> Self {
         let name = name.into();
         let (tx, rx) = flume::bounded(queue_capacity);
+
+        // Determine shard count based on config or available parallelism
+        let shard_count = {
+            let cfg = CONFIG.delivery.fanout_shards;
+            if cfg > 0 { cfg } else { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) }
+        }.clamp(1, 16);
+
+        // Create shards and their worker channels
+        let mut shards: Vec<Shard> = Vec::with_capacity(shard_count);
+        let global_subs: Arc<DashMap<SubscriberId, Subscriber>> = Arc::new(DashMap::new());
+        let topic_name_for_workers = name.clone();
+        for shard_index in 0..shard_count {
+            let (s_tx, mut s_rx) = mpsc::channel::<Arc<WireMessage>>(1024);
+            let shard_subs: Arc<DashMap<SubscriberId, Subscriber>> = Arc::new(DashMap::new());
+            let shard_subs_for_task = Arc::clone(&shard_subs);
+            let global_subs_clone = Arc::clone(&global_subs);
+            let topic_name_clone = topic_name_for_workers.clone();
+
+            // Worker task for this shard
+            task::spawn(async move {
+                // Best-effort: attempt to pin this worker to a specific core
+crate::util::affinity::set_current_thread_affinity(shard_index);
+                // Reuse buffers locally in the worker as needed
+                loop {
+                    match s_rx.recv().await {
+                        Some(wire) => {
+                            // TTL drop early (keeps queues small)
+                            let now = crate::core::message::current_timestamp();
+                            if wire.is_expired(now) {
+                                crate::metrics::inc_dropped_ttl(1);
+                                continue;
+                            }
+
+                            // Snapshot this shard's subscribers
+                            let subs_snapshot: Vec<Subscriber> = shard_subs_for_task
+                                .iter()
+                                .map(|e| e.value().clone())
+                                .collect();
+
+                            let mut disconnected = Vec::new();
+                            for subscriber in subs_snapshot.iter() {
+                                let id = subscriber.id().clone();
+                                let res = subscriber.enqueue(wire.clone());
+                                match res {
+                                    Ok(_) => {
+                                        crate::metrics::inc_enqueued(1);
+                                    }
+                                    Err(BlipError::Disconnected | BlipError::QueueClosed) => {
+                                        disconnected.push(id);
+                                    }
+                                    Err(BlipError::QueueFull) => {
+                                        crate::metrics::inc_dropped_sub_queue_full(1);
+                                    }
+                                    Err(_) => {
+                                        // ignore others
+                                    }
+                                }
+                            }
+
+                            // Remove disconnected from shard and global registries
+                            for id in disconnected.drain(..) {
+                                shard_subs_for_task.remove(&id);
+                                global_subs_clone.remove(&id);
+                            }
+                        }
+                        None => {
+                            tracing::info!("Shard worker exited for topic: {}", topic_name_clone);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            shards.push(Shard { subs: shard_subs, tx: s_tx });
+        }
+
         let topic = Self {
             name: name.clone(),
-            subscribers: Arc::new(DashMap::new()),
+            subscribers: global_subs,
+            shards,
             input_tx: tx,
         };
+
         topic.spawn_fanout_task(rx);
         topic
     }
 
     fn spawn_fanout_task(&self, rx: Receiver<Arc<Message>>) {
-        let subscribers = Arc::clone(&self.subscribers);
+        let shard_senders: Vec<mpsc::Sender<Arc<WireMessage>>> = self.shards.iter().map(|s| s.tx.clone()).collect();
         let topic_name = self.name.clone();
 
         task::spawn(async move {
             while let Ok(message) = rx.recv_async().await {
-                // Snapshot subscribers (avoid DashMap lock during loop)
-                let subs: Vec<Subscriber> = subscribers
-                    .iter()
-                    .map(|entry| entry.value().clone())
-                    .collect();
-
-                // Concurrently attempt to enqueue message to each subscriber
-                let mut fanout = FuturesUnordered::new();
-                for subscriber in subs {
-                    let msg = message.clone();
-                    fanout.push(async move {
-                        let id = subscriber.id().clone();
-                        let res = subscriber.enqueue(msg);
-                        (id, res)
-                    });
-                }
-
-                // Collect disconnected subscribers
-                let mut disconnected = Vec::new();
-                while let Some((id, res)) = fanout.next().await {
-                    match res {
-                        Ok(_) => {
-                            tracing::debug!(target="blipmq::topic", subscriber=%id, "enqueued");
-                        }
-                        Err(BlipError::Disconnected | BlipError::QueueClosed) => {
-                            tracing::debug!(target="blipmq::topic", subscriber=%id, ?res, "enqueue failed - disconnect");
-                            disconnected.push(id);
-                        }
-                        Err(e) => {
-                            tracing::debug!(target="blipmq::topic", subscriber=%id, ?e, "enqueue failed - ignored");
+                // Pre-encode the wire frame once for this published message
+                let wire = Arc::new(to_wire_message(&message));
+                // Send to all shard workers
+                for tx in &shard_senders {
+                    if tx.try_send(wire.clone()).is_err() {
+                        // fall back to await if channel is full
+                        if tx.send(wire.clone()).await.is_err() {
+                            // shard worker exited; continue
+                            continue;
                         }
                     }
-                }
-
-                // Remove disconnected subscribers from registry
-                for id in disconnected {
-                    subscribers.remove(&id);
                 }
             }
 
             tracing::info!("Fanout task exited for topic: {}", topic_name);
         });
     }
+
 
     /// Sends a message into the topic's input queue.
     pub async fn publish(&self, message: Arc<Message>) {
@@ -94,7 +157,7 @@ impl Topic {
     pub async fn publish_with_mode(&self, message: Arc<Message>, mode: DeliveryMode) {
         match mode {
             DeliveryMode::Ordered => {
-                if let Err(_) = self.input_tx.send_async(message).await {
+                if (self.input_tx.send_async(message).await).is_err() {
                     tracing::warn!(
                         "Topic '{}' dropped message: input channel closed",
                         self.name
@@ -114,15 +177,30 @@ impl Topic {
     /// Registers a subscriber.
     pub async fn subscribe(&self, subscriber: Subscriber, _capacity: usize) {
         let subscriber_id = subscriber.id().clone();
-        self.subscribers.insert(subscriber_id, subscriber);
+        // Insert into global registry
+        self.subscribers.insert(subscriber_id.clone(), subscriber.clone());
+        // Insert into shard
+        let idx = self.shard_index(&subscriber_id);
+        self.shards[idx].subs.insert(subscriber_id, subscriber);
     }
 
     /// Removes a subscriber from this topic.
     pub async fn unsubscribe(&self, subscriber_id: &SubscriberId) {
         self.subscribers.remove(subscriber_id);
+        let idx = self.shard_index(subscriber_id);
+        self.shards[idx].subs.remove(subscriber_id);
     }
 
     pub fn name(&self) -> &TopicName {
         &self.name
+    }
+
+    #[inline]
+    fn shard_index(&self, id: &SubscriberId) -> usize {
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        let h = hasher.finish() as usize;
+        let n = self.shards.len().max(1);
+        h % n
     }
 }

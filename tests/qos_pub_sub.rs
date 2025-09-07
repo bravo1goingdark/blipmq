@@ -9,12 +9,11 @@ fn init_logging() {
         blipmq::logging::init_logging();
     });
 }
-use blipmq::core::message::{decode_message, new_message};
+use blipmq::core::message::{decode_frame, new_message, ServerFrame};
 use blipmq::core::publisher::{Publisher, PublisherConfig};
 use blipmq::core::subscriber::{Subscriber, SubscriberId};
 use blipmq::core::topics::registry::TopicRegistry;
-use tokio::io::{AsyncReadExt, BufWriter};
-use tokio::sync::Mutex;
+use tokio::io::AsyncReadExt;
 
 #[tokio::test]
 async fn publish_to_existing_topic_delivers_message() {
@@ -26,8 +25,8 @@ async fn publish_to_existing_topic_delivers_message() {
     let topic = registry.create_or_get_topic(&topic_name);
 
     let (client, mut server) = tokio::io::duplex(1024);
-    let writer = Arc::new(Mutex::new(BufWriter::new(client)));
-    let subscriber = Subscriber::new(SubscriberId::from("sub1".to_string()), writer);
+    let writer_tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
+    let subscriber = Subscriber::new(SubscriberId::from("sub1".to_string()), writer_tx);
     topic
         .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
         .await;
@@ -41,8 +40,12 @@ async fn publish_to_existing_topic_delivers_message() {
     let len = u32::from_be_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     server.read_exact(&mut buf).await.unwrap();
-    let received = decode_message(&buf).unwrap();
-    assert_eq!(received.payload, payload.as_bytes());
+    match decode_frame(&buf).unwrap() {
+        ServerFrame::Message(received) => {
+            assert_eq!(received.payload.as_ref(), payload.as_bytes());
+        }
+        _ => panic!("unexpected frame type"),
+    }
 }
 
 #[tokio::test]
@@ -53,8 +56,8 @@ async fn publish_to_nonexistent_topic_is_dropped() {
 
     let topic_a = registry.create_or_get_topic(&"a".to_string());
     let (client, mut server) = tokio::io::duplex(1024);
-    let writer = Arc::new(Mutex::new(BufWriter::new(client)));
-    let subscriber = Subscriber::new(SubscriberId::from("s1".to_string()), writer);
+    let writer_tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
+    let subscriber = Subscriber::new(SubscriberId::from("s1".to_string()), writer_tx);
     topic_a
         .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity)
         .await;
