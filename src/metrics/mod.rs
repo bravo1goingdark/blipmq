@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Global counters (low overhead). These are coarse-grained and process-wide.
 static PUBLISHED: AtomicU64 = AtomicU64::new(0);
@@ -7,6 +7,19 @@ static DROPPED_TTL: AtomicU64 = AtomicU64::new(0);
 static DROPPED_SUB_Q_FULL: AtomicU64 = AtomicU64::new(0);
 static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+// Broker readiness state
+static READY: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn set_ready(v: bool) {
+    READY.store(v, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_ready() -> bool {
+    READY.load(Ordering::Relaxed)
+}
 
 #[inline]
 pub fn inc_published(n: u64) {
