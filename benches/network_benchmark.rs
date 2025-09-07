@@ -60,7 +60,7 @@ async fn run_network_qos0_benchmark_inner() -> anyhow::Result<(f64, f64, Histogr
         sub_handles.push(tokio::spawn(async move {
             let stream = TcpStream::connect(&addr)
                 .await
-                .with_context(|| format!("Subscriber {i} failed to connect to {addr}"))?;
+                .with_context(|| format!("Subscriber {} failed to connect to {}", i, addr))?;
             stream
                 .set_nodelay(true)
                 .context("Failed to set no_delay for subscriber stream")?;
@@ -245,7 +245,10 @@ fn qos0_network_benchmark(c: &mut Criterion) {
                 last_hist = Some(hist);
 
                 // Optional: print per-iteration summary
-                println!("BlipMQ iter: elapsed={elapsed:?}, throughput≈{tp:.2} msg/s");
+                println!(
+                    "BlipMQ iter: elapsed={:?}, throughput≈{:.2} msg/s",
+                    elapsed, tp
+                );
                 if quick {
                     break;
                 }
@@ -257,7 +260,10 @@ fn qos0_network_benchmark(c: &mut Criterion) {
     group.finish();
 
     println!("\n=== Latency Summary (BlipMQ) ===");
-    println!("Mean latency (throughput-derived): {latency_blip_mean:.2} µs");
+    println!(
+        "Mean latency (throughput-derived): {:.2} µs",
+        latency_blip_mean
+    );
     if let Some(h) = last_hist {
         println!(
             "p50={}µs, p95={}µs, p99={}µs",

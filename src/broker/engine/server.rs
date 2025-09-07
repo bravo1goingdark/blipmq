@@ -13,7 +13,7 @@ use crate::core::{
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, BufReader},
     net::{TcpListener, TcpStream},
     task,
 };
@@ -27,16 +27,13 @@ pub async fn serve() -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     let registry = Arc::new(TopicRegistry::new());
 
-    // Spawn a very small HTTP metrics/health server on CONFIG.metrics.bind_addr
+    // Spawn a very small HTTP metrics server on CONFIG.metrics.bind_addr
     let metrics_addr = CONFIG.metrics.bind_addr.clone();
     tokio::spawn(async move {
         if let Err(e) = serve_metrics(&metrics_addr).await {
             warn!("metrics server error: {:?}", e);
         }
     });
-
-    // Mark broker as ready after listener is bound and metrics server spawned
-    crate::metrics::set_ready(true);
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
@@ -55,68 +52,17 @@ pub async fn serve() -> anyhow::Result<()> {
 }
 
 async fn serve_metrics(addr: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
     let listener = TcpListener::bind(addr).await?;
-    info!("metrics/health listening on {}", addr);
+    info!("metrics listening on {}", addr);
     loop {
-        let (sock, _peer) = listener.accept().await?;
-        // Very small, allocation-light request handler
-        let mut reader = BufReader::new(sock);
-        let mut buf = [0u8; 1024];
-        let n: usize;
-        match reader.read(&mut buf).await {
-            Ok(0) => continue,
-            Ok(m) => n = m,
-            Err(e) => {
-                warn!("metrics read error: {:?}", e);
-                continue;
-            }
-        }
-        let req = match std::str::from_utf8(&buf[..n]) {
-            Ok(s) => s,
-            Err(_) => "",
-        };
-        let mut path = "/metrics";
-        let mut method = "GET";
-        if let Some(line) = req.lines().next() {
-            let mut parts = line.split_whitespace();
-            method = parts.next().unwrap_or("GET");
-            path = parts.next().unwrap_or("/metrics");
-        }
-
-        let (status, body, content_type): (&str, String, &str) = match (method, path) {
-            ("GET", "/metrics") => (
-                "200 OK",
-                crate::metrics::snapshot(),
-                "text/plain; charset=utf-8",
-            ),
-            ("GET", "/healthz") => ("200 OK", "ok".to_string(), "text/plain; charset=utf-8"),
-            ("GET", "/readyz") => {
-                if crate::metrics::is_ready() {
-                    ("200 OK", "ready".to_string(), "text/plain; charset=utf-8")
-                } else {
-                    (
-                        "503 Service Unavailable",
-                        "not-ready".to_string(),
-                        "text/plain; charset=utf-8",
-                    )
-                }
-            }
-            _ => (
-                "404 Not Found",
-                "not found".to_string(),
-                "text/plain; charset=utf-8",
-            ),
-        };
-
+        let (mut sock, _peer) = listener.accept().await?;
+        let body = crate::metrics::snapshot();
         let resp = format!(
-            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status,
-            content_type,
-            body.len(),
-            body
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
         );
-
-        if let Err(e) = reader.get_mut().write_all(resp.as_bytes()).await {
+        if let Err(e) = sock.write_all(resp.as_bytes()).await {
             warn!("metrics write error: {:?}", e);
         }
     }
