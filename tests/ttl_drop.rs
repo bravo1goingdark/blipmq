@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use blipmq::core::message::{current_timestamp, decode_frame, with_custom_message, ServerFrame};
+use blipmq::core::message::{current_timestamp, with_custom_message};
 use blipmq::core::subscriber::{Subscriber, SubscriberId};
 use blipmq::core::topics::registry::TopicRegistry;
 use tokio::io::AsyncReadExt;

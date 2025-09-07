@@ -138,86 +138,83 @@ async fn main() -> anyhow::Result<()> {
     write_half.write_all(&frame).await?;
     info!("Sent request: action={:?}", cmd.action);
 
-    match &cli.command {
-        Command::Sub { count, .. } => {
-            // Read SubAck first
-            let mut len_buf = [0u8; 4];
+    if let Command::Sub { count, .. } = &cli.command {
+        // Read SubAck first
+        let mut len_buf = [0u8; 4];
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            eprintln!("> Failed to read SubAck length");
+            return Ok(());
+        }
+        let ack_len = u32::from_be_bytes(len_buf) as usize;
+
+        if ack_len > CONFIG.server.max_message_size_bytes {
+            error!(
+                "Server sent oversized SubAck ({} bytes), disconnecting.",
+                ack_len
+            );
+            return Err(anyhow::anyhow!("Server sent oversized SubAck"));
+        }
+
+        let mut ack_buf = vec![0u8; ack_len];
+        if reader.read_exact(&mut ack_buf).await.is_err() {
+            eprintln!("> Failed to read SubAck payload");
+            return Ok(());
+        }
+
+        match decode_frame(&ack_buf) {
+            Ok(ServerFrame::SubAck(ack)) => println!("> {}", ack.info),
+            Ok(_) => {
+                eprintln!("> Unexpected frame instead of SubAck");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("> Failed to decode SubAck: {e}");
+                return Ok(());
+            }
+        }
+
+        // Read message frames; optionally stop after N messages
+        let mut seen: usize = 0;
+        loop {
             if reader.read_exact(&mut len_buf).await.is_err() {
-                eprintln!("> Failed to read SubAck length");
-                return Ok(());
+                break;
             }
-            let ack_len = u32::from_be_bytes(len_buf) as usize;
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-            if ack_len > CONFIG.server.max_message_size_bytes {
+            if msg_len > CONFIG.server.max_message_size_bytes {
                 error!(
-                    "Server sent oversized SubAck ({} bytes), disconnecting.",
-                    ack_len
+                    "Server sent oversized message ({} bytes), disconnecting.",
+                    msg_len
                 );
-                return Err(anyhow::anyhow!("Server sent oversized SubAck"));
+                break;
             }
 
-            let mut ack_buf = vec![0u8; ack_len];
-            if reader.read_exact(&mut ack_buf).await.is_err() {
-                eprintln!("> Failed to read SubAck payload");
-                return Ok(());
+            let mut msg_buf = vec![0u8; msg_len];
+            if reader.read_exact(&mut msg_buf).await.is_err() {
+                break;
             }
 
-            match decode_frame(&ack_buf) {
-                Ok(ServerFrame::SubAck(ack)) => println!("> {}", ack.info),
-                Ok(_) => {
-                    eprintln!("> Unexpected frame instead of SubAck");
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!("> Failed to decode SubAck: {e}");
-                    return Ok(());
-                }
-            }
-
-            // Read message frames; optionally stop after N messages
-            let mut seen: usize = 0;
-            loop {
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    break;
-                }
-                let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-                if msg_len > CONFIG.server.max_message_size_bytes {
-                    error!(
-                        "Server sent oversized message ({} bytes), disconnecting.",
-                        msg_len
-                    );
-                    break;
-                }
-
-                let mut msg_buf = vec![0u8; msg_len];
-                if reader.read_exact(&mut msg_buf).await.is_err() {
-                    break;
-                }
-
-                match decode_frame(&msg_buf) {
-                    Ok(ServerFrame::Message(msg)) => {
-                        let payload = String::from_utf8_lossy(&msg.payload);
-                        println!("{} {} @{}", msg.id, payload, msg.timestamp);
-                        seen += 1;
-                        if let Some(limit) = count {
-                            if seen >= *limit {
-                                break;
-                            }
+            match decode_frame(&msg_buf) {
+                Ok(ServerFrame::Message(msg)) => {
+                    let payload = String::from_utf8_lossy(&msg.payload);
+                    println!("{} {} @{}", msg.id, payload, msg.timestamp);
+                    seen += 1;
+                    if let Some(limit) = count {
+                        if seen >= *limit {
+                            break;
                         }
                     }
-                    Ok(_) => {
-                        eprintln!("⚠️ Unexpected frame");
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Failed to decode frame: {e}");
-                    }
+                }
+                Ok(_) => {
+                    eprintln!("⚠️ Unexpected frame");
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to decode frame: {e}");
                 }
             }
-
-            info!("Subscription ended");
         }
-        _ => {}
+
+        info!("Subscription ended");
     }
 
     Ok(())
