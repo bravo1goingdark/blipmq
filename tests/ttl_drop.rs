@@ -15,8 +15,10 @@ async fn expired_message_is_dropped() {
     let (client, mut server) = tokio::io::duplex(1024);
     let tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
     let subscriber = Subscriber::new(SubscriberId::from("sub_ttl".to_string()), tx);
-    topic
-        .subscribe(subscriber, blipmq::config::CONFIG.queues.subscriber_capacity);
+    topic.subscribe(
+        subscriber,
+        blipmq::config::CONFIG.queues.subscriber_capacity,
+    );
 
     // Create an already-expired message: ts + ttl <= now
     let now = current_timestamp();
@@ -31,4 +33,3 @@ async fn expired_message_is_dropped() {
     let res = timeout(Duration::from_millis(100), server.read_exact(&mut len_buf)).await;
     assert!(res.is_err(), "expired message should not be delivered");
 }
-

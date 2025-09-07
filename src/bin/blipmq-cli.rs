@@ -200,7 +200,11 @@ async fn main() -> anyhow::Result<()> {
                         let payload = String::from_utf8_lossy(&msg.payload);
                         println!("{} {} @{}", msg.id, payload, msg.timestamp);
                         seen += 1;
-                        if let Some(limit) = count { if seen >= *limit { break; } }
+                        if let Some(limit) = count {
+                            if seen >= *limit {
+                                break;
+                            }
+                        }
                     }
                     Ok(_) => {
                         eprintln!("⚠️ Unexpected frame");

@@ -15,4 +15,3 @@ pub fn set_current_thread_affinity(core_index: usize) {
 pub fn set_current_thread_affinity(_core_index: usize) {
     // no-op on non-Windows or when feature disabled
 }
-

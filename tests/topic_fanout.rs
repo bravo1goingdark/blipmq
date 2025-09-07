@@ -19,14 +19,12 @@ async fn message_is_fanned_out_to_all_subscribers() {
     let (c1, mut s1) = tokio::io::duplex(1024);
     let tx1 = blipmq::core::subscriber::spawn_connection_writer(c1, 1024);
     let sub1 = Subscriber::new(SubscriberId::from("s1".to_string()), tx1);
-    topic
-        .subscribe(sub1, CONFIG.queues.subscriber_capacity);
+    topic.subscribe(sub1, CONFIG.queues.subscriber_capacity);
 
     let (c2, mut s2) = tokio::io::duplex(1024);
     let tx2 = blipmq::core::subscriber::spawn_connection_writer(c2, 1024);
     let sub2 = Subscriber::new(SubscriberId::from("s2".to_string()), tx2);
-    topic
-        .subscribe(sub2, CONFIG.queues.subscriber_capacity);
+    topic.subscribe(sub2, CONFIG.queues.subscriber_capacity);
 
     let msg = Arc::new(new_message("hello"));
     topic.publish(msg).await;

@@ -18,4 +18,3 @@ async fn timed_flush_sla_small_frames() {
     let res = timeout(Duration::from_millis(50), server.read_exact(&mut buf)).await;
     assert!(res.is_ok(), "writer did not flush within SLA");
 }
-

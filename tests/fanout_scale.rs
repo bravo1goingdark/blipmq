@@ -17,8 +17,7 @@ async fn fanout_to_many_subscribers() {
         let (client, server) = tokio::io::duplex(2048);
         let tx = blipmq::core::subscriber::spawn_connection_writer(client, 1024);
         let sub = Subscriber::new(SubscriberId::from(format!("s{i}")), tx);
-        topic
-            .subscribe(sub, blipmq::config::CONFIG.queues.subscriber_capacity);
+        topic.subscribe(sub, blipmq::config::CONFIG.queues.subscriber_capacity);
         readers.push(server);
     }
 
@@ -39,4 +38,3 @@ async fn fanout_to_many_subscribers() {
         }
     }
 }
-

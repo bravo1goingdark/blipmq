@@ -15,8 +15,8 @@ pub mod broker;
 pub mod config;
 pub mod core;
 pub mod logging;
-pub mod util; // affinity utils, etc.
-pub mod metrics; // minimal global counters + export
+pub mod metrics;
+pub mod util; // affinity utils, etc. // minimal global counters + export
 
 // Generated FlatBuffers bindings (from build.rs)
 // We include them once here and allow lints that commonly trigger in generated code.

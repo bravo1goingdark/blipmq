@@ -3,14 +3,14 @@ use flume::{Receiver, Sender};
 use std::sync::Arc;
 use tokio::task;
 
+use crate::config::CONFIG;
 use crate::core::delivery_mode::DeliveryMode;
 use crate::core::error::BlipError;
 use crate::core::message::{to_wire_message, Message, WireMessage};
 use crate::core::subscriber::{Subscriber, SubscriberId};
-use crate::config::CONFIG;
-use tokio::sync::mpsc;
-use std::hash::{Hash, Hasher};
 use ahash::AHasher;
+use std::hash::{Hash, Hasher};
+use tokio::sync::mpsc;
 
 pub type TopicName = String;
 
@@ -40,8 +40,15 @@ impl Topic {
         // Determine shard count based on config or available parallelism
         let shard_count = {
             let cfg = CONFIG.delivery.fanout_shards;
-            if cfg > 0 { cfg } else { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) }
-        }.clamp(1, 16);
+            if cfg > 0 {
+                cfg
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+            }
+        }
+        .clamp(1, 16);
 
         // Create shards and their worker channels
         let mut shards: Vec<Shard> = Vec::with_capacity(shard_count);
@@ -57,7 +64,7 @@ impl Topic {
             // Worker task for this shard
             task::spawn(async move {
                 // Best-effort: attempt to pin this worker to a specific core (no-op on non-Windows)
-crate::util::affinity::set_current_thread_affinity(shard_index);
+                crate::util::affinity::set_current_thread_affinity(shard_index);
                 // Reuse buffers locally in the worker as needed
                 let mut disconnected: Vec<SubscriberId> = Vec::with_capacity(16);
                 loop {
@@ -71,7 +78,8 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
                             }
 
                             // Snapshot this shard's subscribers (pre-size to reduce reallocations)
-                            let mut subs_snapshot: Vec<Subscriber> = Vec::with_capacity(shard_subs_for_task.len());
+                            let mut subs_snapshot: Vec<Subscriber> =
+                                Vec::with_capacity(shard_subs_for_task.len());
                             for e in shard_subs_for_task.iter() {
                                 subs_snapshot.push(e.value().clone());
                             }
@@ -110,7 +118,10 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
                 }
             });
 
-            shards.push(Shard { subs: shard_subs, tx: s_tx });
+            shards.push(Shard {
+                subs: shard_subs,
+                tx: s_tx,
+            });
         }
 
         let topic = Self {
@@ -125,7 +136,8 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
     }
 
     fn spawn_fanout_task(&self, rx: Receiver<Arc<Message>>) {
-        let shard_senders: Vec<mpsc::Sender<Arc<WireMessage>>> = self.shards.iter().map(|s| s.tx.clone()).collect();
+        let shard_senders: Vec<mpsc::Sender<Arc<WireMessage>>> =
+            self.shards.iter().map(|s| s.tx.clone()).collect();
         let topic_name = self.name.clone();
 
         task::spawn(async move {
@@ -147,7 +159,6 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
             tracing::info!("Fanout task exited for topic: {}", topic_name);
         });
     }
-
 
     /// Sends a message into the topic's input queue.
     pub async fn publish(&self, message: Arc<Message>) {
@@ -179,7 +190,8 @@ crate::util::affinity::set_current_thread_affinity(shard_index);
     pub fn subscribe(&self, subscriber: Subscriber, _capacity: usize) {
         let subscriber_id = subscriber.id().clone();
         // Insert into global registry
-        self.subscribers.insert(subscriber_id.clone(), subscriber.clone());
+        self.subscribers
+            .insert(subscriber_id.clone(), subscriber.clone());
         // Insert into shard
         let idx = self.shard_index(&subscriber_id);
         self.shards[idx].subs.insert(subscriber_id, subscriber);

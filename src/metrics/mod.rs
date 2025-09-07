@@ -9,17 +9,29 @@ static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_BATCHES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-pub fn inc_published(n: u64) { PUBLISHED.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_published(n: u64) {
+    PUBLISHED.fetch_add(n, Ordering::Relaxed);
+}
 #[inline]
-pub fn inc_enqueued(n: u64) { ENQUEUED.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_enqueued(n: u64) {
+    ENQUEUED.fetch_add(n, Ordering::Relaxed);
+}
 #[inline]
-pub fn inc_dropped_ttl(n: u64) { DROPPED_TTL.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_dropped_ttl(n: u64) {
+    DROPPED_TTL.fetch_add(n, Ordering::Relaxed);
+}
 #[inline]
-pub fn inc_dropped_sub_queue_full(n: u64) { DROPPED_SUB_Q_FULL.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_dropped_sub_queue_full(n: u64) {
+    DROPPED_SUB_Q_FULL.fetch_add(n, Ordering::Relaxed);
+}
 #[inline]
-pub fn inc_flush_bytes(n: u64) { FLUSH_BYTES.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_flush_bytes(n: u64) {
+    FLUSH_BYTES.fetch_add(n, Ordering::Relaxed);
+}
 #[inline]
-pub fn inc_flush_batches(n: u64) { FLUSH_BATCHES.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_flush_batches(n: u64) {
+    FLUSH_BATCHES.fetch_add(n, Ordering::Relaxed);
+}
 
 pub fn snapshot() -> String {
     // Simple text format (Prometheus-style without HELP/TYPE lines for brevity)

@@ -34,4 +34,3 @@ fn overflow_volume_drop_oldest_keeps_newest() {
     }
     assert_eq!(ids, (100 - cap as u64..100).collect::<Vec<_>>());
 }
-

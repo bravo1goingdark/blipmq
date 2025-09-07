@@ -62,7 +62,9 @@ async fn serve_metrics(addr: &str) -> anyhow::Result<()> {
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
             body.len(), body
         );
-        if let Err(e) = sock.write_all(resp.as_bytes()).await { warn!("metrics write error: {:?}", e); }
+        if let Err(e) = sock.write_all(resp.as_bytes()).await {
+            warn!("metrics write error: {:?}", e);
+        }
     }
 }
 
@@ -147,8 +149,7 @@ async fn handle_client(stream: TcpStream, registry: Arc<TopicRegistry>) -> anyho
 
                 // Register subscription
                 let topic = registry.create_or_get_topic(&cmd.topic);
-                topic
-                    .subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity);
+                topic.subscribe(subscriber.clone(), CONFIG.queues.subscriber_capacity);
                 subscriptions.push(cmd.topic.clone());
             }
 

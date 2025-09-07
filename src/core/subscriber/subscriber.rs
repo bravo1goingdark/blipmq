@@ -6,9 +6,9 @@ use crate::core::message::{current_timestamp, WireMessage};
 use crate::core::queue::qos0::Queue;
 use crate::core::queue::QueueBehavior;
 
+use bytes::Bytes;
 use bytes::BytesMut;
 use std::sync::Arc;
-use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
 
 /// Unique identifier for a subscriber.
@@ -117,7 +117,11 @@ impl Subscriber {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
                             if let Err(e) = writer_tx.send(chunk).await {
-                                tracing::error!("Subscriber {} writer channel closed: {:?}", id_clone, e);
+                                tracing::error!(
+                                    "Subscriber {} writer channel closed: {:?}",
+                                    id_clone,
+                                    e
+                                );
                                 break 'outer;
                             }
                         }

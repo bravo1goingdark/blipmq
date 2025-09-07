@@ -145,7 +145,11 @@ pub fn encode_message_frame(msg: &Message) -> Bytes {
 #[inline]
 pub fn to_wire_message(msg: &Message) -> WireMessage {
     let frame = encode_message_frame(msg);
-    let expire_at = if msg.ttl_ms == 0 { 0 } else { msg.timestamp + msg.ttl_ms };
+    let expire_at = if msg.ttl_ms == 0 {
+        0
+    } else {
+        msg.timestamp + msg.ttl_ms
+    };
     WireMessage { frame, expire_at }
 }
 

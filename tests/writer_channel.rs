@@ -27,10 +27,6 @@ async fn writer_channel_orders_and_flushes() {
     server.read_exact(&mut buf).await.unwrap();
 
     // Expect the bytes to match the order f1 || f2
-    let expected: Vec<u8> = [
-        &f1[..],
-        &f2[..]
-    ].concat();
+    let expected: Vec<u8> = [&f1[..], &f2[..]].concat();
     assert_eq!(&buf[..], &expected[..]);
 }
-

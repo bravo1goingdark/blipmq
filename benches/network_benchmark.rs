@@ -17,7 +17,9 @@ use tokio::{
 use tracing::{error, info, warn};
 
 fn bench_params() -> (usize, usize, bool) {
-    let quick = std::env::var("BLIPMQ_QUICK_BENCH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let quick = std::env::var("BLIPMQ_QUICK_BENCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     if quick {
         // lighter params for fast validation
         (8, 2_000, true)
@@ -247,7 +249,9 @@ fn qos0_network_benchmark(c: &mut Criterion) {
                     "BlipMQ iter: elapsed={:?}, throughput≈{:.2} msg/s",
                     elapsed, tp
                 );
-                if quick { break; }
+                if quick {
+                    break;
+                }
             }
             total_elapsed
         })
