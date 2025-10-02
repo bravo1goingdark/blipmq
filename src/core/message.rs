@@ -15,7 +15,7 @@ pub struct Message {
 /// Pre-encoded wire representation for a message frame.
 /// Holds the full frame bytes (4-byte length prefix + type + FlatBuffer payload)
 /// and the absolute expiration time in milliseconds since epoch (0 = never expire).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WireMessage {
     pub frame: Bytes,
     pub expire_at: u64,
@@ -60,7 +60,11 @@ pub fn current_timestamp() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .unwrap_or_else(|_| {
+            // Fallback to a reasonable timestamp if system clock is problematic
+            tracing::warn!("System clock went backwards, using fallback timestamp");
+            std::time::Duration::from_secs(1640995200) // 2022-01-01 as fallback
+        })
         .as_millis() as u64
 }
 

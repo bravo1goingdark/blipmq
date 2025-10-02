@@ -85,7 +85,12 @@ pub fn new_quit() -> ClientCommand {
 
 /// Serialize a command to raw bytes (no length prefix).
 pub fn encode_command(cmd: &ClientCommand) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::new();
+    encode_command_with_builder(cmd, &mut FlatBufferBuilder::with_capacity(512))
+}
+
+/// Serialize a command with a reusable builder for better performance.
+pub fn encode_command_with_builder(cmd: &ClientCommand, builder: &mut FlatBufferBuilder) -> Vec<u8> {
+    builder.reset();
     let topic = builder.create_string(&cmd.topic);
     let payload = builder.create_vector(&cmd.payload);
     let args = blipmq::ClientCommandArgs {
@@ -94,7 +99,7 @@ pub fn encode_command(cmd: &ClientCommand) -> Vec<u8> {
         payload: Some(payload),
         ttl_ms: cmd.ttl_ms,
     };
-    let offset = blipmq::ClientCommand::create(&mut builder, &args);
+    let offset = blipmq::ClientCommand::create(builder, &args);
     builder.finish(offset, None);
     builder.finished_data().to_vec()
 }

@@ -29,6 +29,16 @@ path = "src/bin/blipmq.rs"
 name = "blipmq-cli"      # `cargo run --bin blipmq-cli -- …`
 path = "src/bin/blipmq-cli.rs"
 
+# Ultra-high performance server
+# [[bin]]
+# name = "blipmq-ultra"    # `cargo run --bin blipmq-ultra -- …`
+# path = "src/bin/blipmq-ultra.rs"
+
+# V2 server
+# [[bin]]
+# name = "blipmq-v2"       # `cargo run --bin blipmq-v2 -- …`
+# path = "src/bin/blipmq-v2.rs"
+
 
 
 [[bench]]
@@ -36,22 +46,32 @@ name = "network_benchmark"
 harness = false
 path = "benches/network_benchmark.rs"
 
+[[bench]]
+name = "timer_wheel_benchmark"
+harness = false
+path = "benches/timer_wheel_benchmark.rs"
+
+# [[bench]]
+# name = "ultra_performance_benchmark"
+# harness = false
+# path = "benches/ultra_performance_benchmark.rs"
+
 
 # ───────────────────────────────────────────────────────────
 # Dependencies
 # ───────────────────────────────────────────────────────────
 [dependencies]
-tokio = { version = "1.38", features = ["net", "io-util", "io-std", "fs", "rt-multi-thread", "macros", "sync", "time"] }
- tracing = "0.1.41"
- tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "time"] }
+tokio = { version = "1.46", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "fs", "signal", "sync", "io-std"] }
+ tracing = { version = "0.1.41", features = ["log"] }
+ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "time", "local-time"] }
  serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
  toml = "0.9.2"
  anyhow = "1.0"
  dashmap = "6.1.0"
  clap = { version = "4.5", features = ["derive"] }
  rustyline = "17.0.1"
- bytes = "1.10.1"
- log = "0.4.27"
+bytes = { version = "1.10.1", features = ["serde"] }
  crossbeam-queue = "0.3.12"
  flume = "0.11.1"
  once_cell = "1.21.3"
@@ -59,6 +79,25 @@ tokio = { version = "1.38", features = ["net", "io-util", "io-std", "fs", "rt-mu
  flatbuffers = "25.2.10"
  tracing-appender = "0.2.3"
  ahash = "0.8"
+ parking_lot = "0.12"
+ num_cpus = "1.16"
+ ctrlc = "3.4"
+ crossbeam = "0.8"
+ mio = "0.8"
+
+ # Production-grade dependencies
+ bincode = "1.3"
+ sha2 = "0.10"
+ base64 = "0.21"
+ uuid = { version = "1.0", features = ["v4", "serde"] }
+ rand = "0.8"
+
+# Optional HTTP/REST API support
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"], optional = true }
+thiserror = "1.0"
+async-trait = "0.1"
 
  # Optional performance features
  mimalloc = { version = "0.1", optional = true }
@@ -74,15 +113,23 @@ flatbuffers-build = { version = "0.2.2", features = ["vendored"] }
 criterion = "0.7.0"
 nats = "0.25.0"
 hdrhistogram = "7"
+axum-test = "15.0"
+tokio-test = "0.4"
+tempfile = "3.5"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
 
 [features]
 # Pin runtime threads or long-lived workers to CPU cores (Windows only implementation)
 affinity = ["windows-sys"]
 # Use mimalloc as global allocator
 mimalloc = ["dep:mimalloc"]
+# HTTP/REST API support
+http-api = ["axum", "tower", "tower-http"]

@@ -56,7 +56,21 @@ async fn main() -> anyhow::Result<()> {
         Command::Start { config } => {
             let cfg_path = std::env::var("BLIPMQ_CONFIG").unwrap_or(config);
             let cfg = load_config(&cfg_path)?;
+            
+            // Initialize performance optimizations if enabled
+            if cfg.performance.warm_up_pools {
+                use blipmq::core::memory_pool::global_pools;
+                println!("🔥 Warming up memory pools...");
+                global_pools().warm_up();
+            }
+            
             println!("📡 BlipMQ broker listening on {}", cfg.server.bind_addr);
+            println!("⚡ Performance features: pools={}, timer_wheel={}, batch_processing={}", 
+                cfg.performance.enable_memory_pools,
+                cfg.performance.enable_timer_wheel,
+                cfg.performance.enable_batch_processing
+            );
+            
             start_broker().await?;
         }
         Command::Connect { addr } => repl(addr).await?,

@@ -10,6 +10,13 @@
   ⚡ <i>“Kafka-level durability. MQTT-level simplicity. NATS-level performance — all in one binary.”</i>
 </p>
 
+<p align="center">
+  📖 <a href="https://bravo1goingdark.github.io/blipmq-site/blipmq/docs"><strong>Documentation</strong></a> ·
+  🚀 <a href="#-quick-start"><strong>Quick Start</strong></a> ·
+  📦 <a href="https://github.com/bravo1goingdark/blipmq/releases"><strong>Releases</strong></a> ·
+  💬 <a href="https://github.com/bravo1goingdark/blipmq/discussions"><strong>Discussions</strong></a>
+</p>
+
 ## 📢 Follow Us
 
 <p align="center">

@@ -1,8 +1,15 @@
+pub mod auth;
+pub mod batch_processor;
 pub mod command;
 pub mod delivery_mode;
+pub mod dlq;
 pub mod error;
+pub mod memory_pool;
 pub mod message;
 pub mod publisher;
+pub mod qos;
 pub mod queue;
 pub mod subscriber;
+pub mod timer_wheel;
 pub mod topics;
+pub mod wal;

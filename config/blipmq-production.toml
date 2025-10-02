@@ -1,0 +1,64 @@
+# BlipMQ v1.0 Production Configuration
+# High-performance message queue configuration template
+
+[server]
+bind_addr = "0.0.0.0:7878"
+max_connections = 10000      # Increased for production
+max_message_size_bytes = 4194304  # 4MB max message size
+
+[auth]
+# Example API keys - replace with your own secure keys in production
+api_keys = [
+    "prod-key-1234567890abcdef",
+    "prod-key-fedcba0987654321"
+]
+
+[queues]
+topic_capacity = 65536       # Large topic input queue for high throughput
+subscriber_capacity = 8192   # Per-subscriber queue capacity
+overflow_policy = "drop_oldest"  # Best for high-throughput scenarios
+
+[wal]
+directory = "/var/log/blipmq"
+segment_size_bytes = 104857600   # 100MB segments
+flush_interval_ms = 100          # Flush WAL every 100ms
+
+[metrics]
+bind_addr = "127.0.0.1:9090"    # Prometheus-compatible metrics endpoint
+
+[delivery]
+max_batch = 256              # Larger batches for better throughput
+max_batch_bytes = 1048576    # 1MB batch size limit
+flush_interval_ms = 5        # 5ms flush interval for balanced latency/throughput
+fanout_shards = 8            # Explicit fanout parallelism
+default_ttl_ms = 300000      # 5-minute default TTL
+
+# High-Performance Configuration Section
+[performance]
+enable_timer_wheel = true
+timer_wheel_resolution_ms = 10
+enable_memory_pools = true
+warm_up_pools = true
+enable_batch_processing = true
+
+[performance.batch_config]
+ttl_max_batch_size = 2000
+ttl_max_batch_delay_ms = 5
+fanout_max_batch_size = 4000
+fanout_max_batch_delay_ms = 2
+channel_capacity = 32768
+
+[performance.cpu_affinity]
+enable_affinity = true       # Enable on supported platforms
+pin_fanout_workers = true
+pin_timer_tasks = true
+pin_network_tasks = true
+core_offset = 0
+
+[performance.network_optimizations]
+tcp_nodelay = true
+send_buffer_size = 131072    # 128KB socket buffers
+recv_buffer_size = 131072    # 128KB socket buffers
+reuse_addr = true
+reuse_port = false           # Enable on Linux for better performance
+keepalive_timeout_secs = 600 # 10-minute keepalive

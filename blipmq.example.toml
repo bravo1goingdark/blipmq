@@ -1,0 +1,164 @@
+# BlipMQ Configuration File
+# Complete example with all available options and documentation
+
+[server]
+# TCP address to bind the message broker to
+# Default: "127.0.0.1:7878"
+bind_addr = "127.0.0.1:7878"
+
+# Maximum number of concurrent client connections
+# Default: 256
+max_connections = 256
+
+# Maximum size of a single message in bytes (1MB default)
+# Messages larger than this will be rejected
+max_message_size_bytes = 1048576
+
+# Enable API key authentication
+# Default: false (no authentication)
+auth_enabled = false
+
+# API key for authentication (optional, only used if auth_enabled = true)
+# api_key = "your-secret-key-here"
+
+[metrics]
+# HTTP address to bind the Prometheus metrics server
+# Default: "127.0.0.1:9090"
+# Access metrics at http://bind_addr/metrics
+bind_addr = "127.0.0.1:9090"
+
+# Enable metrics collection and HTTP server
+# Default: true
+enabled = true
+
+[queues]
+# Maximum number of messages per topic buffer
+# Default: 1024
+topic_capacity = 1024
+
+# Maximum number of messages per subscriber queue
+# Default: 512
+subscriber_capacity = 512
+
+# What to do when a queue is full and a new message arrives:
+# - "drop_oldest": Remove the oldest message (recommended for real-time)
+# - "drop_new": Drop the incoming message
+# - "block": Block until space is available (may cause backpressure)
+# Default: "drop_oldest"
+overflow_policy = "drop_oldest"
+
+[delivery]
+# Maximum number of messages to batch together before delivery
+# Higher values = better throughput, slightly higher latency
+# Default: 64
+max_batch = 64
+
+# Maximum total bytes to batch together (256 KiB default)
+# Batches are flushed when either max_batch or max_batch_bytes is reached
+max_batch_bytes = 262144
+
+# How often to flush batches in milliseconds
+# Lower values = lower latency, higher CPU usage
+# Set to 0 for immediate flushing (ultra-low latency mode)
+# Default: 1
+flush_interval_ms = 1
+
+# Number of fanout worker threads
+# 0 = auto-detect (recommended)
+# Set to number of CPU cores for maximum throughput
+# Default: 0
+fanout_shards = 0
+
+# Default TTL for messages in milliseconds
+# 0 = no expiration (messages live until consumed or queue overflow)
+# Default: 0
+default_ttl_ms = 0
+
+[wal]
+# Enable Write-Ahead Log for message durability
+# When enabled, messages are persisted to disk before acknowledgment
+# Default: true
+enabled = true
+
+# Size of each WAL segment file in megabytes
+# Larger segments = fewer files, but longer recovery times
+# Default: 64
+segment_size_mb = 64
+
+# Maximum number of WAL segment files to keep
+# Older segments are deleted automatically
+# Default: 10
+max_segments = 10
+
+# How often to sync WAL writes to disk in milliseconds
+# Lower values = better durability, higher I/O overhead
+# Default: 100
+fsync_interval_ms = 100
+
+# Directory to store WAL files
+# Default: "./wal" (relative to working directory)
+wal_dir = "./wal"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+# Default: "info"
+level = "info"
+
+# Log format: "json" for structured logging, "pretty" for human-readable
+# Default: "pretty"
+format = "pretty"
+
+# Write logs to file (optional)
+# Uncomment to enable file logging
+# file = "./blipmq.log"
+
+[performance]
+# Use memory allocator optimized for performance
+# Available: "system", "mimalloc" (Linux only)
+# Default: "system"
+allocator = "system"
+
+# Pin worker threads to specific CPU cores (Linux only)
+# Reduces context switching for high-throughput scenarios
+# Default: false
+cpu_affinity = false
+
+# Enable TCP_NODELAY for lower network latency
+# Disables Nagle's algorithm
+# Default: true
+tcp_nodelay = true
+
+# TCP receive buffer size in bytes
+# 0 = use system default
+# Default: 0
+tcp_recv_buffer = 0
+
+# TCP send buffer size in bytes  
+# 0 = use system default
+# Default: 0
+tcp_send_buffer = 0
+
+# Example production configurations:
+#
+# High-throughput configuration:
+# [delivery]
+# max_batch = 128
+# max_batch_bytes = 524288  # 512 KiB
+# flush_interval_ms = 5
+# fanout_shards = 8  # Match your CPU cores
+#
+# Ultra-low latency configuration:
+# [delivery]
+# max_batch = 1
+# flush_interval_ms = 0
+# [wal]
+# enabled = false
+# [performance]
+# tcp_nodelay = true
+#
+# High-durability configuration:
+# [wal]
+# fsync_interval_ms = 1
+# max_segments = 100
+# [queues]
+# overflow_policy = "block"

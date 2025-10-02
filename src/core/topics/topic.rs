@@ -8,6 +8,7 @@ use crate::core::delivery_mode::DeliveryMode;
 use crate::core::error::BlipError;
 use crate::core::message::{to_wire_message, Message, WireMessage};
 use crate::core::subscriber::{Subscriber, SubscriberId};
+use tracing::debug;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 use tokio::sync::mpsc;
@@ -106,8 +107,10 @@ impl Topic {
 
                             // Remove disconnected from shard and global registries
                             for id in disconnected.drain(..) {
-                                shard_subs_for_task.remove(&id);
-                                global_subs_clone.remove(&id);
+                                if let Some(_) = shard_subs_for_task.remove(&id) {
+                                    global_subs_clone.remove(&id);
+                                    debug!("Removed disconnected subscriber: {}", id);
+                                }
                             }
                         }
                         None => {

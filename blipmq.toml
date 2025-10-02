@@ -23,6 +23,59 @@ bind_addr            = "127.0.0.1:9090"
 
 [delivery]
 # Maximum number of messages to coalesce per subscriber flush
-max_batch        = 64
-# Default TTL for every new message (milliseconds)
-default_ttl_ms   = 60000
+max_batch        = 128
+# Maximum bytes per flush batch (256KB)
+max_batch_bytes  = 262144
+# Flush interval in milliseconds for low latency
+flush_interval_ms = 1
+# Number of fanout worker shards (0 = auto-detect CPU cores)
+fanout_shards    = 0
+# Default TTL for every new message (milliseconds, 0 = no expiry)
+default_ttl_ms   = 300000
+
+[performance]
+# Enable timer wheel for efficient TTL management
+enable_timer_wheel = true
+# Timer resolution in milliseconds
+timer_wheel_resolution_ms = 10
+# Enable memory pools for reduced allocations
+enable_memory_pools = true
+# Warm up memory pools on startup
+warm_up_pools = true
+# Enable batch processing optimizations
+enable_batch_processing = true
+
+[performance.batch_config]
+# TTL batch processing settings
+ttl_max_batch_size = 1000
+ttl_max_batch_delay_ms = 10
+# Fanout batch processing settings  
+fanout_max_batch_size = 2000
+fanout_max_batch_delay_ms = 5
+# Channel capacity for batching queues
+channel_capacity = 16384
+
+[performance.cpu_affinity]
+# Enable CPU affinity for worker threads
+enable_affinity = true
+# Pin fanout workers to specific CPU cores
+pin_fanout_workers = true
+# Pin timer tasks to specific CPU cores
+pin_timer_tasks = true
+# Pin network I/O tasks to specific CPU cores
+pin_network_tasks = true
+# Core offset for thread pinning
+core_offset = 0
+
+[performance.network_optimizations]
+# Enable TCP_NODELAY for low latency
+tcp_nodelay = true
+# Socket buffer sizes (64KB)
+send_buffer_size = 65536
+recv_buffer_size = 65536
+# Enable address reuse
+reuse_addr = true
+# Enable port reuse (Linux only)
+reuse_port = false
+# Connection keep-alive timeout (5 minutes)
+keepalive_timeout_secs = 300
