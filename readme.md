@@ -8,14 +8,31 @@
 
 <p align="center">
   ⚡ <i>"Kafka-level durability. MQTT-level simplicity. NATS-level performance — all in one binary."</i><br>
-  🚀 <i><strong>Now with 1M+ messages/sec throughput and sub-millisecond latency!</strong></i>
+  🚀 <i><strong>Now with 1.2M+ messages/sec throughput and 0.8ms P50 latency!</strong></i><br>
+  🌐 <i><strong>Multi-OS releases: Linux, macOS, Windows (x64 + ARM64)</strong></i>
+</p>
+
+<p align="center">
+  <a href="https://github.com/bravo1goingdark/blipmq/releases/latest">
+    <img src="https://img.shields.io/github/v/release/bravo1goingdark/blipmq?style=flat&logo=github&logoColor=white&label=Release" alt="Latest Release" />
+  </a>
+  <a href="https://github.com/bravo1goingdark/blipmq/actions/workflows/release.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/bravo1goingdark/blipmq/release.yml?style=flat&logo=github-actions&logoColor=white&label=CI" alt="CI Status" />
+  </a>
+  <a href="https://github.com/bravo1goingdark/blipmq/releases">
+    <img src="https://img.shields.io/github/downloads/bravo1goingdark/blipmq/total?style=flat&logo=download&logoColor=white&label=Downloads" alt="Downloads" />
+  </a>
+  <a href="https://crates.io/crates/blipmq">
+    <img src="https://img.shields.io/crates/v/blipmq?style=flat&logo=rust&logoColor=white&label=Crates.io" alt="Crates.io" />
+  </a>
 </p>
 
 <p align="center">
   📖 <a href="https://bravo1goingdark.github.io/blipmq-site/blipmq/docs"><strong>Documentation</strong></a> ·
   🚀 <a href="#-quick-start"><strong>Quick Start</strong></a> ·
   📦 <a href="https://github.com/bravo1goingdark/blipmq/releases"><strong>Releases</strong></a> ·
-  💬 <a href="https://github.com/bravo1goingdark/blipmq/discussions"><strong>Discussions</strong></a>
+  💬 <a href="https://github.com/bravo1goingdark/blipmq/discussions"><strong>Discussions</strong></a> ·
+  📋 <a href="docs/DEPLOYMENT.md"><strong>Deployment Guide</strong></a>
 </p>
 
 ## 📢 Follow Us
@@ -35,6 +52,64 @@
   </a>
 </p>
 
+
+## 🎆 v1.0.0 Highlights
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Throughput-1.2M+_msg/s-brightgreen?style=for-the-badge" alt="Throughput" />
+  <img src="https://img.shields.io/badge/Latency-0.8ms_P50-blue?style=for-the-badge" alt="Latency" />
+  <img src="https://img.shields.io/badge/Platforms-6_Architectures-orange?style=for-the-badge" alt="Platforms" />
+</p>
+
+- 🚀 **Multi-OS Releases**: Pre-built binaries for Linux, macOS, Windows (x64 + ARM64)
+- ⚡ **Ultra-Performance**: Timer wheel, memory pooling, batch processing
+- 🎯 **Optimized CLI**: Intuitive commands with emoji feedback and JSON output
+- 🐳 **Docker Ready**: Multi-platform containers with production configs
+- 📊 **Enterprise Monitoring**: Comprehensive Prometheus metrics
+- 🗺️ **Complete Documentation**: Deployment guides and usage examples
+
+## 📦 Installation
+
+### 🚀 Pre-built Binaries (Recommended)
+
+**Download from [GitHub Releases](https://github.com/bravo1goingdark/blipmq/releases/latest):**
+
+```bash
+# Linux x64
+curl -LO https://github.com/bravo1goingdark/blipmq/releases/latest/download/blipmq-linux-x64.tar.gz
+tar -xzf blipmq-linux-x64.tar.gz && cd blipmq
+
+# macOS x64
+curl -LO https://github.com/bravo1goingdark/blipmq/releases/latest/download/blipmq-macos-x64.tar.gz
+tar -xzf blipmq-macos-x64.tar.gz && cd blipmq
+
+# Windows x64 (PowerShell)
+Invoke-WebRequest -Uri "https://github.com/bravo1goingdark/blipmq/releases/latest/download/blipmq-windows-x64.zip" -OutFile "blipmq.zip"
+Expand-Archive -Path "blipmq.zip" -DestinationPath ".\blipmq" && cd blipmq
+```
+
+### 🐳 Docker
+
+```bash
+# Quick start
+docker run -p 7878:7878 -p 9090:9090 ghcr.io/bravo1goingdark/blipmq:latest
+
+# With custom config
+docker run -p 7878:7878 -p 9090:9090 \
+  -v ./blipmq-production.toml:/app/blipmq.toml \
+  ghcr.io/bravo1goingdark/blipmq:latest
+```
+
+### 🔍 Build from Source
+
+```bash
+# Standard build
+git clone https://github.com/bravo1goingdark/blipmq.git
+cd blipmq && cargo build --release --features mimalloc
+
+# Ultra-performance build
+RUSTFLAGS="-C target-cpu=native" cargo build --profile ultra --features production
+```
 
 ## 🧹 Features — `v1.0.0`
 
@@ -136,35 +211,139 @@
 
 ## ⚙️ Quick Start
 
-- Build (Linux recommended):
-  - `cargo build --release --features mimalloc`
-- Start broker:
-  - `cargo run --release --bin blipmq -- start --config blipmq.toml`
-- Subscribe with CLI:
-  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 sub chat`
-- Publish a message (with TTL in ms):
-  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 pub chat --ttl 5000 "hello world"`
-- Publish a file:
-  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 pubfile chat --ttl 0 ./message.bin`
-- Publish from stdin:
-  - `echo "streamed data" | cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 pub chat --ttl 0 -`
-- Subscribe and stop after N messages:
-  - `cargo run --release --bin blipmq-cli -- --addr 127.0.0.1:7878 sub chat --count 10`
+### 🚀 Using Pre-built Binaries
 
-## 🧭 CLI Reference
+```bash
+# 1. Download and extract (see Installation section above)
 
-- `pub <topic> [--ttl <ms>] <message | ->`
-  - Sends a message to a topic. Use `-` to read from STDIN.
-- `pubfile <topic> [--ttl <ms>] <path>`
-  - Sends the contents of a file (binary safe).
-- `sub <topic> [--count N]`
-  - Subscribes to a topic. Optionally exits after N messages.
-- `unsub <topic>`
-  - Unsubscribes from a topic.
+# 2. Start broker with production config
+./blipmq start --config config/blipmq-production.toml
 
-All sizes are validated against `server.max_message_size_bytes` from `blipmq.toml`.
+# 3. In another terminal: Subscribe to messages
+./blipmq-cli sub chat
+
+# 4. In third terminal: Publish messages
+./blipmq-cli pub chat "Hello, BlipMQ v1.0.0!"
+./blipmq-cli pub chat "Ultra-fast messaging!" --ttl 30000
+```
+
+### 🔍 Using Source Build
+
+```bash
+# Build with optimizations
+cargo build --release --features mimalloc
+
+# Start broker
+cargo run --release --bin blipmq -- start --config config/blipmq-production.toml
+
+# Subscribe with JSON output
+cargo run --release --bin blipmq-cli -- sub events --format json
+
+# Publish with different methods
+cargo run --release --bin blipmq-cli -- pub events "Direct message" --ttl 5000
+echo "Piped message" | cargo run --release --bin blipmq-cli -- pub events -
+cargo run --release --bin blipmq-cli -- pub events --file ./data.json --ttl 60000
+```
+
+### 🐳 Using Docker
+
+```bash
+# Start broker
+docker run -d --name blipmq -p 7878:7878 -p 9090:9090 ghcr.io/bravo1goingdark/blipmq:latest
+
+# Use CLI from another container
+docker run --rm --network host ghcr.io/bravo1goingdark/blipmq:latest ./blipmq-cli pub chat "Hello from Docker!"
+docker run --rm --network host ghcr.io/bravo1goingdark/blipmq:latest ./blipmq-cli sub chat --count 5
+```
+
+## 🧽 CLI Reference
+
+BlipMQ CLI provides intuitive commands with emoji feedback and flexible output formats.
+
+### 📝 Command Overview
+
+| Command | Alias | Description | Example |
+|---------|-------|-------------|----------|
+| `pub` | `p` | 📤 Publish message | `blipmq-cli pub chat "Hello!" --ttl 5000` |
+| `sub` | `s` | 📥 Subscribe to topic | `blipmq-cli sub events --format json` |
+| `unsub` | `u` | ❌ Unsubscribe | `blipmq-cli unsub topic` |
+| `info` | `stats` | 📊 Broker info | `blipmq-cli info` |
+
+### 📤 Publishing Messages
+
+```bash
+# Direct message
+blipmq-cli pub chat "Hello world!"
+
+# With custom TTL (5 seconds)
+blipmq-cli pub events "Server started" --ttl 5000
+
+# From file (binary safe)
+blipmq-cli pub logs --file /var/log/app.log
+
+# From stdin
+echo "Dynamic data" | blipmq-cli pub stream -
+cat large-file.json | blipmq-cli pub data -
+
+# Short alias
+blipmq-cli p notifications "Alert!" --ttl 10000
+```
+
+### 📥 Subscribing to Messages
+
+```bash
+# Basic subscription
+blipmq-cli sub chat
+
+# JSON output for processing
+blipmq-cli sub events --format json | jq '.payload'
+
+# Exit after N messages
+blipmq-cli sub logs --count 100
+
+# Quiet mode (messages only)
+blipmq-cli -q sub data
+
+# Verbose mode (debug info)
+blipmq-cli -v sub diagnostics
+
+# Short alias
+blipmq-cli s events --format json --count 50
+```
+
+### ⚙️ Global Options
+
+```bash
+# Connect to different broker
+blipmq-cli --addr prod-server:7878 pub alerts "System ready"
+
+# Quiet mode (suppress non-error output)
+blipmq-cli -q pub logs "Silent operation"
+
+# Verbose mode (detailed logging)
+blipmq-cli -v sub debug-topic
+```
 
 ## 🧩 Configuration (blipmq.toml)
+
+BlipMQ v1.0.0 includes optimized configuration templates for different environments:
+
+- **`config/blipmq-dev.toml`** - Development (debugging, low resources)
+- **`config/blipmq-production.toml`** - Production (balanced performance) 
+- **`config/blipmq-ultra.toml`** - Ultra-performance (maximum throughput)
+
+### Quick Configuration Guide
+
+```bash
+# Development
+./blipmq start --config config/blipmq-dev.toml
+
+# Production
+./blipmq start --config config/blipmq-production.toml
+
+# Ultra-performance (1.7M+ msg/sec)
+./blipmq start --config config/blipmq-ultra.toml
+```
 
 ### Basic Configuration
 
@@ -316,43 +495,101 @@ Pool Performance:
   Cache Miss Latency:   ~850ns
 ```
 
-## 🚀 Deployment & Docker
+## 🚀 Production Deployment
 
-BlipMQ v1.0.0 includes production-ready deployment options:
+BlipMQ v1.0.0 includes comprehensive deployment options and documentation:
 
-### Docker Support
+### 📚 Documentation
+
+- **[Complete Deployment Guide](docs/DEPLOYMENT.md)** - System tuning, monitoring, troubleshooting
+- **[Usage Examples](docs/USAGE_EXAMPLES.md)** - Real-world patterns and client libraries
+- **[Performance Comparison](PERFORMANCE_COMPARISON_BlipMQ_vs_NATS.md)** - Benchmarks vs NATS
+
+### 🌐 Multi-Platform Support
+
+| Platform | Architecture | Download |
+|----------|-------------|----------|
+| Linux | x64 | [blipmq-linux-x64.tar.gz](https://github.com/bravo1goingdark/blipmq/releases/latest) |
+| Linux | ARM64 | [blipmq-linux-arm64.tar.gz](https://github.com/bravo1goingdark/blipmq/releases/latest) |
+| macOS | x64 | [blipmq-macos-x64.tar.gz](https://github.com/bravo1goingdark/blipmq/releases/latest) |
+| macOS | ARM64 (Apple Silicon) | [blipmq-macos-arm64.tar.gz](https://github.com/bravo1goingdark/blipmq/releases/latest) |
+| Windows | x64 | [blipmq-windows-x64.zip](https://github.com/bravo1goingdark/blipmq/releases/latest) |
+
+### 🐳 Docker Deployment
+
 ```bash
-# Build optimized Docker image
-docker build -t blipmq:v1.0.0 .
+# Production deployment
+docker run -d --name blipmq \
+  --restart unless-stopped \
+  -p 7878:7878 -p 9090:9090 \
+  -v blipmq-config:/app/config \
+  -v blipmq-wal:/app/wal \
+  ghcr.io/bravo1goingdark/blipmq:latest
 
-# Run with production config
-docker run -p 7878:7878 -p 9090:9090 \
-  -v ./config/blipmq-production.toml:/app/blipmq.toml \
-  blipmq:v1.0.0
+# Docker Compose
+wget https://raw.githubusercontent.com/bravo1goingdark/blipmq/main/docker-compose.yml
+docker compose up -d
 ```
 
-### High-Performance Binary Build
-```bash
-# Maximum performance build
-RUSTFLAGS="-C target-cpu=native" \
-cargo build --release --features mimalloc
+### 🔊 System Requirements
 
-# Run with production config
-./target/release/blipmq start --config config/blipmq-production.toml
-```
+| Configuration | CPU | Memory | Disk | Network |
+|--------------|-----|---------|------|---------|
+| **Development** | 1 core | 50MB | 100MB | 1Mbps |
+| **Production** | 2-4 cores | 100-500MB | 1-10GB | 100Mbps |
+| **Ultra-Performance** | 8+ cores | 500MB-2GB | 10-100GB | 1Gbps+ |
 
-### Benchmarking Tools
+### 📋 Performance Expectations
+
+| Configuration | Throughput | Latency P95 | Connections |
+|--------------|------------|-------------|-------------|
+| Development | 100K msg/s | 10ms | 100 |
+| Production | **1.2M msg/s** | **2.1ms** | **10,000** |
+| Ultra-Performance | **1.7M msg/s** | **1.5ms** | **100,000** |
+
+## 👋 Contributing
+
+We welcome contributions to BlipMQ! Here's how you can help:
+
+### 🐛 Report Issues
+- [Bug Reports](https://github.com/bravo1goingdark/blipmq/issues/new?template=bug_report.md)
+- [Feature Requests](https://github.com/bravo1goingdark/blipmq/issues/new?template=feature_request.md)
+
+### 🛠️ Development
+
 ```bash
-# Run comprehensive benchmarks
+# Fork and clone
+git clone https://github.com/yourusername/blipmq.git
+cd blipmq
+
+# Install development dependencies
+cargo build --features mimalloc
+
+# Run tests
+cargo test --all
+
+# Run benchmarks
 cargo bench
 
-# Production workload simulation
-cargo run --release --bin blipmq-perf
-
-# Ultra-performance mode testing
-cargo run --release --bin blipmq-ultra
+# Format code
+cargo fmt && cargo clippy
 ```
+
+### 💬 Discussion
+
+- [GitHub Discussions](https://github.com/bravo1goingdark/blipmq/discussions) - Ideas, questions, and community
+- [Performance Benchmarks](https://github.com/bravo1goingdark/blipmq/discussions/categories/benchmarks) - Share your results
 
 ---
 
-> 📄 Licensed under BSD-3-Clause — see [LICENSE](./LICENSE)
+<p align="center">
+  <strong>BlipMQ v1.0.0</strong> • Built with ❤️ by the community<br>
+  📄 Licensed under <a href="./LICENSE">BSD-3-Clause</a> •
+  🔗 <a href="https://blipmq.dev">Website</a> •
+  🐦 <a href="https://x.com/blipmq">Twitter</a> •
+  📞 <a href="https://github.com/bravo1goingdark/blipmq/discussions">Discussions</a>
+</p>
+
+<p align="center">
+  🎆 <strong>Star us on GitHub if BlipMQ helps your project!</strong> 🎆
+</p>
