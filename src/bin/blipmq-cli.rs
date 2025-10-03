@@ -20,12 +20,28 @@ use blipmq::core::message::{decode_frame, ServerFrame};
 #[command(
     name = "blipmq-cli",
     version,
-    about = "BlipMQ CLI: pub/sub/unsub commands with TTL support"
+    about = "🚀 BlipMQ CLI - Ultra-fast message queue operations",
+    long_about = "BlipMQ CLI provides simple commands for pub/sub operations:\n\n\
+        • pub <topic> <message>  - Publish a message\n\
+        • sub <topic>           - Subscribe to messages\n\
+        • unsub <topic>         - Unsubscribe from topic\n\n\
+        Examples:\n\
+        • blipmq-cli pub chat \"Hello world!\"\n\
+        • blipmq-cli sub events\n\
+        • blipmq-cli --addr prod-server:7878 pub alerts \"System ready\""
 )]
 pub struct Cli {
-    /// Address of the BlipMQ broker (e.g. 127.0.0.1:8080)
-    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    /// Broker address (host:port)
+    #[arg(short, long, default_value = "127.0.0.1:8080", help = "BlipMQ broker address")]
     pub addr: SocketAddr,
+
+    /// Verbose output
+    #[arg(short, long, help = "Enable verbose logging")]
+    pub verbose: bool,
+
+    /// Quiet mode (errors only)
+    #[arg(short, long, help = "Suppress non-error output")]
+    pub quiet: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -34,54 +50,75 @@ pub struct Cli {
 /// Supported CLI subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Publish a message to a topic
+    /// 📤 Publish a message to a topic
+    #[command(alias = "p")]
     Pub {
         /// Topic name
+        #[arg(help = "Target topic for the message")]
         topic: String,
-        /// Optional TTL in milliseconds (defaults to CONFIG.delivery.default_ttl_ms)
-        #[arg(short, long)]
-        ttl: Option<u64>,
-        /// Message payload (enclose in quotes for spaces). Use '-' to read from STDIN.
+        /// Message payload (use quotes for spaces, '-' for stdin)
+        #[arg(help = "Message content to publish")]
         message: String,
-    },
-
-    /// Publish the contents of a file as a message
-    PubFile {
-        /// Topic name
-        topic: String,
-        /// Optional TTL in milliseconds (defaults to CONFIG.delivery.default_ttl_ms)
-        #[arg(short, long)]
+        /// TTL in milliseconds (default: server config)
+        #[arg(short, long, help = "Message time-to-live in ms")]
         ttl: Option<u64>,
-        /// Path to file whose contents will be sent as the message
-        file: PathBuf,
+        /// Publish from file instead of command line
+        #[arg(short, long, help = "Read message from file")]
+        file: Option<PathBuf>,
     },
 
-    /// Subscribe to messages on a topic
+    /// 📥 Subscribe to messages on a topic  
+    #[command(alias = "s")]
     Sub {
         /// Topic name
+        #[arg(help = "Topic to subscribe to")]
         topic: String,
-        /// Stop after receiving this many messages (omit to stream indefinitely)
-        #[arg(short = 'n', long)]
+        /// Stop after N messages (default: infinite)
+        #[arg(short = 'n', long, help = "Exit after receiving N messages")]
         count: Option<usize>,
+        /// Output format: text, json
+        #[arg(short = 'f', long, default_value = "text", help = "Output format (text|json)")]
+        format: String,
     },
 
-    /// Unsubscribe from a topic
+    /// ❌ Unsubscribe from a topic
+    #[command(alias = "u")]
     Unsub {
         /// Topic name
+        #[arg(help = "Topic to unsubscribe from")]
         topic: String,
     },
+
+    /// 📊 Show broker statistics
+    #[command(alias = "stats")]
+    Info,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+    
+    // Configure logging based on verbosity
+    if cli.verbose {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+    } else if !cli.quiet {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .init();
+    }
+
     let mut stream = TcpStream::connect(cli.addr)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", cli.addr, e))?;
+        .map_err(|e| anyhow::anyhow!("❌ Failed to connect to {}: {}", cli.addr, e))?;
+    
     // Low-latency I/O
     let _ = stream.set_nodelay(true);
+    
+    if !cli.quiet {
+        println!("🔗 Connected to BlipMQ at {}", cli.addr);
+    }
 
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -90,55 +127,88 @@ async fn main() -> anyhow::Result<()> {
     let cmd = match &cli.command {
         Command::Pub {
             topic,
-            ttl,
             message,
+            ttl,
+            file,
         } => {
-            // Resolve message (support '-' for stdin)
-            let resolved = if message == "-" {
+            // Determine message source (file, stdin, or direct)
+            let resolved = if let Some(file_path) = file {
+                // Read from file
+                let data = tokio::fs::read(file_path).await
+                    .map_err(|e| anyhow::anyhow!("❌ Failed to read file {}: {}", file_path.display(), e))?;
+                if data.len() > CONFIG.server.max_message_size_bytes {
+                    return Err(anyhow::anyhow!(
+                        "❌ File size ({} bytes) exceeds server limit ({} bytes)",
+                        data.len(),
+                        CONFIG.server.max_message_size_bytes
+                    ));
+                }
+                data
+            } else if message == "-" {
+                // Read from stdin
                 use tokio::io::AsyncReadExt as _;
+                if !cli.quiet {
+                    eprint!("📝 Reading from stdin (Ctrl+D to finish): ");
+                }
                 let mut data = Vec::new();
                 let mut stdin = tokio::io::stdin();
                 stdin.read_to_end(&mut data).await?;
-                String::from_utf8_lossy(&data).into_owned()
+                if data.len() > CONFIG.server.max_message_size_bytes {
+                    return Err(anyhow::anyhow!(
+                        "❌ Input size ({} bytes) exceeds server limit ({} bytes)",
+                        data.len(),
+                        CONFIG.server.max_message_size_bytes
+                    ));
+                }
+                data
             } else {
-                message.clone()
+                // Use message from command line
+                let data = message.as_bytes().to_vec();
+                if data.len() > CONFIG.server.max_message_size_bytes {
+                    return Err(anyhow::anyhow!(
+                        "❌ Message size ({} bytes) exceeds server limit ({} bytes)",
+                        data.len(),
+                        CONFIG.server.max_message_size_bytes
+                    ));
+                }
+                data
             };
-            // Check message size against server's max_message_size_bytes
-            if resolved.len() > CONFIG.server.max_message_size_bytes {
-                error!(
-                    "Message size ({}) exceeds server's maximum allowed size ({}), aborting.",
-                    resolved.len(),
-                    CONFIG.server.max_message_size_bytes
-                );
-                return Err(anyhow::anyhow!("Message too large"));
-            }
+            
             let ttl_ms = ttl.unwrap_or(CONFIG.delivery.default_ttl_ms);
+            if !cli.quiet {
+                println!("📤 Publishing {} bytes to '{}' (TTL: {}ms)", resolved.len(), topic, ttl_ms);
+            }
             new_pub_with_ttl(topic.clone(), resolved, ttl_ms)
         }
-        Command::PubFile { topic, ttl, file } => {
-            let data = tokio::fs::read(file).await?;
-            if data.len() > CONFIG.server.max_message_size_bytes {
-                error!(
-                    "File size ({}) exceeds server's maximum allowed size ({}), aborting.",
-                    data.len(),
-                    CONFIG.server.max_message_size_bytes
-                );
-                return Err(anyhow::anyhow!("Message too large"));
+        Command::Sub { topic, .. } => {
+            if !cli.quiet {
+                println!("📥 Subscribing to '{}'", topic);
             }
-            let ttl_ms = ttl.unwrap_or(CONFIG.delivery.default_ttl_ms);
-            // Send as-is (binary safe)
-            let payload: Vec<u8> = data;
-            new_pub_with_ttl(topic.clone(), payload, ttl_ms)
+            new_sub(topic.clone())
         }
-        Command::Sub { topic, .. } => new_sub(topic.clone()),
-        Command::Unsub { topic } => new_unsub(topic.clone()),
+        Command::Unsub { topic } => {
+            if !cli.quiet {
+                println!("❌ Unsubscribing from '{}'", topic);
+            }
+            new_unsub(topic.clone())
+        }
+        Command::Info => {
+            // For now, just return early - could be extended to query broker stats
+            if !cli.quiet {
+                println!("📊 Broker info feature coming soon!");
+            }
+            return Ok(());
+        }
     };
 
     let frame = encode_command_with_len_prefix(&cmd);
     write_half.write_all(&frame).await?;
-    info!("Sent request: action={:?}", cmd.action);
+    
+    if cli.verbose {
+        info!("Sent request: action={:?}", cmd.action);
+    }
 
-    if let Command::Sub { count, .. } = &cli.command {
+    if let Command::Sub { count, format, .. } = &cli.command {
         // Read SubAck first
         let mut len_buf = [0u8; 4];
         if reader.read_exact(&mut len_buf).await.is_err() {
@@ -162,13 +232,17 @@ async fn main() -> anyhow::Result<()> {
         }
 
         match decode_frame(&ack_buf) {
-            Ok(ServerFrame::SubAck(ack)) => println!("> {}", ack.info),
+            Ok(ServerFrame::SubAck(ack)) => {
+                if !cli.quiet {
+                    println!("✅ {}", ack.info);
+                }
+            }
             Ok(_) => {
-                eprintln!("> Unexpected frame instead of SubAck");
+                eprintln!("❌ Unexpected frame instead of SubAck");
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("> Failed to decode SubAck: {e}");
+                eprintln!("❌ Failed to decode SubAck: {e}");
                 return Ok(());
             }
         }
@@ -196,17 +270,38 @@ async fn main() -> anyhow::Result<()> {
 
             match decode_frame(&msg_buf) {
                 Ok(ServerFrame::Message(msg)) => {
-                    let payload = String::from_utf8_lossy(&msg.payload);
-                    println!("{} {} @{}", msg.id, payload, msg.timestamp);
                     seen += 1;
+                    
+                    // Format output based on user preference
+                    if format == "json" {
+                        let json_msg = serde_json::json!({
+                            "id": msg.id,
+                            "payload": String::from_utf8_lossy(&msg.payload),
+                            "timestamp": msg.timestamp,
+                            "sequence": seen
+                        });
+                        println!("{}", json_msg);
+                    } else {
+                        let payload = String::from_utf8_lossy(&msg.payload);
+                        let timestamp = chrono::DateTime::from_timestamp_millis(msg.timestamp as i64)
+                            .map(|dt| dt.format("%H:%M:%S%.3f").to_string())
+                            .unwrap_or_else(|| msg.timestamp.to_string());
+                        println!("💬 [{}] {}: {}", timestamp, msg.id, payload);
+                    }
+                    
                     if let Some(limit) = count {
                         if seen >= *limit {
+                            if !cli.quiet {
+                                println!("🏁 Received {} messages, exiting", seen);
+                            }
                             break;
                         }
                     }
                 }
                 Ok(_) => {
-                    eprintln!("⚠️ Unexpected frame");
+                    if cli.verbose {
+                        eprintln!("⚠️ Unexpected frame type");
+                    }
                 }
                 Err(e) => {
                     eprintln!("❌ Failed to decode frame: {e}");
@@ -214,7 +309,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        info!("Subscription ended");
+        if !cli.quiet {
+            println!("ℹ️ Subscription ended (received {} messages)", seen);
+        }
     }
 
     Ok(())

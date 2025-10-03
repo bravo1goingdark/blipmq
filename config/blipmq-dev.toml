@@ -1,0 +1,71 @@
+# BlipMQ Development Configuration
+# Optimized for development, debugging, and testing
+# Lower resource usage, verbose logging, quick startup
+
+[server]
+bind_addr = "127.0.0.1:8080"
+max_connections = 100
+max_message_size_bytes = 1048576  # 1MB max message size
+
+[auth]
+# Development API keys - not for production use
+api_keys = [
+    "dev-key-123",
+    "test-key-456"
+]
+
+[queues]
+topic_capacity = 1000
+subscriber_capacity = 512
+overflow_policy = "drop_oldest"
+
+[wal]
+directory = "./dev-wal"
+segment_size_bytes = 1048576     # 1MB segments for quick testing
+flush_interval_ms = 1000         # 1s flush for development
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[delivery]
+max_batch = 32               # Smaller batches for easier debugging
+max_batch_bytes = 65536      # 64KB batch size
+flush_interval_ms = 10       # 10ms flush interval
+fanout_shards = 2            # Limited parallelism for simpler debugging
+default_ttl_ms = 30000       # 30-second default TTL
+
+# Development Performance Configuration
+[performance]
+enable_timer_wheel = true
+timer_wheel_resolution_ms = 100    # Lower precision for less overhead
+enable_memory_pools = false       # Disable for easier memory debugging
+warm_up_pools = false
+enable_batch_processing = false   # Disable for simpler behavior
+
+[performance.timer_config]
+resolution_ms = 100
+max_timeout_ms = 300000      # 5 minutes max timeout
+
+[performance.batch_config]
+ttl_max_batch_size = 100
+ttl_max_batch_delay_ms = 50
+fanout_max_batch_size = 200
+fanout_max_batch_delay_ms = 25
+channel_capacity = 1024
+
+[performance.cpu_affinity]
+enable_affinity = false      # Disable CPU pinning for development
+
+[performance.network_optimizations]
+tcp_nodelay = true
+send_buffer_size = 8192      # 8KB socket buffers
+recv_buffer_size = 8192      # 8KB socket buffers
+reuse_addr = true
+reuse_port = false
+keepalive_timeout_secs = 60  # 1-minute keepalive
+
+# Development logging configuration
+[logging]
+level = "DEBUG"              # Verbose logging for development
+async_logging = false        # Synchronous logging for immediate output
+buffer_size = 8192           # 8KB log buffer

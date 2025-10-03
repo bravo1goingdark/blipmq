@@ -1,0 +1,98 @@
+# BlipMQ Ultra-Performance Configuration
+# Optimized for maximum throughput and minimal latency
+# Recommended for high-end production environments
+
+[server]
+bind_addr = "0.0.0.0:7878"
+max_connections = 100000     # Very high connection limit
+max_message_size_bytes = 16777216  # 16MB max message size
+
+[auth]
+# Production API keys - replace with your secure keys
+api_keys = [
+    "ultra-perf-key-1234567890abcdef",
+    "ultra-perf-key-fedcba0987654321"
+]
+
+[queues]
+topic_capacity = 131072      # 128K topic input queue - very large
+subscriber_capacity = 32768  # 32K per-subscriber queue capacity
+overflow_policy = "drop_oldest"  # Best for ultra-high throughput
+
+[wal]
+directory = "/var/log/blipmq"
+segment_size_bytes = 268435456   # 256MB segments for reduced I/O
+flush_interval_ms = 50           # 50ms flush for balanced durability/performance
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[delivery]
+max_batch = 1024             # Large batches for maximum throughput
+max_batch_bytes = 8388608    # 8MB batch size limit
+flush_interval_ms = 1        # 1ms ultra-low latency flushing
+fanout_shards = 16           # High parallelism (adjust to CPU cores)
+default_ttl_ms = 60000       # 1-minute default TTL
+
+# Ultra-Performance Configuration
+[performance]
+enable_timer_wheel = true
+timer_wheel_resolution_ms = 5      # 5ms resolution for ultra-precision
+enable_memory_pools = true
+warm_up_pools = true
+enable_batch_processing = true
+
+[performance.timer_config]
+resolution_ms = 5
+max_timeout_ms = 86400000    # 24 hours max timeout
+wheel_size = 512             # Larger wheel for better distribution
+
+[performance.pool_config]
+# Larger pool sizes for sustained ultra-high load
+buffer_small_count = 8192    # 8K small buffers
+buffer_medium_count = 4096   # 4K medium buffers  
+buffer_large_count = 2048    # 2K large buffers
+message_batch_count = 4096   # 4K message batch objects
+
+[performance.batch_config]
+# Ultra-aggressive batching for maximum throughput
+ttl_max_batch_size = 8000
+ttl_max_batch_delay_ms = 2
+fanout_max_batch_size = 16000
+fanout_max_batch_delay_ms = 1
+channel_capacity = 131072    # 128K channel capacity
+
+[performance.cpu_affinity]
+enable_affinity = true
+pin_fanout_workers = true
+pin_timer_tasks = true
+pin_network_tasks = true
+core_offset = 0
+# Specific core assignments for maximum performance
+timer_cores = "0,1"          # Dedicate specific cores to timer tasks
+fanout_cores = "2,3,4,5"     # Dedicate cores to fanout operations
+network_cores = "6,7"        # Dedicate cores to network I/O
+
+[performance.network_optimizations]
+tcp_nodelay = true
+send_buffer_size = 2097152   # 2MB socket buffers
+recv_buffer_size = 2097152   # 2MB socket buffers
+reuse_addr = true
+reuse_port = true            # Enable on Linux for better performance
+keepalive_timeout_secs = 1800 # 30-minute keepalive
+tcp_window_scaling = true
+tcp_timestamp = false        # Disable for slightly better performance
+tcp_sack = true
+
+# NUMA and memory optimization
+[performance.memory]
+huge_pages = true            # Use huge pages if available (Linux)
+numa_node = 0                # Pin to specific NUMA node
+memory_prefaulting = true    # Pre-fault memory pages
+jemalloc_background_threads = true
+
+# Logging configuration for ultra-performance
+[logging]
+level = "WARN"               # Minimal logging for maximum performance
+async_logging = true         # Async logging to avoid blocking
+buffer_size = 1048576        # 1MB log buffer

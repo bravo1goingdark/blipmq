@@ -1,0 +1,46 @@
+[server]
+bind_addr = "127.0.0.1:7878"
+max_connections = 10000
+max_message_size_bytes = 4194304
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+
+[queues]
+topic_capacity = 10000
+subscriber_capacity = 5000
+overflow_policy = "drop_oldest"
+
+[delivery]
+max_batch = 256
+max_batch_bytes = 1048576
+flush_interval_ms = 1
+fanout_shards = 0
+default_ttl_ms = 0
+
+[performance]
+enable_timer_wheel = true
+enable_memory_pools = true
+enable_batch_processing = true
+warm_up_pools = true
+
+[performance.timer_config]
+resolution_ms = 10
+max_timeout_ms = 300000
+
+[performance.pool_config]
+buffer_small_count = 2048
+buffer_medium_count = 1024
+buffer_large_count = 512
+message_batch_count = 1024
+
+[performance.batch_config]
+ttl_max_batch_size = 2000
+fanout_max_batch_size = 4000
+channel_capacity = 32768
+
+[performance.network_optimizations]
+tcp_nodelay = true
+send_buffer_size = 131072
+recv_buffer_size = 131072
+cpu_affinity = "auto"
