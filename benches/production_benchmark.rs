@@ -1,9 +1,38 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hdrhistogram::Histogram;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
+
+struct CountingAllocator;
+
+static GLOBAL_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.alloc(layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.alloc_zeroed(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 const WARMUP_MESSAGES: usize = 10_000;
 const PAYLOAD_SIZES: &[usize] = &[64, 256, 1024, 4096, 16384];
@@ -389,7 +418,7 @@ fn benchmark_throughput(c: &mut Criterion) {
 fn benchmark_fanout(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("fanout");
-    
+
     for &subscribers in SUBSCRIBER_COUNTS {
         let config = BenchConfig {
             messages: 100_000,
@@ -416,10 +445,62 @@ fn benchmark_fanout(c: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_encoder(c: &mut Criterion) {
+    use blipmq::core::message::{encode_message_frame, Message};
+    use bytes::Bytes;
+
+    let mut group = c.benchmark_group("message_encoder");
+
+    for &payload_size in PAYLOAD_SIZES {
+        group.throughput(Throughput::Elements(1));
+
+        group.bench_with_input(
+            BenchmarkId::new("encode_frame", payload_size),
+            &payload_size,
+            |b, &size| {
+                let payload = Bytes::from(vec![0u8; size]);
+                let mut message = Message {
+                    id: 1,
+                    payload,
+                    timestamp: 0,
+                    ttl_ms: 0,
+                };
+
+                black_box(encode_message_frame(&message));
+
+                b.iter_custom(|iters| {
+                    let start_allocs = GLOBAL_ALLOCATIONS.load(Ordering::Relaxed);
+                    let start = Instant::now();
+                    let mut id = message.id;
+                    for _ in 0..iters {
+                        id = id.wrapping_add(1);
+                        message.id = id;
+                        let frame = encode_message_frame(&message);
+                        black_box(frame);
+                    }
+                    let duration = start.elapsed();
+                    let end_allocs = GLOBAL_ALLOCATIONS.load(Ordering::Relaxed);
+                    let allocations = end_allocs - start_allocs;
+                    assert!(
+                        allocations == 0,
+                        "encoder incurred {} allocations for payload {} bytes",
+                        allocations,
+                        size
+                    );
+                    duration
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_latency,
     benchmark_throughput,
-    benchmark_fanout
+    benchmark_fanout,
+    benchmark_encoder
 );
 criterion_main!(benches);

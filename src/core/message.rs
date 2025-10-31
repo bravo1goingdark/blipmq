@@ -1,7 +1,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flatbuffers::{root, FlatBufferBuilder, InvalidFlatbuffer};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::config::CONFIG;
 use crate::generated::blipmq;
 
 #[derive(Debug, Clone)]
@@ -88,19 +90,71 @@ fn generate_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+const MESSAGE_OVERHEAD_BYTES: usize = 256;
+const FRAME_PREFIX_BYTES: usize = 5;
+
+fn payload_limit() -> usize {
+    CONFIG.server.max_message_size_bytes.max(64)
+}
+
+fn builder_capacity_hint() -> usize {
+    payload_limit().saturating_add(MESSAGE_OVERHEAD_BYTES)
+}
+
+fn frame_capacity_hint() -> usize {
+    builder_capacity_hint().saturating_add(FRAME_PREFIX_BYTES)
+}
+
+thread_local! {
+    static MESSAGE_BUILDER: RefCell<FlatBufferBuilder<'static>> = RefCell::new(
+        FlatBufferBuilder::with_capacity(builder_capacity_hint())
+    );
+
+    static FRAME_BUFFER: RefCell<BytesMut> =
+        RefCell::new(BytesMut::with_capacity(frame_capacity_hint()));
+}
+
+fn encode_message_with_builder<F, R>(msg: &Message, f: F) -> R
+where
+    F: FnOnce(&[u8]) -> R,
+{
+    MESSAGE_BUILDER.with(|cell| {
+        let mut builder = cell.borrow_mut();
+        builder.reset();
+        let payload = builder.create_vector(msg.payload.as_ref());
+        let args = blipmq::MessageArgs {
+            id: msg.id,
+            payload: Some(payload),
+            timestamp: msg.timestamp,
+            ttl_ms: msg.ttl_ms,
+        };
+        let offset = blipmq::Message::create(&mut builder, &args);
+        builder.finish(offset, None);
+        let data = builder.finished_data();
+        f(data)
+    })
+}
+
+fn take_frozen_bytes(buf: &mut BytesMut) -> Bytes {
+    if buf.is_empty() {
+        Bytes::new()
+    } else {
+        let len = buf.len();
+        buf.split_to(len).freeze()
+    }
+}
+
 /// Serialize a raw `Message` (no length-prefix).
-pub fn encode_message(msg: &Message) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::new();
-    let payload = builder.create_vector(msg.payload.as_ref());
-    let args = blipmq::MessageArgs {
-        id: msg.id,
-        payload: Some(payload),
-        timestamp: msg.timestamp,
-        ttl_ms: msg.ttl_ms,
-    };
-    let offset = blipmq::Message::create(&mut builder, &args);
-    builder.finish(offset, None);
-    builder.finished_data().to_vec()
+pub fn encode_message(msg: &Message) -> Bytes {
+    encode_message_with_builder(msg, |data| {
+        FRAME_BUFFER.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.reserve(data.len());
+            buf.extend_from_slice(data);
+            take_frozen_bytes(&mut buf)
+        })
+    })
 }
 
 /// Deserialize a raw `Message` (no length-prefix).
@@ -119,30 +173,32 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, InvalidFlatbuffer> {
 
 /// Encodes a `Message` with 4-byte length prefix into buffer.
 pub fn encode_message_into(msg: &Message, buf: &mut BytesMut) {
-    let data = encode_message(msg);
-    buf.reserve(4 + data.len());
-    buf.put_u32(data.len() as u32);
-    buf.extend_from_slice(&data);
+    encode_message_with_builder(msg, |data| {
+        buf.reserve(4 + data.len());
+        buf.put_u32(data.len() as u32);
+        buf.extend_from_slice(data);
+    });
 }
 
 /// Encodes a `Message` as a typed ServerFrame::Message with 4-byte length prefix.
 pub fn encode_message_frame_into(msg: &Message, buf: &mut BytesMut) {
-    let data = encode_message(msg);
-    buf.reserve(4 + 1 + data.len());
-    buf.put_u32((1 + data.len()) as u32);
-    buf.put_u8(FRAME_MESSAGE);
-    buf.extend_from_slice(&data);
+    encode_message_with_builder(msg, |data| {
+        buf.reserve(4 + 1 + data.len());
+        buf.put_u32((1 + data.len()) as u32);
+        buf.put_u8(FRAME_MESSAGE);
+        buf.extend_from_slice(data);
+    });
 }
 
 /// Builds and returns an owned frame (4-byte length prefix + type + payload) for a Message.
 #[inline]
 pub fn encode_message_frame(msg: &Message) -> Bytes {
-    let data = encode_message(msg);
-    let mut buf = BytesMut::with_capacity(4 + 1 + data.len());
-    buf.put_u32((1 + data.len()) as u32);
-    buf.put_u8(FRAME_MESSAGE);
-    buf.extend_from_slice(&data);
-    buf.freeze()
+    FRAME_BUFFER.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        encode_message_frame_into(msg, &mut buf);
+        take_frozen_bytes(&mut buf)
+    })
 }
 
 /// Converts a Message into a pre-encoded wire frame along with its expiration time.
@@ -189,11 +245,12 @@ pub fn encode_frame_into(frame: &ServerFrame, buf: &mut BytesMut) {
             buf.extend_from_slice(&data);
         }
         ServerFrame::Message(msg) => {
-            let data = encode_message(msg);
-            buf.reserve(4 + 1 + data.len());
-            buf.put_u32((1 + data.len()) as u32);
-            buf.put_u8(FRAME_MESSAGE);
-            buf.extend_from_slice(&data);
+            encode_message_with_builder(msg, |data| {
+                buf.reserve(4 + 1 + data.len());
+                buf.put_u32((1 + data.len()) as u32);
+                buf.put_u8(FRAME_MESSAGE);
+                buf.extend_from_slice(data);
+            });
         }
     }
 }

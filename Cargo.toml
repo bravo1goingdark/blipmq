@@ -51,6 +51,11 @@ name = "timer_wheel_benchmark"
 harness = false
 path = "benches/timer_wheel_benchmark.rs"
 
+[[bench]]
+name = "production_benchmark"
+harness = false
+path = "benches/production_benchmark.rs"
+
 # [[bench]]
 # name = "ultra_performance_benchmark"
 # harness = false
@@ -117,6 +122,7 @@ hdrhistogram = "7"
 axum-test = "15.0"
 tokio-test = "0.4"
 tempfile = "3.5"
+allocation-counter = "0.8"
 
 [profile.release]
 opt-level = 3
