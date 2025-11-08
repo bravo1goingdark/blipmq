@@ -9,14 +9,14 @@ BlipMQ v1.0.0 introduces significant performance improvements that position it c
 - **Hardware**: Intel Core i7 (8 cores), 16GB RAM
 - **Network**: Loopback (127.0.0.1)
 - **BlipMQ Version**: v1.0.0 (with timer wheel, memory pooling, batch processing)
-- **NATS Version**: v2.10.7
+- **NATS Version**: 2.10.7
 - **Test Date**: October 2025
 
 ## Performance Comparison
 
 ### Throughput Comparison
 
-| Metric | BlipMQ v1.0.0 | NATS v2.10.7 | BlipMQ Advantage |
+| Metric | BlipMQ v1.0.0 | NATS 2.10.7 | BlipMQ Advantage |
 |--------|---------------|--------------|------------------|
 | **Single Topic Throughput** | **1.2M msg/s** | 800K-1M msg/s | **20-50% faster** |
 | **Multi Topic (10 topics)** | **950K msg/s** | 600K-750K msg/s | **25-60% faster** |
@@ -26,7 +26,7 @@ BlipMQ v1.0.0 introduces significant performance improvements that position it c
 
 ### Latency Comparison
 
-| Latency Percentile | BlipMQ v1.0.0 | NATS v2.10.7 | BlipMQ Advantage |
+| Latency Percentile | BlipMQ v1.0.0 | NATS 2.10.7 | BlipMQ Advantage |
 |-------------------|---------------|--------------|------------------|
 | **P50 (Median)** | **0.8ms** | 1.2-2.0ms | **33-60% lower** |
 | **P95** | **2.1ms** | 3.5-5.0ms | **40-58% lower** |
@@ -36,7 +36,7 @@ BlipMQ v1.0.0 introduces significant performance improvements that position it c
 
 ### Resource Utilization
 
-| Resource | BlipMQ v1.0.0 | NATS v2.10.7 | BlipMQ Advantage |
+| Resource | BlipMQ v1.0.0 | NATS 2.10.7 | BlipMQ Advantage |
 |----------|---------------|--------------|------------------|
 | **Binary Size** | **< 5MB** | ~15MB | **66% smaller** |
 | **Memory Baseline** | **~30MB** | ~50-80MB | **37-62% less** |
