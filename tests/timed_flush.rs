@@ -16,5 +16,9 @@ async fn timed_flush_sla_small_frames() {
     use tokio::time::{timeout, Duration};
     let mut buf = [0u8; 5];
     let res = timeout(Duration::from_millis(50), server.read_exact(&mut buf)).await;
-    assert!(res.is_ok(), "writer did not flush within SLA");
+    res.expect("writer did not flush within SLA")
+        .expect("failed to read frame");
+
+    let expected = [0x00, 0x00, 0x00, 0x01, 0xCC];
+    assert_eq!(buf, expected, "unexpected frame contents");
 }
