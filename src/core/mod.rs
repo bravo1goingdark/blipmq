@@ -4,6 +4,7 @@ pub mod command;
 pub mod delivery_mode;
 pub mod dlq;
 pub mod error;
+pub mod lockfree;
 pub mod memory_pool;
 pub mod message;
 pub mod publisher;
