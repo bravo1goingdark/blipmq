@@ -213,7 +213,7 @@ pub fn to_wire_message(msg: &Message) -> WireMessage {
     WireMessage { frame, expire_at }
 }
 
-/// Encodes a `SubAck` with length prefix into buffer.
+/// Encodes a `SubAck` and returns the FlatBuffer payload without a length prefix.
 pub fn encode_suback(ack: &SubAck) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
     let topic = builder.create_string(&ack.topic);
