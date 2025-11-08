@@ -11,8 +11,6 @@ use std::net::SocketAddr;
 use std::env;
 use tracing::{info, error};
 
-// use blipmq::v2::simple_ultra_server::SimpleUltraServer;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging

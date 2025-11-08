@@ -17,7 +17,6 @@ pub mod core;
 pub mod logging;
 pub mod metrics;
 pub mod util; // affinity utils, etc. // minimal global counters + export
-// pub mod v2; // Ultra-high performance implementation - temporarily disabled
 
 // Generated FlatBuffers bindings (from build.rs)
 // We include them once here and allow lints that commonly trigger in generated code.

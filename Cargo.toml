@@ -29,15 +29,10 @@ path = "src/bin/blipmq.rs"
 name = "blipmq-cli"      # `cargo run --bin blipmq-cli -- …`
 path = "src/bin/blipmq-cli.rs"
 
-# Ultra-high performance server
+# Ultra-high performance server (experimental)
 # [[bin]]
 # name = "blipmq-ultra"    # `cargo run --bin blipmq-ultra -- …`
 # path = "src/bin/blipmq-ultra.rs"
-
-# V2 server
-# [[bin]]
-# name = "blipmq-v2"       # `cargo run --bin blipmq-v2 -- …`
-# path = "src/bin/blipmq-v2.rs"
 
 
 
@@ -55,12 +50,6 @@ path = "benches/timer_wheel_benchmark.rs"
 name = "production_benchmark"
 harness = false
 path = "benches/production_benchmark.rs"
-
-# [[bench]]
-# name = "ultra_performance_benchmark"
-# harness = false
-# path = "benches/ultra_performance_benchmark.rs"
-
 
 # ───────────────────────────────────────────────────────────
 # Dependencies
@@ -132,8 +121,6 @@ panic = "abort"
 strip = true
 debug = false
 overflow-checks = false
-# Additional performance optimizations
-inherits = "release"
 
 # Ultra-performance profile for production builds
 [profile.ultra]
