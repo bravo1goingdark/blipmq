@@ -195,7 +195,7 @@ mod tests {
     fn create_test_app_state() -> AppState {
         AppState {
             auth_manager: Arc::new(AuthManager::new()),
-            timer_manager: Arc::new(TimerManager::new(1000)),
+            timer_manager: Arc::new(TimerManager::new()),
             dlq: Arc::new(DeadLetterQueue::new()),
             config: ApiConfig::default(),
         }
