@@ -1,0 +1,13 @@
+[package]
+name = "blipmq_config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ configuration loading (env + file)"
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+serde_yaml = { workspace = true }

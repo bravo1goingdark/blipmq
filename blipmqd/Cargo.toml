@@ -1,0 +1,21 @@
+[package]
+name = "blipmqd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ broker daemon"
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+console-subscriber = { workspace = true }
+bytes = { workspace = true }
+blipmq_core = { path = "../blipmq_core" }
+blipmq_net = { path = "../blipmq_net" }
+blipmq_wal = { path = "../blipmq_wal" }
+blipmq_auth = { path = "../blipmq_auth" }
+blipmq_metrics = { path = "../blipmq_metrics" }
+blipmq_config = { path = "../blipmq_config" }
+clap = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "blipmq_net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ networking: TCP server and protocol framing"
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+blipmq_core = { path = "../blipmq_core" }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+blipmq_auth = { path = "../blipmq_auth" }

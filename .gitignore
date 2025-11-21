@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+**/*.swp
+**/*.swo
+/.idea
+/.vscode
+.DS_Store
+*.log
+flamegraph.svg
+perf.data*
+
