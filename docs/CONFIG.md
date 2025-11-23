@@ -1,10 +1,10 @@
-﻿# BlipMQ Configuration
+# BlipMQ Configuration
 
-`blipmq_config` defines how configuration is loaded and merged from files and environment variables. This document describes all config keys, their types/defaults, and recommended usage.
+`config` defines how configuration is loaded and merged from files and environment variables. This document describes all config keys, their types/defaults, and recommended usage.
 
 ## Config Structure
 
-`blipmq_config::Config`:
+`config::Config`:
 
 ```rust
 pub struct Config {
@@ -30,7 +30,7 @@ If no config file is present and no environment variables are set:
 - `metrics_addr`: `"127.0.0.1"`
 - `metrics_port`: `9100`
 - `wal_path`: `"blipmq.wal"`
-- `fsync_policy`: `None` (interpreted via `WalConfig::default()` → `fsync_every_n = Some(64)`)
+- `fsync_policy`: `None` (interpreted via `WalConfig::default()` ? `fsync_every_n = Some(64)`)
 - `max_retries`: `3`
 - `retry_backoff_ms`: `100`
 - `allowed_api_keys`: `[]` (no clients can authenticate)
@@ -48,7 +48,7 @@ Merge rules:
 
 1. File path is chosen from:
    - CLI `--config` parameter, or
-   - `BLIPMQ_CONFIG` environment variable, or
+   - `CONFIG` environment variable, or
    - None (no file).
 2. File values are loaded and defaulted as above.
 3. Environment variables, if set, override the corresponding file values.
@@ -59,31 +59,31 @@ Merge rules:
 
 - Bind address for the TCP broker.
 - Example: `"127.0.0.1"`, `"0.0.0.0"`.
-- Env override: `BLIPMQ_BIND_ADDR`.
+- Env override: `BIND_ADDR`.
 
 ### `port` (u16)
 
 - TCP port for the broker.
 - Default: `5555`.
-- Env override: `BLIPMQ_PORT`.
+- Env override: `PORT`.
 
 ### `metrics_addr` (String)
 
 - Bind address for the HTTP metrics endpoint.
 - Default: `"127.0.0.1"`.
-- Env override: `BLIPMQ_METRICS_ADDR`.
+- Env override: `METRICS_ADDR`.
 
 ### `metrics_port` (u16)
 
 - HTTP port for metrics.
 - Default: `9100`.
-- Env override: `BLIPMQ_METRICS_PORT`.
+- Env override: `METRICS_PORT`.
 
 ### `wal_path` (String)
 
 - Path to the WAL file.
 - Default: `"blipmq.wal"`.
-- Env override: `BLIPMQ_WAL_PATH`.
+- Env override: `WAL_PATH`.
 
 ### `fsync_policy` (Option<String>)
 
@@ -100,26 +100,26 @@ Merge rules:
   - `"interval_ms:<ms>"` (e.g. `"interval_ms:50"`):
     - fsync when at least `<ms>` milliseconds have elapsed since last fsync.
 - If not set or unparsable, `WalConfig::default()` is used.
-- Env override: `BLIPMQ_FSYNC_POLICY`.
+- Env override: `FSYNC_POLICY`.
 
 ### `max_retries` (u32)
 
 - Maximum QoS1 delivery attempts before dropping a message.
 - Default: `3`.
-- Env override: `BLIPMQ_MAX_RETRIES`.
+- Env override: `MAX_RETRIES`.
 
 ### `retry_backoff_ms` (u64)
 
 - Base delay for exponential backoff between QoS1 retries, in milliseconds.
 - Effective delay per attempt is based on this base value and attempt count.
 - Default: `100`.
-- Env override: `BLIPMQ_RETRY_BACKOFF_MS`.
+- Env override: `RETRY_BACKOFF_MS`.
 
 ### `allowed_api_keys` (Vec<String>)
 
 - Static API keys allowed for authentication.
 - File format: array of strings in TOML/YAML.
-- Env override: `BLIPMQ_ALLOWED_API_KEYS`:
+- Env override: `ALLOWED_API_KEYS`:
   - Comma-separated list: `"key1,key2,key3"`.
   - Whitespace around entries is trimmed.
 
@@ -127,7 +127,7 @@ Merge rules:
 
 - Enables `tokio-console` tracing subscriber instead of default logging.
 - Intended for debugging and profiling, not always-on production use.
-- Env override: `BLIPMQ_ENABLE_TOKIO_CONSOLE`:
+- Env override: `ENABLE_TOKIO_CONSOLE`:
   - Truthy values: `"1"`, `"true"`, `"yes"`, `"on"` (case-insensitive).
 
 ## Example: Complete blipmq.toml
@@ -166,19 +166,19 @@ enable_tokio_console = false
 To override some file values for a specific deployment:
 
 ```bash
-export BLIPMQ_CONFIG=/etc/blipmq/blipmq.toml
+export CONFIG=/etc/blipmq/blipmq.toml
 
 # Run on port 6000 in this environment
-export BLIPMQ_PORT=6000
+export PORT=6000
 
 # Tighter WAL fsync during a critical window
-export BLIPMQ_FSYNC_POLICY="interval_ms:20"
+export FSYNC_POLICY="interval_ms:20"
 
 # Add a temporary API key for a new client rollout
-export BLIPMQ_ALLOWED_API_KEYS="prod-key-2025-01-01-A,prod-key-2025-01-01-B,rollout-key"
+export ALLOWED_API_KEYS="prod-key-2025-01-01-A,prod-key-2025-01-01-B,rollout-key"
 
 # Enable tokio-console during an investigation
-export BLIPMQ_ENABLE_TOKIO_CONSOLE=true
+export ENABLE_TOKIO_CONSOLE=true
 
 blipmqd
 ```
@@ -200,3 +200,4 @@ blipmqd
 - **Use `enable_tokio_console` selectively**:
   - Enable only when actively inspecting performance or correctness issues.
   - Leave disabled in steady-state production to reduce overhead.
+

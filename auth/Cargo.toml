@@ -1,0 +1,14 @@
+[package]
+name = "auth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ API key authentication"
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+

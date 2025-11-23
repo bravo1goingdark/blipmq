@@ -1,6 +1,6 @@
-﻿# BlipMQ Binary Protocol
+# BlipMQ Binary Protocol
 
-This document describes the BlipMQ TCP wire protocol implemented by `blipmq_net`.
+This document describes the BlipMQ TCP wire protocol implemented by `net`.
 
 All communication happens over a single, long-lived TCP connection per client. Frames are length-prefixed and support pipelining.
 
@@ -19,7 +19,7 @@ Each frame has the following binary structure:
   - 32-bit **big-endian** unsigned integer.
   - Number of bytes following the length field:
     - `1 (type) + 8 (correlation_id) + payload_len`.
-  - Must be ≥ `1 + 8` and ≤ `16 * 1024 * 1024` (16 MiB).
+  - Must be = `1 + 8` and = `16 * 1024 * 1024` (16 MiB).
 - `frame_type`:
   - One-byte discriminant (`FrameType`).
 - `correlation_id`:
@@ -37,15 +37,15 @@ If `length == 0`, `length < 9`, or `length > MAX_FRAME_SIZE`, frame decoding fai
 
 | Name       | Value | Direction       | Description                               |
 |-----------|-------|-----------------|-------------------------------------------|
-| HELLO     | 0x01  | Client → Server | Protocol version negotiation              |
-| AUTH      | 0x02  | Client → Server | API key authentication                    |
+| HELLO     | 0x01  | Client ? Server | Protocol version negotiation              |
+| AUTH      | 0x02  | Client ? Server | API key authentication                    |
 | PUBLISH   | 0x03  | Both            | Publish or deliver a message              |
-| SUBSCRIBE | 0x04  | Client → Server | Subscribe to a topic                      |
+| SUBSCRIBE | 0x04  | Client ? Server | Subscribe to a topic                      |
 | ACK       | 0x05  | Both            | ACK for handshake or QoS1 deliveries      |
-| NACK      | 0x06  | Server → Client | Error response                            |
-| PING      | 0x07  | Client → Server | Liveness check                            |
-| PONG      | 0x08  | Server → Client | Liveness response                         |
-| POLL      | 0x09  | Client → Server | Request next message for a subscription   |
+| NACK      | 0x06  | Server ? Client | Error response                            |
+| PING      | 0x07  | Client ? Server | Liveness check                            |
+| PONG      | 0x08  | Server ? Client | Liveness response                         |
+| POLL      | 0x09  | Client ? Server | Request next message for a subscription   |
 
 Unknown frame types result in a decode error and connection close.
 
@@ -53,7 +53,7 @@ Unknown frame types result in a decode error and connection close.
 
 ### HELLO
 
-Client → Server.
+Client ? Server.
 
 Payload:
 
@@ -73,7 +73,7 @@ Server behavior:
 
 ### AUTH
 
-Client → Server.
+Client ? Server.
 
 Payload:
 
@@ -82,7 +82,7 @@ Payload:
 ```
 
 - `key_len`:
-  - Length of the UTF-8 API key in bytes (`≤ u16::MAX`).
+  - Length of the UTF-8 API key in bytes (`= u16::MAX`).
 - `key_bytes`:
   - UTF-8 encoded API key.
 
@@ -110,8 +110,8 @@ All multi-byte integers are big-endian.
 
 ### PUBLISH
 
-Client → Server (publish).
-Server → Client (delivery).
+Client ? Server (publish).
+Server ? Client (delivery).
 
 Payload:
 
@@ -120,8 +120,8 @@ Payload:
 ```
 
 - `qos`:
-  - `0` → QoS0 (AtMostOnce).
-  - `1` → QoS1 (AtLeastOnce).
+  - `0` ? QoS0 (AtMostOnce).
+  - `1` ? QoS1 (AtLeastOnce).
 - `topic_len`:
   - Length of topic in bytes (`u16`).
 - `topic_bytes`:
@@ -154,7 +154,7 @@ Server behavior when sending PUBLISH as delivery:
 
 ### SUBSCRIBE
 
-Client → Server.
+Client ? Server.
 
 Payload:
 
@@ -217,7 +217,7 @@ Server behavior on incoming ACK:
 
 ### NACK
 
-Server → Client error responses.
+Server ? Client error responses.
 
 Payload:
 
@@ -234,7 +234,7 @@ Payload:
 
 ### POLL
 
-Client → Server.
+Client ? Server.
 
 Payload:
 
@@ -259,9 +259,9 @@ Server behavior:
 
 Keepalive frames.
 
-- PING (Client → Server):
+- PING (Client ? Server):
   - Payload: empty.
-- PONG (Server → Client):
+- PONG (Server ? Client):
   - Payload: empty.
   - Sent as a direct response to PING with the same `correlation_id`.
 
@@ -325,12 +325,12 @@ These examples illustrate on-the-wire representation. All integers are big-endia
 
 Payload:
 
-- `protocol_version = 1` → `00 01`.
+- `protocol_version = 1` ? `00 01`.
 
 Total length:
 
 - payload = 2 bytes.
-- total = `1 (type) + 8 (cid) + 2 (payload) = 11` → `00 00 00 0B`.
+- total = `1 (type) + 8 (cid) + 2 (payload) = 11` ? `00 00 00 0B`.
 
 Hex frame:
 
@@ -346,12 +346,12 @@ Hex frame:
 Key:
 
 - `"dev-key"` bytes = `64 65 76 2D 6B 65 79`.
-- `key_len = 7` → `00 07`.
+- `key_len = 7` ? `00 07`.
 
 Payload length:
 
 - `2 (len) + 7 (key) = 9`.
-- total = `1 + 8 + 9 = 18` → `00 00 00 12`.
+- total = `1 + 8 + 9 = 18` ? `00 00 00 12`.
 
 Hex:
 
@@ -367,12 +367,12 @@ Hex:
 
 Topic:
 
-- `"demo"` bytes = `64 65 6D 6F`, `topic_len = 4` → `00 04`.
+- `"demo"` bytes = `64 65 6D 6F`, `topic_len = 4` ? `00 04`.
 
 Payload length:
 
 - `2 (len) + 4 (topic) + 1 (qos) = 7`.
-- total = `1 + 8 + 7 = 16` → `00 00 00 10`.
+- total = `1 + 8 + 7 = 16` ? `00 00 00 10`.
 
 Hex:
 
@@ -385,7 +385,7 @@ Hex:
 01            // qos = 1
 ```
 
-### PUBLISH (Client → Server)
+### PUBLISH (Client ? Server)
 
 Example: topic = "demo", qos = 1, message = "hi", correlation_id = 4.
 
@@ -396,7 +396,7 @@ Message:
 Payload length:
 
 - `1 (qos) + 2 (topic_len) + 4 (topic) + 2 (msg) = 9`.
-- total = `1 + 8 + 9 = 18` → `00 00 00 12`.
+- total = `1 + 8 + 9 = 18` ? `00 00 00 12`.
 
 Hex:
 
@@ -416,12 +416,12 @@ Example: ACK for `subscription_id = 42` in response to SUBSCRIBE with `correlati
 
 Payload:
 
-- `subscription_id = 42` → `00 00 00 00 00 00 00 2A`.
+- `subscription_id = 42` ? `00 00 00 00 00 00 00 2A`.
 
 Payload length:
 
 - 8 bytes.
-- total = `1 + 8 + 8 = 17` → `00 00 00 11`.
+- total = `1 + 8 + 8 = 17` ? `00 00 00 11`.
 
 Hex:
 
@@ -432,4 +432,5 @@ Hex:
 00 00 00 00 00 00 00 2A   // subscription_id = 42
 ```
 
-These frame examples can be constructed safely using the `blipmq_net` Rust API, which handles encoding/decoding and length calculations.
+These frame examples can be constructed safely using the `net` Rust API, which handles encoding/decoding and length calculations.
+

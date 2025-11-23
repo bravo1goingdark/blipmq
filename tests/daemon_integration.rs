@@ -2,9 +2,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use blipmq_auth::StaticApiKeyValidator;
-use blipmq_core::{Broker, BrokerConfig, QoSLevel, TopicName};
-use blipmq_net::{
+use auth::StaticApiKeyValidator;
+use corelib::{Broker, BrokerConfig, QoSLevel, TopicName};
+use net::{
     AckPayload, AuthPayload, BrokerHandler, Frame, FrameResponse, FrameType,
     HelloPayload, MessageHandler, NetworkConfig, PollPayload, PublishPayload,
     Server, SubscribePayload, PROTOCOL_VERSION, encode_frame, try_decode_frame,
@@ -327,7 +327,7 @@ async fn invalid_topic_and_ack_produce_nack() {
     client.send_frame(&sub_frame).await;
     let resp = client.recv_frame().await.expect("no response for bad sub");
     assert_eq!(resp.msg_type, FrameType::Nack);
-    let nack = blipmq_net::NackPayload::decode(&resp.payload).expect("decode nack");
+    let nack = net::NackPayload::decode(&resp.payload).expect("decode nack");
     assert_eq!(nack.code, 400);
 
     // ACK with unknown subscription id -> NACK 404.
@@ -344,7 +344,7 @@ async fn invalid_topic_and_ack_produce_nack() {
     client.send_frame(&ack_frame).await;
     let resp = client.recv_frame().await.expect("no response for bad ack");
     assert_eq!(resp.msg_type, FrameType::Nack);
-    let nack = blipmq_net::NackPayload::decode(&resp.payload).expect("decode nack2");
+    let nack = net::NackPayload::decode(&resp.payload).expect("decode nack2");
     assert_eq!(nack.code, 404);
 
     let _ = shutdown_tx.send(true);
@@ -372,9 +372,10 @@ async fn invalid_publish_payload_is_rejected() {
     client.send_frame(&frame).await;
     let resp = client.recv_frame().await.expect("no response for bad publish");
     assert_eq!(resp.msg_type, FrameType::Nack);
-    let nack = blipmq_net::NackPayload::decode(&resp.payload).expect("decode nack");
+    let nack = net::NackPayload::decode(&resp.payload).expect("decode nack");
     assert_eq!(nack.code, 400);
 
     let _ = shutdown_tx.send(true);
 }
+
 

@@ -1,4 +1,4 @@
-ï»¿# BlipMQ Overview
+# BlipMQ Overview
 
 BlipMQ is a lightweight, high-performance message broker written in Rust. It is designed for low-latency pub/sub workloads with a simple binary protocol over TCP, durable write-ahead logging (WAL), and operational clarity.
 
@@ -14,15 +14,15 @@ BlipMQ is a lightweight, high-performance message broker written in Rust. It is 
 
 The BlipMQ repository is a Cargo workspace composed of focused crates:
 
-- `blipmqd` â€“ main daemon (TCP server, WAL, auth, metrics, graceful shutdown).
-- `blipmq_core` â€“ broker core (topics, per-subscriber queues, QoS, TTL, retry).
-- `blipmq_net` â€“ TCP networking and binary framing (HELLO/AUTH, PUBLISH/SUBSCRIBE, POLL/ACK).
-- `blipmq_wal` â€“ write-ahead log for durable QoS1 messages.
-- `blipmq_auth` â€“ static API key validation.
-- `blipmq_metrics` â€“ HTTP `/metrics` endpoint.
-- `blipmq_config` â€“ configuration loader (TOML/YAML + env overrides).
-- `blipmq_bench` â€“ in-process benchmark harness using the real protocol.
-- `blipmq_chaos` â€“ chaos/failure testing utilities.
+- `blipmqd` – main daemon (TCP server, WAL, auth, metrics, graceful shutdown).
+- `core` – broker core (topics, per-subscriber queues, QoS, TTL, retry).
+- `net` – TCP networking and binary framing (HELLO/AUTH, PUBLISH/SUBSCRIBE, POLL/ACK).
+- `wal` – write-ahead log for durable QoS1 messages.
+- `auth` – static API key validation.
+- `metrics` – HTTP `/metrics` endpoint.
+- `config` – configuration loader (TOML/YAML + env overrides).
+- `bench` – in-process benchmark harness using the real protocol.
+- `chaos` – chaos/failure testing utilities.
 
 ## Feature Summary
 
@@ -38,7 +38,7 @@ The BlipMQ repository is a Cargo workspace composed of focused crates:
 
 ## Minimal Rust Publish/Subscribe Client
 
-The example below shows a minimal async client using the public API from `blipmq_net`:
+The example below shows a minimal async client using the public API from `net`:
 
 - Connects to a running `blipmqd` at `127.0.0.1:5555`.
 - Performs `HELLO` and `AUTH` with an API key.
@@ -79,7 +79,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 bytes = "1"
-blipmq_net = { path = "../blipmq_net" } # adjust path as needed
+net = { path = "../net" } # adjust path as needed
 ```
 
 ### Client Example (`src/main.rs`)
@@ -92,7 +92,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use blipmq_net::{
+use net::{
     AckPayload, AuthPayload, Frame, FrameType, HelloPayload,
     NackPayload, PollPayload, PublishPayload, SubscribePayload,
     PROTOCOL_VERSION, encode_frame, try_decode_frame,
@@ -313,4 +313,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-This example uses the real protocol and payload types from `blipmq_net` and will successfully publish, receive, and ACK a message when `blipmqd` is running and configured with the appropriate API key.
+This example uses the real protocol and payload types from `net` and will successfully publish, receive, and ACK a message when `blipmqd` is running and configured with the appropriate API key.
+

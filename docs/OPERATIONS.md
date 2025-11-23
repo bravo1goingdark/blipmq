@@ -1,4 +1,4 @@
-ï»¿# BlipMQ Operations Guide
+# BlipMQ Operations Guide
 
 This guide explains how to run the BlipMQ daemon (`blipmqd`), configure it, inspect metrics, and manage graceful shutdown and WAL behavior.
 
@@ -32,7 +32,7 @@ cargo build -p blipmqd --release
 
 - `--config <path>`:
   - Optional path to a TOML or YAML config file.
-  - If omitted, `BLIPMQ_CONFIG` can be used instead.
+  - If omitted, `CONFIG` can be used instead.
 
 Example:
 
@@ -42,19 +42,19 @@ blipmqd --config /etc/blipmq/blipmq.toml
 
 ## Environment Variables
 
-`blipmq_config` defines these environment variables (all optional):
+`config` defines these environment variables (all optional):
 
-- `BLIPMQ_CONFIG` â€“ path to the config file (TOML or YAML).
-- `BLIPMQ_BIND_ADDR` â€“ overrides `bind_addr` (e.g. `0.0.0.0`).
-- `BLIPMQ_PORT` â€“ overrides `port`.
-- `BLIPMQ_METRICS_ADDR` â€“ overrides `metrics_addr`.
-- `BLIPMQ_METRICS_PORT` â€“ overrides `metrics_port`.
-- `BLIPMQ_WAL_PATH` â€“ overrides `wal_path`.
-- `BLIPMQ_FSYNC_POLICY` â€“ overrides `fsync_policy`.
-- `BLIPMQ_MAX_RETRIES` â€“ overrides `max_retries`.
-- `BLIPMQ_RETRY_BACKOFF_MS` â€“ overrides `retry_backoff_ms`.
-- `BLIPMQ_ALLOWED_API_KEYS` â€“ comma-separated list of API keys.
-- `BLIPMQ_ENABLE_TOKIO_CONSOLE` â€“ `"1"`, `"true"`, `"yes"`, or `"on"` to enable `tokio-console`.
+- `CONFIG` – path to the config file (TOML or YAML).
+- `BIND_ADDR` – overrides `bind_addr` (e.g. `0.0.0.0`).
+- `PORT` – overrides `port`.
+- `METRICS_ADDR` – overrides `metrics_addr`.
+- `METRICS_PORT` – overrides `metrics_port`.
+- `WAL_PATH` – overrides `wal_path`.
+- `FSYNC_POLICY` – overrides `fsync_policy`.
+- `MAX_RETRIES` – overrides `max_retries`.
+- `RETRY_BACKOFF_MS` – overrides `retry_backoff_ms`.
+- `ALLOWED_API_KEYS` – comma-separated list of API keys.
+- `ENABLE_TOKIO_CONSOLE` – `"1"`, `"true"`, `"yes"`, or `"on"` to enable `tokio-console`.
 
 These override file values when present.
 
@@ -90,25 +90,25 @@ enable_tokio_console = false
 ### Env Overrides Example
 
 ```bash
-export BLIPMQ_CONFIG=./config/blipmq-dev.toml
+export CONFIG=./config/blipmq-dev.toml
 
 # Expose TCP & metrics on all interfaces
-export BLIPMQ_BIND_ADDR=0.0.0.0
-export BLIPMQ_METRICS_ADDR=0.0.0.0
+export BIND_ADDR=0.0.0.0
+export METRICS_ADDR=0.0.0.0
 
 # Place WAL on a fast local SSD
-export BLIPMQ_WAL_PATH=/var/lib/blipmq/blipmq.wal
-export BLIPMQ_FSYNC_POLICY="interval_ms:50"
+export WAL_PATH=/var/lib/blipmq/blipmq.wal
+export FSYNC_POLICY="interval_ms:50"
 
 # API keys for dev
-export BLIPMQ_ALLOWED_API_KEYS="dev-key-1,dev-key-2"
+export ALLOWED_API_KEYS="dev-key-1,dev-key-2"
 
 blipmqd
 ```
 
 ## Metrics Endpoint
 
-`blipmq_metrics` exposes a simple text metrics endpoint:
+`metrics` exposes a simple text metrics endpoint:
 
 - Address: `metrics_addr:metrics_port` (e.g. `127.0.0.1:9100`).
 - Path: `/metrics`.
@@ -211,8 +211,8 @@ services:
 
     environment:
       - RUST_LOG=info
-      - BLIPMQ_ALLOWED_API_KEYS=prod-key-1
-      - BLIPMQ_ENABLE_TOKIO_CONSOLE=false
+      - ALLOWED_API_KEYS=prod-key-1
+      - ENABLE_TOKIO_CONSOLE=false
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9100/metrics"]
@@ -227,3 +227,4 @@ This setup:
 - Uses a read-only config file mounted from the host.
 - Persists WAL and durable state in `./data`.
 - Exposes the broker TCP port and metrics HTTP port to the host.
+

@@ -9,16 +9,16 @@ use tokio::time::{self, Duration};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use blipmq_auth::StaticApiKeyValidator;
-use blipmq_config::{Config, ConfigError};
-use blipmq_core::{Broker, BrokerConfig, QoSLevel};
-use blipmq_metrics::run_metrics_server;
-use blipmq_net::{
+use auth::StaticApiKeyValidator;
+use bytes::Bytes;
+use config::{Config, ConfigError};
+use corelib::{Broker, BrokerConfig, QoSLevel};
+use metrics::run_metrics_server;
+use net::{
     AckPayload, BrokerHandler, Frame, FrameResponse, FrameType, MessageHandler, NetworkConfig,
     PollPayload, PublishPayload, Server, SubscribePayload,
 };
-use blipmq_wal::{WalConfig, WriteAheadLog};
-use bytes::Bytes;
+use wal::{WalConfig, WriteAheadLog};
 
 #[derive(Parser, Debug)]
 #[command(name = "blipmqd", about = "BlipMQ broker daemon")]

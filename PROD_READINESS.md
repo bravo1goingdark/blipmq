@@ -28,16 +28,16 @@ Each item should be validated on the target environment (or a close staging repl
 ## 2. Performance benchmarks
 
 - [ ] **Baseline throughput**
-  - [ ] Use `blipmq_bench` in `qos0` mode to measure in-memory QoS0 throughput:
+  - [ ] Use `bench` in `qos0` mode to measure in-memory QoS0 throughput:
     - [ ] Record msgs/sec and p50/p95/p99 latencies for representative message sizes (e.g., 128B, 1KB, 4KB).
 - [ ] **QoS1 performance**
-  - [ ] Use `blipmq_bench` in `qos1` mode (without WAL) to measure QoS1 throughput and latency:
+  - [ ] Use `bench` in `qos1` mode (without WAL) to measure QoS1 throughput and latency:
     - [ ] Confirm that p95/p99 latency remains within acceptable SLOs under expected peak load.
 - [ ] **Durable (WAL) performance**
-  - [ ] Use `blipmq_bench` in `durable` mode to measure throughput and latency with WAL enabled:
+  - [ ] Use `bench` in `durable` mode to measure throughput and latency with WAL enabled:
     - [ ] Measure impact of different `fsync_policy` settings (`always`, `every_n`, `interval_ms`) and choose a default per environment.
 - [ ] **Scaled publishers/subscribers**
-  - [ ] Use `blipmq_bench` in `scaled` mode with realistic publisher/subscriber counts:
+  - [ ] Use `bench` in `scaled` mode with realistic publisher/subscriber counts:
     - [ ] Confirm CPU utilization and latency remain within acceptable levels.
 - [ ] **Profiling**
   - [ ] Capture CPU profiles (e.g., with `perf` + `flamegraph`) in at least:
@@ -58,7 +58,7 @@ Each item should be validated on the target environment (or a close staging repl
       - [ ] All unacked messages are redelivered at least once.
       - [ ] No duplicate durable messages beyond acceptable at-least-once semantics.
 - [ ] **Random network disconnects**
-  - [ ] Use a chaos tool (e.g., `blipmq_chaos::maybe_disconnect` or tc/netem) to randomly close client connections:
+  - [ ] Use a chaos tool (e.g., `chaos::maybe_disconnect` or tc/netem) to randomly close client connections:
     - [ ] Confirm broker remains stable and resources (connections, memory) are cleaned up.
 - [ ] **Slow disk simulation**
   - [ ] Introduce artificial delay into WAL writes (e.g., `simulate_slow_disk_write` or slower storage):
@@ -191,3 +191,4 @@ Each item should be validated on the target environment (or a close staging repl
 ---
 
 All items above should be tracked in your release checklist, with explicit pass/fail status and links to the test runs, benchmark results, and profiling reports used to validate them.
+

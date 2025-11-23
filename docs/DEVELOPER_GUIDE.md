@@ -9,32 +9,32 @@ From the workspace root `Cargo.toml`, the main crates are:
 - `blipmqd`
   - Main broker daemon.
   - Wires together config, WAL, broker, net server, metrics, and shutdown.
-- `blipmq_core`
+- `core`
   - Core broker logic:
     - Topics and subscriptions.
     - Per-subscriber queues.
     - QoS0/QoS1.
     - TTL and retry with exponential backoff.
     - WAL integration for durability.
-- `blipmq_net`
+- `net`
   - TCP networking and binary framing:
     - Frame types: HELLO, AUTH, PUBLISH, SUBSCRIBE, ACK, NACK, PING, PONG, POLL.
     - Per-connection `Connection` tasks.
     - `Server` accept loop.
     - `MessageHandler` trait and `BrokerHandler` implementation.
-- `blipmq_wal`
+- `wal`
   - Write-ahead log:
     - Append-only, CRC32-checked, with index rebuild on open.
     - Configurable fsync policy.
-- `blipmq_auth`
+- `auth`
   - Static API key validation.
-- `blipmq_metrics`
+- `metrics`
   - HTTP `/metrics` endpoint.
-- `blipmq_config`
+- `config`
   - Config loader (file + env merge).
-- `blipmq_bench`
+- `bench`
   - In-process performance harness using the real protocol over TCP.
-- `blipmq_chaos`
+- `chaos`
   - Chaos and failure testing utilities.
 
 Integration tests live under the root `tests/` directory.
@@ -45,7 +45,7 @@ BlipMQ uses Tokio for async I/O and `parking_lot` locks for in-memory data struc
 
 ### Networking
 
-- The accept loop is a single async task in `blipmq_net::Server`:
+- The accept loop is a single async task in `net::Server`:
   - Binds a `TcpListener` to `Config.bind_addr:port`.
   - On each `accept()`:
     - Creates a `Connection` with:
@@ -62,7 +62,7 @@ BlipMQ uses Tokio for async I/O and `parking_lot` locks for in-memory data struc
 
 ### Broker
 
-- The broker core is encapsulated in `blipmq_core::Broker`:
+- The broker core is encapsulated in `corelib::Broker`:
   - Shared as `Arc<Broker>` between:
     - Network handler (`BrokerHandler`).
     - Metrics server.
@@ -81,7 +81,7 @@ BlipMQ uses Tokio for async I/O and `parking_lot` locks for in-memory data struc
 
 ### WAL
 
-- The WAL is provided by `blipmq_wal::WriteAheadLog`:
+- The WAL is provided by `wal::WriteAheadLog`:
   - Wraps a `WalInner` inside `tokio::sync::Mutex`.
   - Ensures:
     - Sequential appends.
@@ -137,21 +137,21 @@ Key principles:
 Testing practice:
 
 - Unit tests within each crate:
-  - `blipmq_core`:
+  - `core`:
     - QoS0 and QoS1 publish/subscribe.
     - TTL expiry and retry logic.
     - WAL-based durability.
-  - `blipmq_wal`:
+  - `wal`:
     - Append/read roundtrip.
     - Corruption detection.
     - Index rebuild on open.
-  - `blipmq_net`:
+  - `net`:
     - Frame encode/decode roundtrips.
     - Partial buffer behavior.
 - Integration tests under `tests/`:
   - Daemon-level tests for HELLO/AUTH, SUBSCRIBE, PUBLISH, POLL, ACK.
   - Multiple subscribers and error case handling.
-  - Chaos and crash-recovery tests using `blipmq_chaos`.
+  - Chaos and crash-recovery tests using `chaos`.
 
 ## Extending the Protocol
 
@@ -159,7 +159,7 @@ This section walks through adding a new frame type end-to-end, using a hypotheti
 
 ### 1. Extend `FrameType`
 
-In `blipmq_net/src/frame.rs`, add a variant:
+In `net/src/frame.rs`, add a variant:
 
 ```rust
 #[repr(u8)]
@@ -239,11 +239,11 @@ impl StatsResponsePayload {
 }
 ```
 
-Re-export these from `blipmq_net/src/lib.rs` so clients can use them.
+Re-export these from `net/src/lib.rs` so clients can use them.
 
 ### 3. Handle the New Frame in `BrokerHandler`
 
-In `blipmq_net/src/server.rs`, extend the `MessageHandler` implementation:
+In `net/src/server.rs`, extend the `MessageHandler` implementation:
 
 ```rust
 #[async_trait]
@@ -331,7 +331,7 @@ Update `docs/PROTOCOL.md` to:
 
 ### 5. Add Tests
 
-- Unit tests in `blipmq_net`:
+- Unit tests in `net`:
   - Roundtrip encode/decode of `StatsRequestPayload` and `StatsResponsePayload`.
 - Integration test in `tests/`:
   - Start a test server.
@@ -343,7 +343,7 @@ Update `docs/PROTOCOL.md` to:
 
 ## Extending the Broker
 
-When modifying or extending `blipmq_core`:
+When modifying or extending `core`:
 
 - Keep hot paths (`publish`, `publish_durable`, `poll`, `ack`, queue operations) as allocation-free as feasible.
 - Use `Bytes` and `BytesMut` for payloads and record encoding, not `Vec<u8>` where avoidable.
@@ -352,7 +352,7 @@ When modifying or extending `blipmq_core`:
   - Encode records and compute metadata outside lock scopes when possible.
 - When adding metrics:
   - Use `AtomicU64` counters on `Broker` or `WriteAheadLog`.
-  - Expose them via accessor methods and integrate them into `blipmq_metrics`.
+  - Expose them via accessor methods and integrate them into `metrics`.
 
 If you introduce new durable state:
 
@@ -360,7 +360,7 @@ If you introduce new durable state:
   - If yes, extend `WalMessageRecord` or create new record types with explicit versioning.
 - Update recovery logic in `Broker::replay_from_wal`.
 - Extend tests:
-  - Broker-level durable tests in `blipmq_core`.
+  - Broker-level durable tests in `core`.
   - Crash-recovery tests in `tests/chaos_recovery.rs`.
 
 ## Running and Debugging Tests
@@ -373,9 +373,9 @@ cargo test
 
 This runs:
 
-- Core broker tests (`blipmq_core`).
-- WAL tests (`blipmq_wal`).
-- Networking/framing tests (`blipmq_net`).
+- Core broker tests (`core`).
+- WAL tests (`wal`).
+- Networking/framing tests (`net`).
 - Integration tests (`tests/daemon_integration.rs`, `tests/chaos_recovery.rs`).
 
 Tips:
@@ -383,8 +383,9 @@ Tips:
 - Use `RUST_LOG=debug` or `RUST_LOG=trace` for specific modules when debugging:
 
   ```bash
-  RUST_LOG=blipmq_core=debug,blipmq_net=debug cargo test tests::daemon_integration -- --nocapture
+  RUST_LOG=core=debug,net=debug cargo test tests::daemon_integration -- --nocapture
   ```
 
 - Use `tokio-console` in development by setting `enable_tokio_console = true` in config to inspect async task behavior.
+
 

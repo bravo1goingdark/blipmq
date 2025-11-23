@@ -1,22 +1,19 @@
 [package]
-name = "blipmqd"
+name = "bench"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "BlipMQ broker daemon"
+description = "BlipMQ in-process performance harness"
 license.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-console-subscriber = { workspace = true }
 bytes = { workspace = true }
 corelib = { path = "../core", package = "core" }
-net = { path = "../net" }
 wal = { path = "../wal" }
+net = { path = "../net" }
 auth = { path = "../auth" }
-metrics = { path = "../metrics" }
-config = { path = "../config" }
-clap = { workspace = true }
 

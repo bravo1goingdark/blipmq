@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use blipmq_chaos::simulate_crash;
-use blipmq_core::{Broker, BrokerConfig, ClientId, QoSLevel, TopicName};
-use blipmq_wal::WriteAheadLog;
+use chaos::simulate_crash;
+use corelib::{Broker, BrokerConfig, ClientId, QoSLevel, TopicName};
+use wal::WriteAheadLog;
 use bytes::Bytes;
 
 fn wal_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("blipmq_chaos_test_{}.wal", name));
+    path.push(format!("chaos_test_{}.wal", name));
     let _ = std::fs::remove_file(&path);
     path
 }
@@ -130,4 +130,5 @@ async fn chaos_crash_recovery_qos1() {
         );
     }
 }
+
 

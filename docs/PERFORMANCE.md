@@ -1,4 +1,4 @@
-ï»¿# BlipMQ Performance Guide
+# BlipMQ Performance Guide
 
 This document covers expected performance characteristics, tuning knobs, and how to use the BlipMQ benchmark harness.
 
@@ -7,14 +7,14 @@ This document covers expected performance characteristics, tuning knobs, and how
 The numbers below are indicative ranges on a modern 8-core x86 server with SSD storage and local clients. Actual numbers depend on hardware, workload, and configuration.
 
 - **QoS0 in-memory (no WAL)**:
-  - Throughput: 1â€“5 million msgs/sec (small messages).
-  - Latency: p50 < 200Âµs, p99 < 1ms.
+  - Throughput: 1–5 million msgs/sec (small messages).
+  - Latency: p50 < 200µs, p99 < 1ms.
 - **QoS1 in-memory (no WAL)**:
-  - Throughput: 0.5â€“2 million msgs/sec.
+  - Throughput: 0.5–2 million msgs/sec.
   - Latency: higher due to inflight tracking and ACK handling.
 - **QoS1 durable (WAL on)**:
-  - Throughput: 100kâ€“500k msgs/sec with `fsync_every_n=64` or `interval_ms=20`.
-  - Latency: p50 around 500Âµsâ€“2ms; tail latency influenced by fsync behavior.
+  - Throughput: 100k–500k msgs/sec with `fsync_every_n=64` or `interval_ms=20`.
+  - Latency: p50 around 500µs–2ms; tail latency influenced by fsync behavior.
 - **Scaled publishers/subscribers**:
   - Scales with number of CPU cores and topics.
   - Contention primarily in:
@@ -57,8 +57,8 @@ Choosing a policy:
 
 Implications:
 
-- More topics â†’ better distribution across shards.
-- Single hot topic â†’ more contention on that topicâ€™s shard.
+- More topics ? better distribution across shards.
+- Single hot topic ? more contention on that topic’s shard.
   - Consider using multiple topics per logical stream to spread load.
 
 ### Per-Subscriber Queue Capacity
@@ -71,7 +71,7 @@ Implications:
 
 Tuning:
 
-- Low capacity (e.g. 128â€“1024):
+- Low capacity (e.g. 128–1024):
   - Reduces memory footprint.
   - More aggressive dropping when subscribers are slow.
 - High capacity:
@@ -95,10 +95,10 @@ Guidance:
 
 - For low-latency, highly available consumers:
   - `max_retries` can be higher (e.g. 10).
-  - `retry_backoff_ms` can be small (e.g. 10â€“20).
+  - `retry_backoff_ms` can be small (e.g. 10–20).
 - For resource-constrained or bursty workloads:
-  - Use moderate `max_retries` (e.g. 3â€“5).
-  - Larger backoffs (e.g. 100â€“500ms) to avoid overload during outages.
+  - Use moderate `max_retries` (e.g. 3–5).
+  - Larger backoffs (e.g. 100–500ms) to avoid overload during outages.
 
 ### Networking Considerations
 
@@ -109,9 +109,9 @@ Guidance:
 - Batch operations:
   - Pipeline multiple `PUBLISH` or `POLL` frames before waiting on responses.
 
-## Benchmark Harness (`blipmq_bench`)
+## Benchmark Harness (`bench`)
 
-`blipmq_bench` provides a full-protocol performance harness. It:
+`bench` provides a full-protocol performance harness. It:
 
 - Spawns an in-process BlipMQ instance (including WAL when configured).
 - Starts TCP clients that speak the real protocol.
@@ -132,7 +132,7 @@ Controlled by `--mode`:
 
 ### CLI Options
 
-From `blipmq_bench::Cli`:
+From `bench::Cli`:
 
 - `--mode <qos0|qos1|durable|scaled>`:
   - Benchmark mode (default: `qos1`).
@@ -141,7 +141,7 @@ From `blipmq_bench::Cli`:
 - `--subscribers <M>`:
   - Number of subscriber clients (default: 1).
 - `--message-size <bytes>`:
-  - Payload size in bytes, must be â‰¥ 8 (default: 256).
+  - Payload size in bytes, must be = 8 (default: 256).
 - `--qos <0|1>`:
   - QoS mode (default: 1). Some modes override this.
 - `--use-wal <on|off>`:
@@ -156,7 +156,7 @@ From `blipmq_bench::Cli`:
 QoS1 durable benchmark:
 
 ```bash
-cargo run -p blipmq_bench -- \
+cargo run -p bench -- \
   --mode durable \
   --publishers 4 \
   --subscribers 4 \
@@ -169,7 +169,7 @@ cargo run -p blipmq_bench -- \
 QoS0 in-memory benchmark:
 
 ```bash
-cargo run -p blipmq_bench -- \
+cargo run -p bench -- \
   --mode qos0 \
   --publishers 8 \
   --subscribers 8 \
@@ -193,23 +193,23 @@ message_size: 512 bytes
 messages received: 100000
 elapsed: 5.002s
 throughput: 19992 msgs/sec
-p50 latency: 850.00 Âµs
-p95 latency: 1500.00 Âµs
-p99 latency: 3200.00 Âµs
+p50 latency: 850.00 µs
+p95 latency: 1500.00 µs
+p99 latency: 3200.00 µs
 ```
 
 Notes:
 
 - Latencies are calculated from timestamps embedded in the first 8 bytes of each message payload.
 - Throughput is total received messages divided by wall-clock time.
-- The harness uses the real TCP protocol and `blipmq_net` framing, not a mocked broker.
+- The harness uses the real TCP protocol and `net` framing, not a mocked broker.
 
 ## Hardware Recommendations
 
 For best performance:
 
 - **CPU**:
-  - At least 4â€“8 cores at modern frequencies (â‰¥ 3 GHz).
+  - At least 4–8 cores at modern frequencies (= 3 GHz).
   - Higher core counts help with many topics/subscribers.
 - **Memory**:
   - Enough RAM to hold in-memory queues and WAL buffers without swapping.
@@ -249,3 +249,4 @@ sudo flamegraph
 ```
 
 Hot paths such as publish, frame encode/decode, and WAL append are annotated with `#[inline(always)]` and tracing spans for clear attribution in profiles.
+

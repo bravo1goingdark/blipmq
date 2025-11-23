@@ -1,0 +1,21 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ core broker logic: topics, queues, QoS"
+license.workspace = true
+
+[lib]
+name = "corelib"
+
+[dependencies]
+tracing = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+wal = { path = "../wal" }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+

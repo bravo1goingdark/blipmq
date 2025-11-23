@@ -1,0 +1,15 @@
+[package]
+name = "metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ metrics HTTP endpoint"
+license.workspace = true
+
+[dependencies]
+hyper = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+corelib = { path = "../core", package = "core" }
+wal = { path = "../wal" }
+

@@ -1,14 +1,15 @@
 [workspace]
 members = [
     "blipmqd",
-    "blipmq_core",
-    "blipmq_net",
-    "blipmq_wal",
-    "blipmq_auth",
-    "blipmq_metrics",
-    "blipmq_config",
-    "blipmq_bench",
-    "blipmq_chaos",
+    "core",
+    "net",
+    "wal",
+    "auth",
+    "metrics",
+    "config",
+    "bench",
+    "chaos",
+    "bench_compare",
 ]
 resolver = "2"
 
@@ -39,3 +40,4 @@ parking_lot = "0.12"
 opt-level = 3
 lto = true
 codegen-units = 1
+

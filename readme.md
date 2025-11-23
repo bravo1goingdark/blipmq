@@ -20,13 +20,13 @@ This repository contains the Rust workspace used to build and evolve the core br
 ## Workspace layout
 
 - `blipmqd` – main broker daemon (TCP protocol, WAL, auth, metrics)
-- `blipmq_core` – core broker logic (topics, queues, QoS, TTL, retry)
-- `blipmq_net` – TCP server and binary framing
-- `blipmq_wal` – write-ahead log (append-only, CRC-checked, indexable)
-- `blipmq_auth` – static API key authentication
-- `blipmq_metrics` – HTTP metrics endpoint
-- `blipmq_config` – configuration loader (TOML/YAML + env merge)
-- `blipmq_bench` – in-process performance benchmark harness
+- `core` – core broker logic (topics, queues, QoS, TTL, retry)
+- `net` – TCP server and binary framing
+- `wal` – write-ahead log (append-only, CRC-checked, indexable)
+- `auth` – static API key authentication
+- `metrics` – HTTP metrics endpoint
+- `config` – configuration loader (TOML/YAML + env merge)
+- `bench` – in-process performance benchmark harness
 
 ## Running the daemon from source
 
@@ -36,11 +36,11 @@ From the workspace root:
 cargo run -p blipmqd -- --config ./config/blipmq-dev.toml
 ```
 
-You can also rely on the `BLIPMQ_CONFIG` environment variable instead of `--config`.
+You can also rely on the `CONFIG` environment variable instead of `--config`.
 
 ## Configuration
 
-`blipmqd` uses `blipmq_config` to load configuration from:
+`blipmqd` uses `config` to load configuration from:
 
 - an optional TOML or YAML file, and
 - environment variables that override file defaults.
@@ -65,15 +65,15 @@ allowed_api_keys = ["dev-key-1", "dev-key-2"]
 
 Environment overrides (examples):
 
-- `BLIPMQ_BIND_ADDR`, `BLIPMQ_PORT`
-- `BLIPMQ_METRICS_ADDR`, `BLIPMQ_METRICS_PORT`
-- `BLIPMQ_WAL_PATH`, `BLIPMQ_FSYNC_POLICY`
-- `BLIPMQ_MAX_RETRIES`, `BLIPMQ_RETRY_BACKOFF_MS`
-- `BLIPMQ_ALLOWED_API_KEYS="key1,key2,..."`
+- `BIND_ADDR`, `PORT`
+- `METRICS_ADDR`, `METRICS_PORT`
+- `WAL_PATH`, `FSYNC_POLICY`
+- `MAX_RETRIES`, `RETRY_BACKOFF_MS`
+- `ALLOWED_API_KEYS="key1,key2,..."`
 
 ## Metrics endpoint
 
-`blipmq_metrics` exposes a simple HTTP endpoint suitable for Prometheus scraping or basic monitoring:
+`metrics` exposes a simple HTTP endpoint suitable for Prometheus scraping or basic monitoring:
 
 - Path: `GET /metrics` on `metrics_addr:metrics_port`
 - Response (plain text), for example:
@@ -88,11 +88,11 @@ wal_appends_total <n>
 wal_bytes_total <n>
 ```
 
-These values are provided by `blipmq_core::Broker` and `blipmq_wal::WriteAheadLog`.
+These values are provided by `corelib::Broker` and `wal::WriteAheadLog`.
 
 ## WAL and durability
 
-`blipmq_wal` implements an append-only log with:
+`wal` implements an append-only log with:
 
 - fixed header and `[id][len][crc32][payload...]` record layout,
 - CRC32 validation for corruption detection,
@@ -108,7 +108,7 @@ These values are provided by `blipmq_core::Broker` and `blipmq_wal::WriteAheadLo
 
 ## QoS, TTL, and retry
 
-`blipmq_core` supports:
+`core` supports:
 
 - QoS 0 (at-most-once) and QoS 1 (at-least-once),
 - per-message metadata:
@@ -134,12 +134,12 @@ On SIGINT/SIGTERM (Ctrl+C), `blipmqd`:
 
 This provides at-least-once semantics for QoS1 across restarts while avoiding abrupt loss of in-flight messages during orderly shutdowns.
 
-## Benchmark harness (`blipmq_bench`)
+## Benchmark harness (`bench`)
 
-The `blipmq_bench` crate provides an in-process benchmark that exercises the `Broker` API directly (with optional WAL) to measure basic throughput and latency:
+The `bench` crate provides an in-process benchmark that exercises the `Broker` API directly (with optional WAL) to measure basic throughput and latency:
 
 ```bash
-cargo run -p blipmq_bench -- \
+cargo run -p bench -- \
   --publishers 4 \
   --subscribers 4 \
   --topics 8 \
@@ -185,3 +185,4 @@ sudo flamegraph
 ```
 
 Hot paths such as publish, frame encode/decode, and WAL append are annotated with `#[inline(always)]` and tracing spans so that perf and `tokio-console` can attribute time accurately.
+

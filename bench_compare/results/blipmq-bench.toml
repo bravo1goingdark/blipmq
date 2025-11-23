@@ -1,0 +1,9 @@
+bind_addr = "127.0.0.1"
+port = 5555
+metrics_addr = "127.0.0.1"
+metrics_port = 9100
+wal_path = "blipmq.wal"
+fsync_policy = "every_n:64"
+max_retries = 3
+retry_backoff_ms = 100
+allowed_api_keys = ["bench-key"]

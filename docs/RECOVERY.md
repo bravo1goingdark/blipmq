@@ -1,10 +1,10 @@
-﻿# BlipMQ Recovery & Failure Handling
+# BlipMQ Recovery & Failure Handling
 
 BlipMQ uses a write-ahead log (WAL) to provide durable QoS1 semantics and crash recovery. This document describes the WAL format, replay rules, and recommended recovery drills.
 
 ## WAL Format
 
-The WAL implemented by `blipmq_wal` has a simple binary layout:
+The WAL implemented by `wal` has a simple binary layout:
 
 ```text
 [32-byte header]
@@ -40,7 +40,7 @@ If a CRC mismatch or structural error is detected during scanning, `WriteAheadLo
 
 ## Broker WAL Encoding
 
-The broker (`blipmq_core`) encodes messages into WAL records via `WalMessageRecord`:
+The broker (`core`) encodes messages into WAL records via `WalMessageRecord`:
 
 ```rust
 struct WalMessageRecord {
@@ -163,7 +163,7 @@ Steps:
 3. Publish N QoS1 messages using a client.
 4. ACK approximately half of them from the subscriber.
 5. Simulate crash:
-   - In tests: use `blipmq_chaos::simulate_crash(broker)` or simply drop the broker.
+   - In tests: use `chaos::simulate_crash(broker)` or simply drop the broker.
    - In a running daemon: kill the process (in a controlled environment).
 6. Restart `blipmqd` with the same WAL path.
 7. Allow the broker to call `replay_from_wal`.
@@ -185,7 +185,7 @@ Steps:
 
 1. Run a program that uses `WriteAheadLog` to append a few records.
 2. Close the program to ensure WAL is flushed.
-3. Use `blipmq_chaos::corrupt_file_tail_bit(path)` to flip a bit near the end of the WAL.
+3. Use `chaos::corrupt_file_tail_bit(path)` to flip a bit near the end of the WAL.
 4. Attempt to open the WAL again via `WriteAheadLog::open(path)`.
 
 Expected behavior:
@@ -205,7 +205,7 @@ Goal: Validate behavior when WAL cannot append due to disk-full.
 
 Steps:
 
-1. Use `blipmq_chaos::full_disk_error()` in a test harness to simulate IO errors during WAL append.
+1. Use `chaos::full_disk_error()` in a test harness to simulate IO errors during WAL append.
 2. Ensure `publish_durable` translates this into:
    - A NACK to the client.
    - Appropriate logging.
@@ -224,7 +224,7 @@ Goal: Evaluate how BlipMQ behaves with high WAL latency.
 
 Steps:
 
-1. Wrap WAL writes in tests with `blipmq_chaos::simulate_slow_disk_write`:
+1. Wrap WAL writes in tests with `chaos::simulate_slow_disk_write`:
 
    ```rust
    let result = simulate_slow_disk_write(Duration::from_millis(50), || async {
@@ -246,7 +246,7 @@ Goal: Ensure clients and broker behave correctly under intermittent network fail
 
 Steps:
 
-1. Use `blipmq_chaos::maybe_disconnect(&mut TcpStream, probability)` in clients.
+1. Use `chaos::maybe_disconnect(&mut TcpStream, probability)` in clients.
 2. Run end-to-end tests:
    - Frequent random disconnects at various points (before/after AUTH, during publish, during poll).
 3. Validate:
@@ -263,7 +263,7 @@ The following example describes a typical corruption scenario and expected respo
 3. Introduce corruption:
 
    ```rust
-   use blipmq_chaos::corrupt_file_tail_bit;
+   use chaos::corrupt_file_tail_bit;
 
    corrupt_file_tail_bit("/var/lib/blipmq/blipmq.wal")
        .expect("failed to corrupt WAL");
@@ -284,3 +284,4 @@ Operator actions:
 - Restart BlipMQ with a clean or repaired WAL once root cause is addressed.
 
 By regularly executing these drills and verifying behavior, teams can ensure BlipMQ behaves predictably under failure and that operational runbooks remain accurate and effective.
+

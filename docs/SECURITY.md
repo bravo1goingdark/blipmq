@@ -1,4 +1,4 @@
-﻿# BlipMQ Security
+# BlipMQ Security
 
 BlipMQ's security model is intentionally simple and composable with existing infrastructure:
 
@@ -10,7 +10,7 @@ This document describes the auth model, isolation assumptions, and production de
 
 ## Static API Key Authentication
 
-`blipmq_auth` defines:
+`auth` defines:
 
 - `ApiKey(String)`:
   - Immutable wrapper for API key strings.
@@ -23,9 +23,9 @@ This document describes the auth model, isolation assumptions, and production de
 
 - Loads `allowed_api_keys` from config (`blipmq.toml` or YAML) and environment.
 - Constructs `StaticApiKeyValidator::from_keys(&config.allowed_api_keys)`.
-- Passes it into `blipmq_net::Server`.
+- Passes it into `net::Server`.
 
-`Connection` in `blipmq_net`:
+`Connection` in `net`:
 
 - Accepts HELLO and AUTH frames from unauthenticated clients.
 - On AUTH:
@@ -183,3 +183,4 @@ This unit:
 - Transport security and sophisticated authorization should be layered via proxies and network controls.
 - Run `blipmqd` under a dedicated user with restricted filesystem privileges.
 - Harden logging and monitor metrics to detect and respond to security-relevant events.
+

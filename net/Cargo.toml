@@ -1,0 +1,17 @@
+[package]
+name = "net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "BlipMQ networking: TCP server and protocol framing"
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+corelib = { path = "../core", package = "core" }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+auth = { path = "../auth" }
+

@@ -1,4 +1,4 @@
-﻿# BlipMQ Architecture
+# BlipMQ Architecture
 
 BlipMQ is built as a set of focused crates that compose into a high-performance, durable message broker. This document explains the components, how they fit together, and the end-to-end dataflow for common operations.
 
@@ -8,28 +8,28 @@ At a high level, BlipMQ is structured as:
 
 ```text
 +-----------+     TCP (HELLO/AUTH/PUB/SUB/POLL/ACK)     +----------------+
-| Clients   | <---------------------------------------> |  blipmq_net    |
+| Clients   | <---------------------------------------> |  net    |
 +-----------+                                          +----------------+
                                                            |
                                                            | BrokerHandler
                                                            v
                                                      +----------------+
-                                                     |  blipmq_core   |
+                                                     |  core   |
                                                      |  (Broker)      |
                                                      +----------------+
                                                            |
                                                            | durable QoS1 publish
                                                            v
                                                      +----------------+
-                                                     |  blipmq_wal    |
+                                                     |  wal    |
                                                      +----------------+
 
                        +----------------+       +------------------+
-                       | blipmq_metrics | <---- |    Broker+WAL    |
+                       | metrics | <---- |    Broker+WAL    |
                        +----------------+       +------------------+
 
                        +----------------+
-                       | blipmq_config |
+                       | config |
                        +----------------+
 
                        +----------------+
@@ -37,7 +37,7 @@ At a high level, BlipMQ is structured as:
                        +----------------+
 ```
 
-### `blipmq_net` (Networking & Protocol)
+### `net` (Networking & Protocol)
 
 - TCP server (`Server`) listening on a configured address.
 - For each accepted TCP connection:
@@ -46,7 +46,7 @@ At a high level, BlipMQ is structured as:
   - Parses/encodes frames with `encode_frame`/`try_decode_frame`.
   - Routes application frames to a `MessageHandler` (typically `BrokerHandler`).
 
-### `blipmq_core` (Broker)
+### `core` (Broker)
 
 - `Broker` manages:
   - Topic registry: sharded map `TopicName -> Topic`.
@@ -60,7 +60,7 @@ At a high level, BlipMQ is structured as:
   - `maintenance_tick` for TTL & retry logic.
   - `replay_from_wal` and `flush_wal` when WAL is configured.
 
-### `blipmq_wal` (Write-Ahead Log)
+### `wal` (Write-Ahead Log)
 
 - Append-only file with:
   - Fixed header and `[id][len][crc32][payload...]` records.
@@ -71,7 +71,7 @@ At a high level, BlipMQ is structured as:
   - `fsync_interval`.
 - Used by `Broker::publish_durable` and `Broker::replay_from_wal`.
 
-### `blipmq_auth` (Auth)
+### `auth` (Auth)
 
 - `ApiKey` newtype.
 - `ApiKeyValidator` trait.
@@ -80,13 +80,13 @@ At a high level, BlipMQ is structured as:
   - Only HELLO/AUTH frames are accepted pre-auth.
   - Non-auth frames before authentication yield `NACK(401, "unauthenticated")`.
 
-### `blipmq_metrics` (Metrics)
+### `metrics` (Metrics)
 
 - HTTP server exposing `GET /metrics`.
 - Retrieves metrics from `Broker` and `WriteAheadLog`.
 - Suitable for basic monitoring or Prometheus scraping.
 
-### `blipmq_config` (Config)
+### `config` (Config)
 
 - Loads configuration from:
   - Optional TOML/YAML file.
@@ -112,7 +112,7 @@ At a high level, BlipMQ is structured as:
 
 ## Dataflow: Publish & Delivery
 
-### Publish Path (Client → Broker)
+### Publish Path (Client ? Broker)
 
 ```text
 Client              Net Server            BrokerHandler              Broker               WAL
@@ -141,7 +141,7 @@ PUBLISH frame
   (no response frame)
 ```
 
-### Subscribe Path (Client → Broker)
+### Subscribe Path (Client ? Broker)
 
 ```text
 Client          Net Server         BrokerHandler               Broker
@@ -250,12 +250,13 @@ The broker does not use background threads internally; instead, `blipmqd` runs a
     |
     v
 Broker::maintenance_tick(now)
-    ├─ iterate subscriptions
-    ├─ call SubscriberQueue::maintenance_tick
-    │    ├─ drop expired messages from pending
-    │    ├─ drop expired messages from inflight
-    │    └─ reschedule or drop inflight QoS1 based on retry policy
-    └─ update internal counters
+    +- iterate subscriptions
+    +- call SubscriberQueue::maintenance_tick
+    �    +- drop expired messages from pending
+    �    +- drop expired messages from inflight
+    �    +- reschedule or drop inflight QoS1 based on retry policy
+    +- update internal counters
 ```
 
 This decouples time-based behavior (TTL expiry, retries) from the main publish/poll paths, keeping hot paths lean.
+
