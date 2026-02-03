@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -180,8 +181,11 @@ struct SubscriberQueue {
 #[derive(Debug)]
 struct SubscriberQueueInner {
     next_tag: u64,
-    pending: VecDeque<QueueEntry>,
+    pending: VecDeque<DeliveryTag>,
+    pending_entries: HashMap<DeliveryTag, QueueEntry>,
     inflight: HashMap<DeliveryTag, QueueEntry>,
+    expiration_heap: BinaryHeap<Reverse<ExpirationEntry>>,
+    retry_heap: BinaryHeap<Reverse<RetryEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +199,46 @@ struct QueueEntry {
     ttl: Option<Duration>,
     delivery_attempts: u32,
     next_delivery_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ExpirationEntry {
+    expires_at: std::time::Instant,
+    tag: DeliveryTag,
+}
+
+impl Ord for ExpirationEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.expires_at
+            .cmp(&other.expires_at)
+            .then_with(|| self.tag.value().cmp(&other.tag.value()))
+    }
+}
+
+impl PartialOrd for ExpirationEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RetryEntry {
+    next_delivery_at: std::time::Instant,
+    tag: DeliveryTag,
+}
+
+impl Ord for RetryEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.next_delivery_at
+            .cmp(&other.next_delivery_at)
+            .then_with(|| self.tag.value().cmp(&other.tag.value()))
+    }
+}
+
+impl PartialOrd for RetryEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,7 +319,10 @@ impl SubscriberQueue {
             inner: Mutex::new(SubscriberQueueInner {
                 next_tag: 1,
                 pending: VecDeque::new(),
+                pending_entries: HashMap::new(),
                 inflight: HashMap::new(),
+                expiration_heap: BinaryHeap::new(),
+                retry_heap: BinaryHeap::new(),
             }),
         }
     }
@@ -291,9 +338,10 @@ impl SubscriberQueue {
         let mut inner = self.inner.lock();
 
         // Bound total number of stored messages.
-        while inner.pending.len() + inner.inflight.len() >= self.capacity {
-            inner.pending.pop_front();
-            if inner.pending.is_empty() {
+        while inner.pending_entries.len() + inner.inflight.len() >= self.capacity {
+            if let Some(tag) = inner.pending.pop_front() {
+                inner.pending_entries.remove(&tag);
+            } else {
                 break;
             }
         }
@@ -308,7 +356,7 @@ impl SubscriberQueue {
 
         let now = std::time::Instant::now();
 
-        inner.pending.push_back(QueueEntry {
+        let entry = QueueEntry {
             tag,
             payload,
             qos: effective_qos,
@@ -317,13 +365,28 @@ impl SubscriberQueue {
             ttl,
             delivery_attempts: 0,
             next_delivery_at: now,
-        });
+        };
+
+        if let Some(ttl) = entry.ttl {
+            inner.expiration_heap.push(Reverse(ExpirationEntry {
+                expires_at: entry.created_at + ttl,
+                tag: entry.tag,
+            }));
+        }
+
+        inner.pending.push_back(entry.tag);
+        inner.pending_entries.insert(entry.tag, entry);
     }
 
     #[inline(always)]
     fn dequeue(&self, base_delay: Duration) -> Option<(QueueEntry, Option<DeliveryTag>)> {
         let mut inner = self.inner.lock();
-        let mut entry = inner.pending.pop_front()?;
+        let mut entry = loop {
+            let tag = inner.pending.pop_front()?;
+            if let Some(entry) = inner.pending_entries.remove(&tag) {
+                break entry;
+            }
+        };
 
         let span = tracing::trace_span!("subscriber_dequeue", qos = ?entry.qos);
         let _guard = span.enter();
@@ -346,6 +409,10 @@ impl SubscriberQueue {
 
                 let tag = Some(entry.tag);
                 inner.inflight.insert(entry.tag, entry.clone());
+                inner.retry_heap.push(Reverse(RetryEntry {
+                    next_delivery_at: entry.next_delivery_at,
+                    tag: entry.tag,
+                }));
                 Some((entry, tag))
             }
         }
@@ -354,7 +421,10 @@ impl SubscriberQueue {
     #[allow(dead_code)]
     fn peek(&self) -> Option<Bytes> {
         let inner = self.inner.lock();
-        inner.pending.front().map(|e| e.payload.clone())
+        inner
+            .pending
+            .iter()
+            .find_map(|tag| inner.pending_entries.get(tag).map(|e| e.payload.clone()))
     }
 
     fn ack(&self, tag: DeliveryTag) -> bool {
@@ -367,51 +437,70 @@ impl SubscriberQueue {
         inner.inflight.len()
     }
 
+    fn expiration_heap_len(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.expiration_heap.len()
+    }
+
+    fn retry_heap_len(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.retry_heap.len()
+    }
+
     fn maintenance_tick(&self, now: std::time::Instant, max_retries: u32, _base_delay: Duration) {
         let mut inner = self.inner.lock();
 
-        // Drop expired messages from pending.
-        inner.pending.retain(|entry| {
-            if let Some(ttl) = entry.ttl {
-                entry.created_at + ttl > now
-            } else {
-                true
+        while let Some(Reverse(expiration)) = inner.expiration_heap.peek().copied() {
+            if expiration.expires_at > now {
+                break;
             }
-        });
+            inner.expiration_heap.pop();
 
-        // Drop expired messages from inflight.
-        inner.inflight.retain(|_, entry| {
-            if let Some(ttl) = entry.ttl {
-                entry.created_at + ttl > now
-            } else {
-                true
+            if let Some(entry) = inner.pending_entries.get(&expiration.tag) {
+                if entry
+                    .ttl
+                    .map(|ttl| entry.created_at + ttl == expiration.expires_at)
+                    .unwrap_or(false)
+                {
+                    inner.pending_entries.remove(&expiration.tag);
+                }
+                continue;
             }
-        });
 
-        // Collect inflight messages that should be retried or dropped.
-        let mut to_retry = Vec::new();
-        let mut to_drop = Vec::new();
-
-        for (tag, entry) in inner.inflight.iter() {
-            if now >= entry.next_delivery_at {
-                if entry.delivery_attempts < max_retries {
-                    to_retry.push(*tag);
-                } else {
-                    to_drop.push(*tag);
+            if let Some(entry) = inner.inflight.get(&expiration.tag) {
+                if entry
+                    .ttl
+                    .map(|ttl| entry.created_at + ttl == expiration.expires_at)
+                    .unwrap_or(false)
+                {
+                    inner.inflight.remove(&expiration.tag);
                 }
             }
         }
 
-        for tag in to_drop {
-            inner.inflight.remove(&tag);
-        }
+        while let Some(Reverse(retry)) = inner.retry_heap.peek().copied() {
+            if retry.next_delivery_at > now {
+                break;
+            }
+            inner.retry_heap.pop();
 
-        for tag in to_retry {
-            if let Some(mut entry) = inner.inflight.remove(&tag) {
-                // Reset next_delivery_at; it will be set when the message is
-                // delivered again via `dequeue`.
+            let Some(entry) = inner.inflight.get(&retry.tag) else {
+                continue;
+            };
+
+            if entry.next_delivery_at != retry.next_delivery_at {
+                continue;
+            }
+
+            if entry.delivery_attempts >= max_retries {
+                inner.inflight.remove(&retry.tag);
+                continue;
+            }
+
+            if let Some(mut entry) = inner.inflight.remove(&retry.tag) {
                 entry.next_delivery_at = now;
-                inner.pending.push_back(entry);
+                inner.pending.push_back(entry.tag);
+                inner.pending_entries.insert(entry.tag, entry);
             }
         }
     }
@@ -637,6 +726,22 @@ impl Broker {
         subscriptions
             .values()
             .map(|sub_ref| sub_ref.subscriber.queue.inflight_len())
+            .sum()
+    }
+
+    pub fn expiration_heap_size(&self) -> usize {
+        let subscriptions = self.subscriptions.read();
+        subscriptions
+            .values()
+            .map(|sub_ref| sub_ref.subscriber.queue.expiration_heap_len())
+            .sum()
+    }
+
+    pub fn retry_heap_size(&self) -> usize {
+        let subscriptions = self.subscriptions.read();
+        subscriptions
+            .values()
+            .map(|sub_ref| sub_ref.subscriber.queue.retry_heap_len())
             .sum()
     }
 
