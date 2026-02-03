@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use auth::StaticApiKeyValidator;
-use corelib::{Broker, BrokerConfig, QoSLevel, TopicName};
+use corelib::{BackpressurePolicy, Broker, BrokerConfig, QoSLevel, TopicName};
 use net::{
     AckPayload, AuthPayload, BrokerHandler, Frame, FrameResponse, FrameType,
     HelloPayload, MessageHandler, NetworkConfig, PollPayload, PublishPayload,
@@ -20,6 +20,7 @@ fn test_broker() -> Arc<Broker> {
         default_qos: QoSLevel::AtLeastOnce,
         message_ttl: Duration::from_secs(5),
         per_subscriber_queue_capacity: 1024,
+        per_subscriber_backpressure: BackpressurePolicy::Drop,
         max_retries: 3,
         retry_base_delay: Duration::from_millis(20),
     }))
@@ -377,5 +378,3 @@ async fn invalid_publish_payload_is_rejected() {
 
     let _ = shutdown_tx.send(true);
 }
-
-

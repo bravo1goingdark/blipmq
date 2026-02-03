@@ -12,7 +12,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 use auth::StaticApiKeyValidator;
 use bytes::Bytes;
 use config::{Config, ConfigError};
-use corelib::{Broker, BrokerConfig, QoSLevel};
+use corelib::{BackpressurePolicy, Broker, BrokerConfig, QoSLevel};
 use metrics::run_metrics_server;
 use net::{
     AckPayload, BrokerHandler, Frame, FrameResponse, FrameType, MessageHandler, NetworkConfig,
@@ -176,6 +176,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     default_qos: QoSLevel::AtLeastOnce,
                     message_ttl: std::time::Duration::from_secs(60),
                     per_subscriber_queue_capacity: 1024,
+                    per_subscriber_backpressure: BackpressurePolicy::Drop,
                     max_retries: config.max_retries,
                     retry_base_delay: std::time::Duration::from_millis(config.retry_backoff_ms),
                 },

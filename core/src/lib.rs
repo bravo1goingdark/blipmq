@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::mpsc;
 use wal::{WalError as LogError, WalRecord, WriteAheadLog};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,12 +15,21 @@ pub enum QoSLevel {
     AtLeastOnce,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BackpressurePolicy {
+    Drop,
+    Block,
+    Shed,
+}
+
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub default_qos: QoSLevel,
     pub message_ttl: Duration,
     /// Default per-subscriber in-memory queue capacity in number of messages.
     pub per_subscriber_queue_capacity: usize,
+    /// Backpressure behavior when per-subscriber queues are full.
+    pub per_subscriber_backpressure: BackpressurePolicy,
     /// Maximum number of delivery attempts for QoS1 messages before dropping.
     pub max_retries: u32,
     /// Base delay used for exponential backoff between retry attempts.
@@ -162,6 +172,7 @@ struct Subscriber {
     #[allow(dead_code)]
     client_id: ClientId,
     queue: SubscriberQueue,
+    inflight: SubscriberInflight,
 }
 
 #[derive(Debug)]
@@ -174,14 +185,15 @@ struct SubscriptionRef {
 struct SubscriberQueue {
     default_qos: QoSLevel,
     capacity: usize,
-    inner: Mutex<SubscriberQueueInner>,
+    backpressure: BackpressurePolicy,
+    sender: mpsc::Sender<QueueEntry>,
+    receiver: Mutex<mpsc::Receiver<QueueEntry>>,
+    next_tag: AtomicU64,
 }
 
 #[derive(Debug)]
-struct SubscriberQueueInner {
-    next_tag: u64,
-    pending: VecDeque<QueueEntry>,
-    inflight: HashMap<DeliveryTag, QueueEntry>,
+struct SubscriberInflight {
+    inner: Mutex<HashMap<DeliveryTag, QueueEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,15 +280,15 @@ impl WalMessageRecord {
 }
 
 impl SubscriberQueue {
-    fn new(default_qos: QoSLevel, capacity: usize) -> Self {
+    fn new(default_qos: QoSLevel, capacity: usize, backpressure: BackpressurePolicy) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
         Self {
             default_qos,
             capacity,
-            inner: Mutex::new(SubscriberQueueInner {
-                next_tag: 1,
-                pending: VecDeque::new(),
-                inflight: HashMap::new(),
-            }),
+            backpressure,
+            sender,
+            receiver: Mutex::new(receiver),
+            next_tag: AtomicU64::new(1),
         }
     }
 
@@ -288,90 +300,141 @@ impl SubscriberQueue {
         wal_id: Option<u64>,
         ttl: Option<Duration>,
     ) {
-        let mut inner = self.inner.lock();
-
-        // Bound total number of stored messages.
-        while inner.pending.len() + inner.inflight.len() >= self.capacity {
-            inner.pending.pop_front();
-            if inner.pending.is_empty() {
-                break;
-            }
-        }
-
-        let tag = DeliveryTag(inner.next_tag);
-        inner.next_tag = inner.next_tag.wrapping_add(1);
-
-        let effective_qos = match (self.default_qos, message_qos) {
-            (QoSLevel::AtLeastOnce, QoSLevel::AtLeastOnce) => QoSLevel::AtLeastOnce,
-            _ => QoSLevel::AtMostOnce,
-        };
-
-        let now = std::time::Instant::now();
-
-        inner.pending.push_back(QueueEntry {
-            tag,
-            payload,
-            qos: effective_qos,
-            wal_id,
-            created_at: now,
-            ttl,
-            delivery_attempts: 0,
-            next_delivery_at: now,
-        });
+        self.enqueue_batch(std::iter::once(payload), message_qos, wal_id, ttl);
     }
 
     #[inline(always)]
-    fn dequeue(&self, base_delay: Duration) -> Option<(QueueEntry, Option<DeliveryTag>)> {
-        let mut inner = self.inner.lock();
-        let mut entry = inner.pending.pop_front()?;
+    fn enqueue_batch<I>(
+        &self,
+        payloads: I,
+        message_qos: QoSLevel,
+        wal_id: Option<u64>,
+        ttl: Option<Duration>,
+    ) where
+        I: IntoIterator<Item = Bytes>,
+    {
+        for payload in payloads {
+            let tag = DeliveryTag(self.next_tag.fetch_add(1, Ordering::Relaxed));
+            let entry = QueueEntry::new(tag, payload, self.default_qos, message_qos, wal_id, ttl);
+            self.send_entry(entry);
+        }
+    }
 
-        let span = tracing::trace_span!("subscriber_dequeue", qos = ?entry.qos);
-        let _guard = span.enter();
-
-        match entry.qos {
-            QoSLevel::AtMostOnce => {
-                // Fire-and-forget: do not track in inflight.
-                let tag = None;
-                Some((entry, tag))
+    fn send_entry(&self, entry: QueueEntry) {
+        match self.backpressure {
+            BackpressurePolicy::Drop => {
+                let _ = self.sender.try_send(entry);
             }
-            QoSLevel::AtLeastOnce => {
-                entry.delivery_attempts = entry.delivery_attempts.saturating_add(1);
-                let shift = entry.delivery_attempts.saturating_sub(1).min(31);
-                let mut factor: u32 = 1;
-                for _ in 0..shift {
-                    factor = factor.saturating_mul(2);
+            BackpressurePolicy::Block => {
+                let _ = self.sender.blocking_send(entry);
+            }
+            BackpressurePolicy::Shed => match self.sender.try_send(entry) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(entry)) => {
+                    let mut receiver = self.receiver.lock();
+                    let _ = receiver.try_recv();
+                    let _ = self.sender.try_send(entry);
                 }
-                let backoff = base_delay.checked_mul(factor).unwrap_or(base_delay);
-                entry.next_delivery_at = std::time::Instant::now() + backoff;
+                Err(mpsc::error::TrySendError::Closed(_entry)) => {}
+            },
+        }
+    }
 
-                let tag = Some(entry.tag);
-                inner.inflight.insert(entry.tag, entry.clone());
-                Some((entry, tag))
+    #[inline(always)]
+    fn dequeue(
+        &self,
+        inflight: &SubscriberInflight,
+        base_delay: Duration,
+    ) -> Option<(QueueEntry, Option<DeliveryTag>)> {
+        let mut receiver = self.receiver.lock();
+        loop {
+            let mut entry = match receiver.try_recv() {
+                Ok(entry) => entry,
+                Err(mpsc::error::TryRecvError::Empty) => return None,
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            };
+
+            let now = std::time::Instant::now();
+            if let Some(ttl) = entry.ttl {
+                if entry.created_at + ttl <= now {
+                    continue;
+                }
+            }
+
+            let span = tracing::trace_span!("subscriber_dequeue", qos = ?entry.qos);
+            let _guard = span.enter();
+
+            match entry.qos {
+                QoSLevel::AtMostOnce => {
+                    let tag = None;
+                    return Some((entry, tag));
+                }
+                QoSLevel::AtLeastOnce => {
+                    entry.delivery_attempts = entry.delivery_attempts.saturating_add(1);
+                    let shift = entry.delivery_attempts.saturating_sub(1).min(31);
+                    let mut factor: u32 = 1;
+                    for _ in 0..shift {
+                        factor = factor.saturating_mul(2);
+                    }
+                    let backoff = base_delay.checked_mul(factor).unwrap_or(base_delay);
+                    entry.next_delivery_at = std::time::Instant::now() + backoff;
+
+                    let tag = Some(entry.tag);
+                    inflight.insert(entry.clone());
+                    return Some((entry, tag));
+                }
             }
         }
     }
 
     #[allow(dead_code)]
     fn peek(&self) -> Option<Bytes> {
-        let inner = self.inner.lock();
-        inner.pending.front().map(|e| e.payload.clone())
+        let mut receiver = self.receiver.lock();
+        match receiver.try_recv() {
+            Ok(entry) => {
+                let payload = entry.payload.clone();
+                let _ = self.sender.try_send(entry);
+                Some(payload)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn requeue(&self, entry: QueueEntry) {
+        self.send_entry(entry);
+    }
+}
+
+impl SubscriberInflight {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, entry: QueueEntry) {
+        let mut inner = self.inner.lock();
+        inner.insert(entry.tag, entry);
     }
 
     fn ack(&self, tag: DeliveryTag) -> bool {
         let mut inner = self.inner.lock();
-        inner.inflight.remove(&tag).is_some()
+        inner.remove(&tag).is_some()
     }
 
-    fn inflight_len(&self) -> usize {
+    fn len(&self) -> usize {
         let inner = self.inner.lock();
-        inner.inflight.len()
+        inner.len()
     }
 
-    fn maintenance_tick(&self, now: std::time::Instant, max_retries: u32, _base_delay: Duration) {
+    fn maintenance_tick(&self, queue: &SubscriberQueue, now: std::time::Instant, max_retries: u32) {
         let mut inner = self.inner.lock();
 
-        // Drop expired messages from pending.
-        inner.pending.retain(|entry| {
+        inner.retain(|_, entry| {
             if let Some(ttl) = entry.ttl {
                 entry.created_at + ttl > now
             } else {
@@ -379,20 +442,10 @@ impl SubscriberQueue {
             }
         });
 
-        // Drop expired messages from inflight.
-        inner.inflight.retain(|_, entry| {
-            if let Some(ttl) = entry.ttl {
-                entry.created_at + ttl > now
-            } else {
-                true
-            }
-        });
-
-        // Collect inflight messages that should be retried or dropped.
         let mut to_retry = Vec::new();
         let mut to_drop = Vec::new();
 
-        for (tag, entry) in inner.inflight.iter() {
+        for (tag, entry) in inner.iter() {
             if now >= entry.next_delivery_at {
                 if entry.delivery_attempts < max_retries {
                     to_retry.push(*tag);
@@ -403,16 +456,43 @@ impl SubscriberQueue {
         }
 
         for tag in to_drop {
-            inner.inflight.remove(&tag);
+            inner.remove(&tag);
         }
 
         for tag in to_retry {
-            if let Some(mut entry) = inner.inflight.remove(&tag) {
-                // Reset next_delivery_at; it will be set when the message is
-                // delivered again via `dequeue`.
+            if let Some(mut entry) = inner.remove(&tag) {
                 entry.next_delivery_at = now;
-                inner.pending.push_back(entry);
+                queue.requeue(entry);
             }
+        }
+    }
+}
+
+impl QueueEntry {
+    fn new(
+        tag: DeliveryTag,
+        payload: Bytes,
+        default_qos: QoSLevel,
+        message_qos: QoSLevel,
+        wal_id: Option<u64>,
+        ttl: Option<Duration>,
+    ) -> Self {
+        let effective_qos = match (default_qos, message_qos) {
+            (QoSLevel::AtLeastOnce, QoSLevel::AtLeastOnce) => QoSLevel::AtLeastOnce,
+            _ => QoSLevel::AtMostOnce,
+        };
+
+        let now = std::time::Instant::now();
+
+        QueueEntry {
+            tag,
+            payload,
+            qos: effective_qos,
+            wal_id,
+            created_at: now,
+            ttl,
+            delivery_attempts: 0,
+            next_delivery_at: now,
         }
     }
 }
@@ -496,8 +576,17 @@ impl Broker {
         topic: TopicName,
         qos: QoSLevel,
     ) -> SubscriptionId {
-        let queue = SubscriberQueue::new(qos, self.config.per_subscriber_queue_capacity);
-        let subscriber = Arc::new(Subscriber { client_id, queue });
+        let queue = SubscriberQueue::new(
+            qos,
+            self.config.per_subscriber_queue_capacity,
+            self.config.per_subscriber_backpressure,
+        );
+        let inflight = SubscriberInflight::new();
+        let subscriber = Arc::new(Subscriber {
+            client_id,
+            queue,
+            inflight,
+        });
 
         let topic_arc = self.topics.get_or_insert(topic.clone());
 
@@ -539,12 +628,16 @@ impl Broker {
             None => return,
         };
 
-        let subscribers = topic.subscribers.read();
+        let subscribers: Vec<Arc<Subscriber>> = {
+            let subscribers = topic.subscribers.read();
+            subscribers.values().cloned().collect()
+        };
 
-        for subscriber in subscribers.values() {
+        let ttl = Some(self.config.message_ttl);
+        for subscriber in subscribers {
             subscriber
                 .queue
-                .enqueue(payload.clone(), qos, wal_id, Some(self.config.message_ttl));
+                .enqueue_batch(std::iter::once(payload.clone()), qos, wal_id, ttl);
         }
     }
 
@@ -609,7 +702,7 @@ impl Broker {
         let (entry, tag) = sub_ref
             .subscriber
             .queue
-            .dequeue(self.config.retry_base_delay)?;
+            .dequeue(&sub_ref.subscriber.inflight, self.config.retry_base_delay)?;
 
         Some(PolledMessage {
             subscription_id: sub_id,
@@ -627,7 +720,7 @@ impl Broker {
             None => return false,
         };
 
-        sub_ref.subscriber.queue.ack(tag)
+        sub_ref.subscriber.inflight.ack(tag)
     }
 
     /// Total number of QoS1 messages currently tracked as in-flight across
@@ -636,7 +729,7 @@ impl Broker {
         let subscriptions = self.subscriptions.read();
         subscriptions
             .values()
-            .map(|sub_ref| sub_ref.subscriber.queue.inflight_len())
+            .map(|sub_ref| sub_ref.subscriber.inflight.len())
             .sum()
     }
 
@@ -646,10 +739,10 @@ impl Broker {
     pub fn maintenance_tick(&self, now: std::time::Instant) {
         let subscriptions = self.subscriptions.read();
         for sub_ref in subscriptions.values() {
-            sub_ref.subscriber.queue.maintenance_tick(
+            sub_ref.subscriber.inflight.maintenance_tick(
+                &sub_ref.subscriber.queue,
                 now,
                 self.config.max_retries,
-                self.config.retry_base_delay,
             );
         }
     }
@@ -674,6 +767,7 @@ mod tests {
             default_qos: QoSLevel::AtLeastOnce,
             message_ttl: Duration::from_secs(60),
             per_subscriber_queue_capacity: 16,
+            per_subscriber_backpressure: BackpressurePolicy::Drop,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(50),
         })
@@ -760,6 +854,7 @@ mod tests {
             default_qos: QoSLevel::AtLeastOnce,
             message_ttl: Duration::from_millis(50),
             per_subscriber_queue_capacity: 16,
+            per_subscriber_backpressure: BackpressurePolicy::Drop,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(10),
         });
@@ -792,6 +887,7 @@ mod tests {
             default_qos: QoSLevel::AtLeastOnce,
             message_ttl: Duration::from_secs(5),
             per_subscriber_queue_capacity: 16,
+            per_subscriber_backpressure: BackpressurePolicy::Drop,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(20),
         });
@@ -849,6 +945,7 @@ mod tests {
             default_qos: QoSLevel::AtLeastOnce,
             message_ttl: Duration::from_secs(60),
             per_subscriber_queue_capacity: 16,
+            per_subscriber_backpressure: BackpressurePolicy::Drop,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(50),
         };

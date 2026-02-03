@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chaos::simulate_crash;
-use corelib::{Broker, BrokerConfig, ClientId, QoSLevel, TopicName};
+use corelib::{BackpressurePolicy, Broker, BrokerConfig, ClientId, QoSLevel, TopicName};
 use wal::WriteAheadLog;
 use bytes::Bytes;
 
@@ -29,6 +29,7 @@ async fn chaos_crash_recovery_qos1() {
         default_qos: QoSLevel::AtLeastOnce,
         message_ttl: Duration::from_secs(60),
         per_subscriber_queue_capacity: 1024,
+        per_subscriber_backpressure: BackpressurePolicy::Drop,
         max_retries: 3,
         retry_base_delay: Duration::from_millis(50),
     };
@@ -130,5 +131,4 @@ async fn chaos_crash_recovery_qos1() {
         );
     }
 }
-
 

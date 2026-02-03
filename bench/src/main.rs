@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use auth::StaticApiKeyValidator;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::Parser;
-use corelib::{Broker, BrokerConfig, QoSLevel};
+use corelib::{BackpressurePolicy, Broker, BrokerConfig, QoSLevel};
 use net::{
     encode_frame, try_decode_frame, AckPayload, AuthPayload, BrokerHandler, Frame, FrameType,
     HelloPayload, NetworkConfig, PollPayload, PublishPayload, Server, SubscribePayload,
@@ -404,6 +404,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         default_qos: cfg.qos,
         message_ttl: Duration::from_secs(60),
         per_subscriber_queue_capacity: 4096,
+        per_subscriber_backpressure: BackpressurePolicy::Drop,
         max_retries: 3,
         retry_base_delay: Duration::from_millis(50),
     };
