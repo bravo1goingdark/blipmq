@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -7,7 +9,7 @@ use crc32fast::Hasher as Crc32Hasher;
 use thiserror::Error;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::error;
 
 const HEADER_MAGIC: &[u8; 8] = b"BLIPWAL\0";
@@ -19,6 +21,15 @@ const RECORD_HEADER_LEN: usize = 8 + 4 + 4;
 pub enum WalError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("wal overload: {0}")]
+    Backpressure(String),
+
+    #[error("wal writer stopped")]
+    WriterStopped,
+
+    #[error("invalid wal config: {0}")]
+    InvalidConfig(String),
 
     #[error("log corruption: {0}")]
     Corruption(String),
@@ -32,6 +43,8 @@ pub struct WalConfig {
     /// Call fsync if at least this duration has elapsed since the last fsync.
     /// Checked on each append. If `None`, do not fsync based on time.
     pub fsync_interval: Option<Duration>,
+    /// Capacity for the WAL write channel. When full, appends return an error.
+    pub channel_capacity: usize,
 }
 
 impl Default for WalConfig {
@@ -39,6 +52,7 @@ impl Default for WalConfig {
         Self {
             fsync_every_n: Some(64),
             fsync_interval: None,
+            channel_capacity: 1024,
         }
     }
 }
@@ -50,30 +64,37 @@ pub struct WalRecord {
 }
 
 #[derive(Debug)]
-struct WalInner {
-    file: File,
-    /// Next logical id to assign.
-    next_id: u64,
-    /// In-memory index: logical id -> file offset of the record header.
-    index: HashMap<u64, u64>,
-    /// Offset in the file where the next record will be written.
-    write_offset: u64,
-    /// Number of records appended since the last fsync.
-    unflushed_records: usize,
-    /// Instant at which the last fsync occurred.
-    last_fsync: Instant,
-    /// Flush policy configuration.
-    config: WalConfig,
-    /// Number of records appended in this process.
-    append_count: u64,
-    /// Total bytes appended in this process, including record headers.
-    bytes_written: u64,
+pub struct WriteAheadLog {
+    path: PathBuf,
+    index: Arc<Mutex<HashMap<u64, u64>>>,
+    sender: mpsc::Sender<WalMessage>,
+    next_id: AtomicU64,
+    append_count: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
-pub struct WriteAheadLog {
-    path: PathBuf,
-    inner: Mutex<WalInner>,
+struct WalWriteRequest {
+    id: u64,
+    header: [u8; RECORD_HEADER_LEN],
+    payload: Bytes,
+}
+
+#[derive(Debug)]
+enum WalMessage {
+    Record(WalWriteRequest),
+    Flush(oneshot::Sender<Result<(), WalError>>),
+}
+
+struct WalWriter {
+    file: File,
+    write_offset: u64,
+    unflushed_records: usize,
+    last_fsync: Instant,
+    config: WalConfig,
+    receiver: mpsc::Receiver<WalMessage>,
+    append_count: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
 }
 
 impl WriteAheadLog {
@@ -120,21 +141,42 @@ impl WriteAheadLog {
         // Rebuild in-memory index and determine next_id / write_offset.
         let (index, next_id, write_offset) = rebuild_index(&mut file).await?;
 
-        let inner = WalInner {
+        if config.channel_capacity == 0 {
+            return Err(WalError::InvalidConfig(
+                "channel_capacity must be greater than 0".to_string(),
+            ));
+        }
+
+        let (sender, receiver) = mpsc::channel(config.channel_capacity);
+        let index = Arc::new(Mutex::new(index));
+        let append_count = Arc::new(AtomicU64::new(0));
+        let bytes_written = Arc::new(AtomicU64::new(0));
+
+        let writer = WalWriter {
             file,
-            next_id,
-            index,
             write_offset,
             unflushed_records: 0,
             last_fsync: Instant::now(),
-            config,
-            append_count: 0,
-            bytes_written: 0,
+            config: config.clone(),
+            receiver,
+            append_count: Arc::clone(&append_count),
+            bytes_written: Arc::clone(&bytes_written),
         };
+
+        let writer_index = Arc::clone(&index);
+        tokio::spawn(async move {
+            if let Err(err) = writer.run(writer_index).await {
+                error!("wal writer stopped with error: {err}");
+            }
+        });
 
         Ok(Self {
             path: path_ref.to_path_buf(),
-            inner: Mutex::new(inner),
+            index,
+            sender,
+            next_id: AtomicU64::new(next_id),
+            append_count,
+            bytes_written,
         })
     }
 
@@ -142,13 +184,7 @@ impl WriteAheadLog {
     #[inline(always)]
     #[tracing::instrument(skip(self, data))]
     pub async fn append(&self, data: &[u8]) -> Result<u64, WalError> {
-        let mut inner = self.inner.lock().await;
-
-        let id = inner.next_id;
-        inner.next_id = inner.next_id.wrapping_add(1);
-
-        let record_offset = inner.write_offset;
-
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut header = [0u8; RECORD_HEADER_LEN];
         header[..8].copy_from_slice(&id.to_le_bytes());
         let len_u32 = u32::try_from(data.len())
@@ -160,56 +196,55 @@ impl WriteAheadLog {
         let crc = hasher.finalize();
         header[12..16].copy_from_slice(&crc.to_le_bytes());
 
-        inner.file.write_all(&header).await?;
-        inner.file.write_all(data).await?;
+        let request = WalWriteRequest {
+            id,
+            header,
+            payload: Bytes::copy_from_slice(data),
+        };
 
-        inner.write_offset += RECORD_HEADER_LEN as u64 + data.len() as u64;
-        inner.index.insert(id, record_offset);
-        inner.append_count = inner.append_count.saturating_add(1);
-        inner.bytes_written = inner
-            .bytes_written
-            .saturating_add(RECORD_HEADER_LEN as u64 + data.len() as u64);
-
-        inner.unflushed_records += 1;
-        maybe_sync(&mut inner).await?;
-
+        self.sender
+            .try_send(WalMessage::Record(request))
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    WalError::Backpressure("wal channel full".to_string())
+                }
+                mpsc::error::TrySendError::Closed(_) => WalError::WriterStopped,
+            })?;
         Ok(id)
     }
 
     /// Force a flush of buffered data and an fsync, regardless of configuration.
     pub async fn flush(&self) -> Result<(), WalError> {
-        let mut inner = self.inner.lock().await;
-        inner.file.flush().await?;
-        inner.file.sync_data().await?;
-        inner.unflushed_records = 0;
-        inner.last_fsync = Instant::now();
-        Ok(())
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(WalMessage::Flush(sender))
+            .await
+            .map_err(|_| WalError::WriterStopped)?;
+        receiver.await.map_err(|_| WalError::WriterStopped)?
     }
 
     /// Return the number of WAL appends and total bytes written since this
     /// process started.
     pub async fn metrics(&self) -> (u64, u64) {
-        let inner = self.inner.lock().await;
-        (inner.append_count, inner.bytes_written)
+        (
+            self.append_count.load(Ordering::Relaxed),
+            self.bytes_written.load(Ordering::Relaxed),
+        )
     }
 
     /// Iterate over all records starting at the first record whose id is >= `from_id`.
     pub async fn iterate_from(&self, from_id: u64) -> Result<Vec<WalRecord>, WalError> {
         // Find starting file offset from the index.
         let (start_offset, min_id) = {
-            let inner = self.inner.lock().await;
+            let inner = self.index.lock().await;
 
-            if inner.index.is_empty() {
+            if inner.is_empty() {
                 return Ok(Vec::new());
             }
 
             // Find the smallest id >= from_id.
-            let mut matching_ids: Vec<u64> = inner
-                .index
-                .keys()
-                .copied()
-                .filter(|id| *id >= from_id)
-                .collect();
+            let mut matching_ids: Vec<u64> =
+                inner.keys().copied().filter(|id| *id >= from_id).collect();
 
             if matching_ids.is_empty() {
                 return Ok(Vec::new());
@@ -218,7 +253,6 @@ impl WriteAheadLog {
             matching_ids.sort_unstable();
             let min_id = matching_ids[0];
             let offset = *inner
-                .index
                 .get(&min_id)
                 .expect("index missing offset for known id");
 
@@ -253,8 +287,134 @@ impl WriteAheadLog {
 
     /// Lookup the file offset for a given logical id. Mainly useful for tests and diagnostics.
     pub async fn lookup_offset(&self, id: u64) -> Option<u64> {
-        let inner = self.inner.lock().await;
-        inner.index.get(&id).copied()
+        let inner = self.index.lock().await;
+        inner.get(&id).copied()
+    }
+}
+
+impl WalWriter {
+    async fn run(mut self, index: Arc<Mutex<HashMap<u64, u64>>>) -> Result<(), WalError> {
+        while let Some(message) = self.receiver.recv().await {
+            match message {
+                WalMessage::Record(record) => {
+                    let (records, pending_flush) = self.collect_batch(record).await;
+                    self.write_batch(records, &index).await?;
+                    if let Some(flush_sender) = pending_flush {
+                        let result = self.flush_file().await;
+                        let _ = flush_sender.send(result);
+                    }
+                }
+                WalMessage::Flush(sender) => {
+                    let result = self.flush_file().await;
+                    let _ = sender.send(result);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn collect_batch(
+        &mut self,
+        first: WalWriteRequest,
+    ) -> (
+        Vec<WalWriteRequest>,
+        Option<oneshot::Sender<Result<(), WalError>>>,
+    ) {
+        let mut records = vec![first];
+        let mut pending_flush = None;
+
+        loop {
+            match self.receiver.try_recv() {
+                Ok(WalMessage::Record(record)) => {
+                    records.push(record);
+                }
+                Ok(WalMessage::Flush(sender)) => {
+                    pending_flush = Some(sender);
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        (records, pending_flush)
+    }
+
+    async fn write_batch(
+        &mut self,
+        records: Vec<WalWriteRequest>,
+        index: &Arc<Mutex<HashMap<u64, u64>>>,
+    ) -> Result<(), WalError> {
+        let mut buffer_len = 0usize;
+        for record in &records {
+            buffer_len += RECORD_HEADER_LEN + record.payload.len();
+        }
+
+        let mut buffer = Vec::with_capacity(buffer_len);
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut current_offset = self.write_offset;
+
+        for record in &records {
+            offsets.push((record.id, current_offset));
+            current_offset += (RECORD_HEADER_LEN + record.payload.len()) as u64;
+            buffer.extend_from_slice(&record.header);
+            buffer.extend_from_slice(&record.payload);
+        }
+
+        self.file.write_all(&buffer).await?;
+        self.write_offset = current_offset;
+
+        {
+            let mut guard = index.lock().await;
+            for (id, offset) in offsets {
+                guard.insert(id, offset);
+            }
+        }
+
+        let total_bytes = buffer.len() as u64;
+        self.append_count
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
+
+        self.unflushed_records = self.unflushed_records.saturating_add(records.len());
+        self.maybe_sync().await?;
+
+        Ok(())
+    }
+
+    async fn flush_file(&mut self) -> Result<(), WalError> {
+        self.file.flush().await?;
+        self.file.sync_data().await?;
+        self.unflushed_records = 0;
+        self.last_fsync = Instant::now();
+        Ok(())
+    }
+
+    async fn maybe_sync(&mut self) -> Result<(), WalError> {
+        let mut should_sync = false;
+
+        if let Some(every_n) = self.config.fsync_every_n {
+            if self.unflushed_records >= every_n {
+                should_sync = true;
+            }
+        }
+
+        if !should_sync {
+            if let Some(interval) = self.config.fsync_interval {
+                if self.last_fsync.elapsed() >= interval {
+                    should_sync = true;
+                }
+            }
+        }
+
+        if should_sync {
+            let span = tracing::trace_span!("wal_flush");
+            let _guard = span.enter();
+            self.flush_file().await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -391,35 +551,6 @@ async fn read_next_record_with_offset(
     let total_len = RECORD_HEADER_LEN as u64 + len as u64;
 
     Ok(Some((id, Bytes::from(payload), current_offset, total_len)))
-}
-
-async fn maybe_sync(inner: &mut WalInner) -> Result<(), WalError> {
-    let mut should_sync = false;
-
-    if let Some(every_n) = inner.config.fsync_every_n {
-        if inner.unflushed_records >= every_n {
-            should_sync = true;
-        }
-    }
-
-    if !should_sync {
-        if let Some(interval) = inner.config.fsync_interval {
-            if inner.last_fsync.elapsed() >= interval {
-                should_sync = true;
-            }
-        }
-    }
-
-    if should_sync {
-        let span = tracing::trace_span!("wal_flush");
-        let _guard = span.enter();
-        inner.file.flush().await?;
-        inner.file.sync_data().await?;
-        inner.unflushed_records = 0;
-        inner.last_fsync = Instant::now();
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
