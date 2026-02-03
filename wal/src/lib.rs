@@ -195,12 +195,33 @@ impl WriteAheadLog {
 
     /// Iterate over all records starting at the first record whose id is >= `from_id`.
     pub async fn iterate_from(&self, from_id: u64) -> Result<Vec<WalRecord>, WalError> {
+        let mut records = Vec::new();
+        self.iterate_from_stream(from_id, |record| {
+            records.push(record);
+            async { Ok(()) }
+        })
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Stream records starting at the first record whose id is >= `from_id`.
+    pub async fn iterate_from_stream<F, Fut, E>(
+        &self,
+        from_id: u64,
+        mut on_record: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(WalRecord) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+        E: From<WalError>,
+    {
         // Find starting file offset from the index.
         let (start_offset, min_id) = {
             let inner = self.inner.lock().await;
 
             if inner.index.is_empty() {
-                return Ok(Vec::new());
+                return Ok(());
             }
 
             // Find the smallest id >= from_id.
@@ -212,7 +233,7 @@ impl WriteAheadLog {
                 .collect();
 
             if matching_ids.is_empty() {
-                return Ok(Vec::new());
+                return Ok(());
             }
 
             matching_ids.sort_unstable();
@@ -225,25 +246,25 @@ impl WriteAheadLog {
             (offset, min_id)
         };
 
-        let mut file = File::open(&self.path).await?;
-        file.seek(std::io::SeekFrom::Start(start_offset)).await?;
-
-        let mut records = Vec::new();
+        let mut file = File::open(&self.path).await.map_err(E::from)?;
+        file.seek(std::io::SeekFrom::Start(start_offset))
+            .await
+            .map_err(E::from)?;
 
         loop {
-            match read_next_record(&mut file).await? {
+            match read_next_record(&mut file).await.map_err(E::from)? {
                 None => break,
                 Some((id, payload)) => {
                     if id < min_id {
                         continue;
                     }
 
-                    records.push(WalRecord { id, payload });
+                    on_record(WalRecord { id, payload }).await?;
                 }
             }
         }
 
-        Ok(records)
+        Ok(())
     }
 
     /// Access the underlying log path.

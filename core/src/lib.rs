@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
-use wal::{WalError as LogError, WalRecord, WriteAheadLog};
+use wal::{WalError as LogError, WriteAheadLog};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QoSLevel {
@@ -592,12 +592,22 @@ impl Broker {
             None => return Ok(()),
         };
 
-        let records: Vec<WalRecord> = wal.iterate_from(1).await?;
-        for record in records {
-            let msg = WalMessageRecord::decode(&record.payload)?;
-            let topic = TopicName::new(msg.topic);
-            self.publish_with_wal_id(&topic, msg.payload, msg.qos, Some(record.id));
-        }
+        let mut processed = 0usize;
+        let yield_every = 1024usize;
+        wal.iterate_from_stream(1, |record| {
+            processed += 1;
+            let should_yield = processed % yield_every == 0;
+            async move {
+                let msg = WalMessageRecord::decode(&record.payload)?;
+                let topic = TopicName::new(msg.topic);
+                self.publish_with_wal_id(&topic, msg.payload, msg.qos, Some(record.id));
+                if should_yield {
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            }
+        })
+        .await?;
 
         Ok(())
     }
