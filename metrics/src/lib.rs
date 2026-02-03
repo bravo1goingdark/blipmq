@@ -25,11 +25,13 @@ async fn handle_request(
     let published = broker.messages_published_total();
     let delivered = broker.messages_delivered_total();
     let inflight = broker.inflight_message_count();
+    let expiration_heap = broker.expiration_heap_size();
+    let retry_heap = broker.retry_heap_size();
 
     let (wal_appends_total, wal_bytes_total) = wal.metrics().await;
 
     let body = format!(
-        "topics {topics}\nsubscribers {subscribers}\nmessages_published_total {published}\nmessages_delivered_total {delivered}\nmessages_inflight {inflight}\nwal_appends_total {wal_appends_total}\nwal_bytes_total {wal_bytes_total}\n"
+        "topics {topics}\nsubscribers {subscribers}\nmessages_published_total {published}\nmessages_delivered_total {delivered}\nmessages_inflight {inflight}\nsubscriber_expiration_heap_size {expiration_heap}\nsubscriber_retry_heap_size {retry_heap}\nwal_appends_total {wal_appends_total}\nwal_bytes_total {wal_bytes_total}\n"
     );
 
     Ok(Response::new(Body::from(body)))
