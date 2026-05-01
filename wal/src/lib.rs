@@ -17,9 +17,20 @@ const HEADER_MAGIC: &[u8; 8] = b"BLIPWAL\0";
 // v2: CRC covers `id` and `len` header fields in addition to the payload,
 // so a bit flip in the framing bytes is detected on replay (previously
 // `id` and `len` were not protected).
-const HEADER_VERSION: u32 = 2;
+// v3: WAL is now a directory of segments (`wal-NNNNNNNNNNNNNNNNNNNN.log`)
+// rather than a single growing file. Each segment carries this same
+// header. Bumped because old single-file WALs from v2 won't be auto-
+// migrated; users with existing v2 files should drain them before
+// upgrading.
+const HEADER_VERSION: u32 = 3;
 const HEADER_LEN: u64 = 32;
 const RECORD_HEADER_LEN: usize = 8 + 4 + 4;
+
+const SEGMENT_PREFIX: &str = "wal-";
+const SEGMENT_SUFFIX: &str = ".log";
+/// Default per-segment size in bytes: 256 MiB. Configurable via
+/// `WalConfig::segment_bytes`.
+const DEFAULT_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -49,6 +60,9 @@ pub struct WalConfig {
     pub fsync_interval: Option<Duration>,
     /// Capacity for the WAL write channel. When full, appends return an error.
     pub channel_capacity: usize,
+    /// Roll to a new segment when the current segment grows past this many
+    /// bytes (header + records). Default 256 MiB.
+    pub segment_bytes: u64,
 }
 
 impl Default for WalConfig {
@@ -57,6 +71,7 @@ impl Default for WalConfig {
             fsync_every_n: Some(64),
             fsync_interval: None,
             channel_capacity: 1024,
+            segment_bytes: DEFAULT_SEGMENT_BYTES,
         }
     }
 }
@@ -67,10 +82,19 @@ pub struct WalRecord {
     pub payload: Bytes,
 }
 
+/// Where in the segmented WAL a record lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordLocation {
+    pub segment_seq: u64,
+    pub offset_in_segment: u64,
+}
+
 #[derive(Debug)]
 pub struct WriteAheadLog {
-    path: PathBuf,
-    index: Arc<Mutex<HashMap<u64, u64>>>,
+    dir: PathBuf,
+    /// In-memory id → (segment_seq, offset) index. Rebuilt at open time
+    /// by scanning all segments under `dir`.
+    index: Arc<Mutex<HashMap<u64, RecordLocation>>>,
     sender: mpsc::Sender<WalMessage>,
     next_id: AtomicU64,
     append_count: Arc<AtomicU64>,
@@ -95,8 +119,13 @@ enum WalMessage {
 }
 
 struct WalWriter {
+    dir: PathBuf,
+    /// Currently-active segment file. New writes go here; rolls over once
+    /// `current_offset` would exceed `segment_bytes`.
     file: File,
-    write_offset: u64,
+    current_segment_seq: u64,
+    current_offset: u64,
+    segment_bytes: u64,
     unflushed_records: usize,
     last_fsync: Instant,
     config: WalConfig,
@@ -112,54 +141,102 @@ struct WalWriter {
 }
 
 impl WriteAheadLog {
-    /// Open or create a write-ahead log at the given path with default configuration.
+    /// Open or create a write-ahead log at the given directory with default configuration.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, WalError> {
         Self::open_with_config(path, WalConfig::default()).await
     }
 
-    /// Open or create a write-ahead log at the given path with the given configuration.
+    /// Open or create a write-ahead log at the given directory with the given configuration.
+    /// `path` is interpreted as a **directory**: WAL segments live inside as
+    /// `wal-NNNNNNNNNNNNNNNNNNNN.log` files.
     pub async fn open_with_config<P: AsRef<Path>>(
         path: P,
         config: WalConfig,
     ) -> Result<Self, WalError> {
-        let path_ref = path.as_ref();
-        if let Some(parent) = path_ref.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).await?;
-            }
-        }
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path_ref)
-            .await?;
-
-        let metadata = file.metadata().await?;
-        let len = metadata.len();
-
-        if len == 0 {
-            // New file: write header.
-            write_header(&mut file).await?;
-        } else if len < HEADER_LEN {
-            return Err(WalError::Corruption(
-                "file too small to contain header".to_string(),
-            ));
-        } else {
-            // Existing file: validate header.
-            validate_header(&mut file).await?;
-        }
-
-        // Rebuild in-memory index and determine next_id / write_offset.
-        let (index, next_id, write_offset) = rebuild_index(&mut file).await?;
-
         if config.channel_capacity == 0 {
             return Err(WalError::InvalidConfig(
                 "channel_capacity must be greater than 0".to_string(),
             ));
         }
+        if config.segment_bytes < HEADER_LEN + RECORD_HEADER_LEN as u64 {
+            return Err(WalError::InvalidConfig(
+                "segment_bytes too small to hold one record".to_string(),
+            ));
+        }
+
+        let dir = path.as_ref().to_path_buf();
+
+        // Migration guard: if the path exists as a regular file, it's a
+        // pre-segmentation WAL. Refuse rather than silently shadowing.
+        if let Ok(meta) = std::fs::metadata(&dir) {
+            if meta.is_file() {
+                return Err(WalError::InvalidConfig(format!(
+                    "{} is a file; segmented WAL expects a directory. \
+                     Drain old single-file WALs before upgrading.",
+                    dir.display()
+                )));
+            }
+        }
+        fs::create_dir_all(&dir).await?;
+
+        // Scan segments. If empty, create segment 1.
+        let mut segment_seqs = list_segment_seqs(&dir).await?;
+        segment_seqs.sort_unstable();
+
+        let mut index: HashMap<u64, RecordLocation> = HashMap::new();
+        let mut next_id: u64 = 1;
+        let (current_seq, current_offset, current_file) = if segment_seqs.is_empty() {
+            // Fresh WAL: create segment 1 with header.
+            let seq = 1;
+            let segment_path = segment_path(&dir, seq);
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&segment_path)
+                .await?;
+            write_header(&mut file).await?;
+            (seq, HEADER_LEN, file)
+        } else {
+            // Validate every segment header and rebuild the index by
+            // walking every record in every segment in order.
+            let mut tail_seq = *segment_seqs.last().unwrap();
+            let mut tail_offset = HEADER_LEN;
+            for &seq in &segment_seqs {
+                let segment_path = segment_path(&dir, seq);
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&segment_path)
+                    .await?;
+                validate_header(&mut file).await?;
+                let (seg_records, _next_id_in_seg, end_offset) =
+                    rebuild_segment_index(&mut file).await?;
+                for (id, offset) in seg_records {
+                    index.insert(
+                        id,
+                        RecordLocation {
+                            segment_seq: seq,
+                            offset_in_segment: offset,
+                        },
+                    );
+                    if id >= next_id {
+                        next_id = id.wrapping_add(1);
+                    }
+                }
+                tail_seq = seq;
+                tail_offset = end_offset;
+            }
+            // Reopen the tail segment with append semantics for the writer.
+            let tail_path = segment_path(&dir, tail_seq);
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tail_path)
+                .await?;
+            file.seek(std::io::SeekFrom::Start(tail_offset)).await?;
+            (tail_seq, tail_offset, file)
+        };
 
         let (sender, receiver) = mpsc::channel(config.channel_capacity);
         let index = Arc::new(Mutex::new(index));
@@ -167,8 +244,11 @@ impl WriteAheadLog {
         let bytes_written = Arc::new(AtomicU64::new(0));
 
         let writer = WalWriter {
-            file,
-            write_offset,
+            dir: dir.clone(),
+            file: current_file,
+            current_segment_seq: current_seq,
+            current_offset,
+            segment_bytes: config.segment_bytes,
             unflushed_records: 0,
             last_fsync: Instant::now(),
             config: config.clone(),
@@ -187,7 +267,7 @@ impl WriteAheadLog {
         });
 
         Ok(Self {
-            path: path_ref.to_path_buf(),
+            dir,
             index,
             sender,
             next_id: AtomicU64::new(next_id),
@@ -201,9 +281,6 @@ impl WriteAheadLog {
     /// **Channel-gated**: returns as soon as the record is queued for the
     /// writer task. The record is *not* guaranteed to be on disk when this
     /// returns. Use [`Self::append_durable`] for fsync-gated semantics.
-    ///
-    /// Takes `Bytes` rather than `&[u8]` so callers that already hold a
-    /// `Bytes` (e.g. inbound PUBLISH payload) avoid an extra copy.
     #[inline(always)]
     #[tracing::instrument(skip(self, data))]
     pub async fn append(&self, data: Bytes) -> Result<u64, WalError> {
@@ -213,8 +290,7 @@ impl WriteAheadLog {
     }
 
     /// Append a record and wait for the next fsync that covers it. When this
-    /// returns `Ok`, the record is durable on disk. This is the strict-
-    /// durability path used for QoS1 publishes.
+    /// returns `Ok`, the record is durable on disk.
     #[inline]
     #[tracing::instrument(skip(self, data))]
     pub async fn append_durable(&self, data: Bytes) -> Result<u64, WalError> {
@@ -237,7 +313,7 @@ impl WriteAheadLog {
             .map_err(|_| WalError::Corruption("record too large".to_string()))?;
         header[8..12].copy_from_slice(&len_u32.to_le_bytes());
 
-        // CRC covers (id, len, payload). v1 covered only payload.
+        // CRC covers (id, len, payload).
         let mut hasher = Crc32Hasher::new();
         hasher.update(&header[..12]);
         hasher.update(&data);
@@ -285,47 +361,56 @@ impl WriteAheadLog {
         )
     }
 
-    /// Iterate over all records starting at the first record whose id is >= `from_id`.
+    /// Iterate over all records starting at the first record whose id is
+    /// >= `from_id`, walking segments in order.
     pub async fn iterate_from(&self, from_id: u64) -> Result<Vec<WalRecord>, WalError> {
-        // Find starting file offset from the index.
-        let (start_offset, min_id) = {
+        // Determine starting segment by finding the smallest id >= from_id
+        // and looking up its segment_seq. From there, walk that segment to
+        // its end, then continue across subsequent segments.
+        let (start_seq, start_offset, min_id) = {
             let inner = self.index.lock();
-
             if inner.is_empty() {
                 return Ok(Vec::new());
             }
-
-            // Find the smallest id >= from_id.
-            let mut matching_ids: Vec<u64> =
-                inner.keys().copied().filter(|id| *id >= from_id).collect();
-
-            if matching_ids.is_empty() {
+            let mut matching: Vec<(u64, RecordLocation)> = inner
+                .iter()
+                .filter(|(id, _)| **id >= from_id)
+                .map(|(id, loc)| (*id, *loc))
+                .collect();
+            if matching.is_empty() {
                 return Ok(Vec::new());
             }
-
-            matching_ids.sort_unstable();
-            let min_id = matching_ids[0];
-            let offset = *inner
-                .get(&min_id)
-                .expect("index missing offset for known id");
-
-            (offset, min_id)
+            matching.sort_unstable_by_key(|(id, _)| *id);
+            let (min_id, loc) = matching[0];
+            (loc.segment_seq, loc.offset_in_segment, min_id)
         };
 
-        let mut file = File::open(&self.path).await?;
-        file.seek(std::io::SeekFrom::Start(start_offset)).await?;
-
+        let mut all_seqs = list_segment_seqs(&self.dir).await?;
+        all_seqs.sort_unstable();
         let mut records = Vec::new();
 
-        loop {
-            match read_next_record(&mut file).await? {
-                None => break,
-                Some((id, payload)) => {
-                    if id < min_id {
-                        continue;
+        for &seq in all_seqs.iter().filter(|s| **s >= start_seq) {
+            let path = segment_path(&self.dir, seq);
+            let mut file = File::open(&path).await?;
+            let start_offset_for_segment = if seq == start_seq {
+                start_offset
+            } else {
+                HEADER_LEN
+            };
+            file.seek(std::io::SeekFrom::Start(start_offset_for_segment))
+                .await?;
+            let mut offset = start_offset_for_segment;
+            loop {
+                match read_next_record_with_offset(&mut file, offset).await? {
+                    Some((id, payload, _record_offset, total_len)) => {
+                        if id >= min_id {
+                            records.push(WalRecord { id, payload });
+                        }
+                        offset = offset
+                            .checked_add(total_len)
+                            .ok_or_else(|| WalError::Corruption("offset overflow".to_string()))?;
                     }
-
-                    records.push(WalRecord { id, payload });
+                    None => break,
                 }
             }
         }
@@ -333,20 +418,21 @@ impl WriteAheadLog {
         Ok(records)
     }
 
-    /// Access the underlying log path.
+    /// Access the underlying log directory.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.dir
     }
 
-    /// Lookup the file offset for a given logical id. Mainly useful for tests and diagnostics.
-    pub async fn lookup_offset(&self, id: u64) -> Option<u64> {
+    /// Lookup the (segment_seq, offset) for a given logical id. Useful for
+    /// tests and diagnostics.
+    pub async fn lookup_offset(&self, id: u64) -> Option<RecordLocation> {
         let inner = self.index.lock();
         inner.get(&id).copied()
     }
 }
 
 impl WalWriter {
-    async fn run(mut self, index: Arc<Mutex<HashMap<u64, u64>>>) -> Result<(), WalError> {
+    async fn run(mut self, index: Arc<Mutex<HashMap<u64, RecordLocation>>>) -> Result<(), WalError> {
         while let Some(message) = self.receiver.recv().await {
             match message {
                 WalMessage::Record(record) => {
@@ -397,21 +483,40 @@ impl WalWriter {
     async fn write_batch(
         &mut self,
         records: Vec<WalWriteRequest>,
-        index: &Arc<Mutex<HashMap<u64, u64>>>,
+        index: &Arc<Mutex<HashMap<u64, RecordLocation>>>,
     ) -> Result<(), WalError> {
-        // Reuse the writer's batch buffer; clear (preserves capacity) instead
-        // of re-allocating per batch.
-        self.batch_buf.clear();
-        let mut offsets = Vec::with_capacity(records.len());
-        let mut current_offset = self.write_offset;
+        // Compute total batch size to decide whether to roll.
+        let batch_size: u64 = records
+            .iter()
+            .map(|r| RECORD_HEADER_LEN as u64 + r.payload.len() as u64)
+            .sum();
 
-        // Drain durable_ack senders out of the records before we move
-        // payloads into the buffer; we'll signal them after fsync.
+        // If adding this batch would push the current segment past
+        // `segment_bytes` AND the current segment already holds at least
+        // one record beyond the header, roll to a new segment first. Never
+        // roll on an empty segment (would create an empty file).
+        if self.current_offset > HEADER_LEN
+            && self.current_offset.saturating_add(batch_size) > self.segment_bytes
+        {
+            self.roll_segment().await?;
+        }
+
+        self.batch_buf.clear();
+        let mut offsets: Vec<(u64, RecordLocation)> = Vec::with_capacity(records.len());
+        let mut current_offset = self.current_offset;
+        let current_seq = self.current_segment_seq;
+
         let mut new_acks: Vec<oneshot::Sender<Result<(), WalError>>> =
             Vec::with_capacity(records.len());
 
         for mut record in records {
-            offsets.push((record.id, current_offset));
+            offsets.push((
+                record.id,
+                RecordLocation {
+                    segment_seq: current_seq,
+                    offset_in_segment: current_offset,
+                },
+            ));
             current_offset += (RECORD_HEADER_LEN + record.payload.len()) as u64;
             self.batch_buf.extend_from_slice(&record.header);
             self.batch_buf.extend_from_slice(&record.payload);
@@ -424,12 +529,12 @@ impl WalWriter {
         let total_bytes = self.batch_buf.len() as u64;
 
         self.file.write_all(&self.batch_buf).await?;
-        self.write_offset = current_offset;
+        self.current_offset = current_offset;
 
         {
             let mut guard = index.lock();
-            for (id, offset) in offsets {
-                guard.insert(id, offset);
+            for (id, loc) in offsets {
+                guard.insert(id, loc);
             }
         }
 
@@ -438,22 +543,37 @@ impl WalWriter {
         self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
 
         self.unflushed_records = self.unflushed_records.saturating_add(total_records);
-        // Defer durable acks to the next fsync. If `maybe_sync` fires below
-        // because of a record-count or interval threshold, all pending acks
-        // (including these new ones) get signaled inside `flush_file`.
-        // Otherwise they stay queued until the next fsync.
         self.pending_durable_acks.extend(new_acks);
 
-        // If any record requested durable ack, force a sync now so callers
-        // don't wait for the next batch / interval. This keeps p99 latency
-        // bounded for QoS1 publishers; the cost is amortized across the
-        // whole batch (group commit).
         if !self.pending_durable_acks.is_empty() {
             self.flush_file().await?;
         } else {
             self.maybe_sync().await?;
         }
 
+        Ok(())
+    }
+
+    async fn roll_segment(&mut self) -> Result<(), WalError> {
+        // Flush + fsync the current segment so we never lose records that
+        // were in flight when the new segment was created.
+        self.flush_file().await?;
+
+        let next_seq = self.current_segment_seq.checked_add(1).ok_or_else(|| {
+            WalError::Corruption("segment sequence overflow".to_string())
+        })?;
+        let path = segment_path(&self.dir, next_seq);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        write_header(&mut file).await?;
+
+        self.file = file;
+        self.current_segment_seq = next_seq;
+        self.current_offset = HEADER_LEN;
         Ok(())
     }
 
@@ -465,9 +585,6 @@ impl WalWriter {
         }
         .await;
 
-        // Fan the outcome out to all queued durable-ack senders so callers
-        // wake. WalError isn't Clone, so on error we string-format once and
-        // hand each waiter a fresh Corruption with that message.
         let err_msg: Option<String> = result
             .as_ref()
             .err()
@@ -514,11 +631,40 @@ impl WalWriter {
     }
 }
 
+/// Build the path for segment `seq`. The name is zero-padded to 20 digits
+/// (u64 max) so lex-sort matches numeric order.
+fn segment_path(dir: &Path, seq: u64) -> PathBuf {
+    dir.join(format!("{SEGMENT_PREFIX}{seq:020}{SEGMENT_SUFFIX}"))
+}
+
+/// Parse a segment filename like `wal-00000000000000000007.log` into 7.
+/// Returns `None` if the filename doesn't match.
+fn parse_segment_seq(name: &str) -> Option<u64> {
+    let s = name.strip_prefix(SEGMENT_PREFIX)?.strip_suffix(SEGMENT_SUFFIX)?;
+    s.parse::<u64>().ok()
+}
+
+async fn list_segment_seqs(dir: &Path) -> Result<Vec<u64>, WalError> {
+    let mut seqs = Vec::new();
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(seqs),
+        Err(err) => return Err(WalError::Io(err)),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(seq) = parse_segment_seq(name) {
+                seqs.push(seq);
+            }
+        }
+    }
+    Ok(seqs)
+}
+
 async fn write_header(file: &mut File) -> Result<(), WalError> {
     let mut buf = [0u8; HEADER_LEN as usize];
     buf[..8].copy_from_slice(HEADER_MAGIC);
     buf[8..12].copy_from_slice(&HEADER_VERSION.to_le_bytes());
-    // Remaining bytes are reserved / zero.
     file.write_all(&buf).await?;
     file.flush().await?;
     file.sync_data().await?;
@@ -555,8 +701,12 @@ async fn validate_header(file: &mut File) -> Result<(), WalError> {
     Ok(())
 }
 
-async fn rebuild_index(file: &mut File) -> Result<(HashMap<u64, u64>, u64, u64), WalError> {
-    let mut index = HashMap::new();
+/// Walk one segment from end-of-header to EOF (or first corruption),
+/// returning (records_in_segment, next_id_after_segment, end_offset).
+async fn rebuild_segment_index(
+    file: &mut File,
+) -> Result<(Vec<(u64, u64)>, u64, u64), WalError> {
+    let mut records = Vec::new();
     let mut next_id = 1u64;
 
     file.seek(std::io::SeekFrom::Start(HEADER_LEN)).await?;
@@ -565,11 +715,11 @@ async fn rebuild_index(file: &mut File) -> Result<(HashMap<u64, u64>, u64, u64),
     loop {
         match read_next_record_with_offset(file, offset).await {
             Ok(Some((id, _payload, record_offset, total_len))) => {
-                index.insert(id, record_offset);
+                records.push((id, record_offset));
                 next_id = id.wrapping_add(1);
                 offset = offset
                     .checked_add(total_len)
-                    .ok_or_else(|| WalError::Corruption("log offset overflow".to_string()))?;
+                    .ok_or_else(|| WalError::Corruption("offset overflow".to_string()))?;
             }
             Ok(None) => break,
             Err(WalError::Corruption(reason)) => {
@@ -580,15 +730,7 @@ async fn rebuild_index(file: &mut File) -> Result<(HashMap<u64, u64>, u64, u64),
         }
     }
 
-    Ok((index, next_id, offset))
-}
-
-async fn read_next_record(file: &mut File) -> Result<Option<(u64, Bytes)>, WalError> {
-    match read_next_record_with_offset(file, 0).await {
-        Ok(Some((id, payload, _offset, _len))) => Ok(Some((id, payload))),
-        Ok(None) => Ok(None),
-        Err(e) => Err(e),
-    }
+    Ok((records, next_id, offset))
 }
 
 async fn read_next_record_with_offset(
@@ -601,10 +743,8 @@ async fn read_next_record_with_offset(
         let n = file.read(&mut header[read..]).await?;
         if n == 0 {
             return if read == 0 {
-                // Clean EOF.
                 Ok(None)
             } else {
-                // Partial header at end of file: treat as no further records.
                 Ok(None)
             };
         }
@@ -628,14 +768,11 @@ async fn read_next_record_with_offset(
     while read_payload < len {
         let n = file.read(&mut payload[read_payload..]).await?;
         if n == 0 {
-            // Partial payload at end of file: treat tail as not present.
             return Ok(None);
         }
         read_payload += n;
     }
 
-    // CRC v2 covers the (id, len) header bytes plus the payload. v1 covered
-    // only the payload, so a flip in the framing bytes went undetected.
     let mut hasher = Crc32Hasher::new();
     hasher.update(&header[..12]);
     hasher.update(&payload);
@@ -656,17 +793,19 @@ async fn read_next_record_with_offset(
 mod tests {
     use super::*;
 
-    fn wal_path(name: &str) -> PathBuf {
+    /// Test helper: returns a fresh-empty directory under `temp_dir()` for
+    /// the named WAL. Removes any leftover from a previous run.
+    fn wal_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("wal_test_{name}.log"));
-        let _ = std::fs::remove_file(&path);
+        path.push(format!("wal_test_{name}"));
+        let _ = std::fs::remove_dir_all(&path);
         path
     }
 
     #[tokio::test]
     async fn append_and_iterate_roundtrip() {
-        let path = wal_path("roundtrip");
-        let wal = WriteAheadLog::open(&path).await.unwrap();
+        let dir = wal_dir("roundtrip");
+        let wal = WriteAheadLog::open(&dir).await.unwrap();
 
         let id1 = wal.append(Bytes::from_static(b"first")).await.unwrap();
         let id2 = wal.append(Bytes::from_static(b"second")).await.unwrap();
@@ -682,21 +821,22 @@ mod tests {
 
     #[tokio::test]
     async fn corruption_is_detected() {
-        let path = wal_path("corruption");
+        let dir = wal_dir("corruption");
         {
-            let wal = WriteAheadLog::open(&path).await.unwrap();
+            let wal = WriteAheadLog::open(&dir).await.unwrap();
             let _ = wal.append(Bytes::from_static(b"good")).await.unwrap();
             let _ = wal.append(Bytes::from_static(b"also good")).await.unwrap();
             wal.flush().await.unwrap();
         }
 
-        // Corrupt a byte near the end of the file.
+        // Corrupt a byte near the end of segment 1.
         use std::io::{Read, Seek, SeekFrom, Write};
 
+        let segment_1 = segment_path(&dir, 1);
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)
+            .open(&segment_1)
             .unwrap();
 
         file.seek(SeekFrom::End(-1)).unwrap();
@@ -707,35 +847,33 @@ mod tests {
         file.write_all(&byte).unwrap();
         file.flush().unwrap();
 
-        let err = WriteAheadLog::open(&path).await.unwrap_err();
+        let err = WriteAheadLog::open(&dir).await.unwrap_err();
         match err {
             WalError::Corruption(_) => {}
             other => panic!("expected corruption error, got {other:?}"),
         }
     }
 
-    /// v2 CRC covers (id, len, payload). A bit flip in the `id` bytes used
-    /// to go undetected (v1 CRC was payload-only). Reopen must fail with
-    /// Corruption.
+    /// v3 CRC covers (id, len, payload). Flip a bit in the `id` field of
+    /// the first record; reopen must fail with Corruption.
     #[tokio::test]
     async fn header_corruption_caught_by_crc_v2() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        let path = wal_path("header_corruption");
+        let dir = wal_dir("header_corruption");
         {
-            let wal = WriteAheadLog::open(&path).await.unwrap();
+            let wal = WriteAheadLog::open(&dir).await.unwrap();
             let _ = wal.append(Bytes::from_static(b"first")).await.unwrap();
             let _ = wal.append(Bytes::from_static(b"second")).await.unwrap();
             wal.flush().await.unwrap();
         }
 
-        // Flip the lowest bit of the *id* field of the first record. With v1
-        // CRC this would have been silently accepted; with v2 it must fail.
         let id_offset = HEADER_LEN; // first record's id starts immediately after WAL header
+        let segment_1 = segment_path(&dir, 1);
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)
+            .open(&segment_1)
             .unwrap();
 
         file.seek(SeekFrom::Start(id_offset)).unwrap();
@@ -746,58 +884,117 @@ mod tests {
         file.write_all(&byte).unwrap();
         file.flush().unwrap();
 
-        let err = WriteAheadLog::open(&path).await.unwrap_err();
+        let err = WriteAheadLog::open(&dir).await.unwrap_err();
         assert!(
             matches!(err, WalError::Corruption(_)),
             "expected Corruption, got {err:?}",
         );
     }
 
-    /// Group-commit fsync ACK: append_durable must NOT return until the
-    /// record is on disk. Verified by checking the file length after the
-    /// call returns (without an explicit `flush` first).
+    /// append_durable must not return until the record is on disk.
     #[tokio::test]
     async fn append_durable_blocks_until_on_disk() {
-        let path = wal_path("durable_blocks");
-        let wal = WriteAheadLog::open(&path).await.unwrap();
+        let dir = wal_dir("durable_blocks");
+        let wal = WriteAheadLog::open(&dir).await.unwrap();
 
-        let len_before = std::fs::metadata(&path).unwrap().len();
+        let segment_1 = segment_path(&dir, 1);
+        let len_before = std::fs::metadata(&segment_1).unwrap().len();
         let _ = wal
             .append_durable(Bytes::from_static(b"durable"))
             .await
             .unwrap();
-        let len_after = std::fs::metadata(&path).unwrap().len();
+        let len_after = std::fs::metadata(&segment_1).unwrap().len();
 
-        // The record (header + payload) is at least HEADER_LEN larger than
-        // before; if append_durable returned before fsync, the file might
-        // still be empty/short.
         assert!(
             len_after > len_before,
-            "file did not grow after append_durable: before={len_before} after={len_after}",
+            "segment did not grow after append_durable: before={len_before} after={len_after}",
         );
         assert!(len_after >= len_before + RECORD_HEADER_LEN as u64);
     }
 
     #[tokio::test]
     async fn index_is_rebuilt_on_open() {
-        let path = wal_path("index_rebuild");
+        let dir = wal_dir("index_rebuild");
         let id2;
         {
-            let wal = WriteAheadLog::open(&path).await.unwrap();
+            let wal = WriteAheadLog::open(&dir).await.unwrap();
             let _id1 = wal.append(Bytes::from_static(b"first")).await.unwrap();
             id2 = wal.append(Bytes::from_static(b"second")).await.unwrap();
             let _id3 = wal.append(Bytes::from_static(b"third")).await.unwrap();
             wal.flush().await.unwrap();
         }
 
-        let wal = WriteAheadLog::open(&path).await.unwrap();
+        let wal = WriteAheadLog::open(&dir).await.unwrap();
 
-        let offset = wal.lookup_offset(id2).await;
-        assert!(offset.is_some(), "offset for id2 should be present");
+        let loc = wal.lookup_offset(id2).await;
+        assert!(loc.is_some(), "location for id2 should be present");
+        assert_eq!(loc.unwrap().segment_seq, 1);
 
         let records = wal.iterate_from(id2).await.unwrap();
         assert!(!records.is_empty());
         assert_eq!(records[0].id, id2);
         assert_eq!(records[0].payload, Bytes::from_static(b"second"));
+    }
+
+    /// Exercise segment rollover: write enough data to force a roll, then
+    /// reopen and verify all records are recovered across both segments.
+    #[tokio::test]
+    async fn segments_roll_at_boundary_and_reopen_recovers_all() {
+        let dir = wal_dir("rollover");
+        // Tiny segment size so a single record (16 B payload + 16 B record
+        // header = 32 B) puts the segment past the limit on the next batch.
+        let config = WalConfig {
+            segment_bytes: HEADER_LEN + RECORD_HEADER_LEN as u64 + 16,
+            ..WalConfig::default()
+        };
+
+        let mut written_ids = Vec::new();
+        {
+            let wal = WriteAheadLog::open_with_config(&dir, config.clone())
+                .await
+                .unwrap();
+            for i in 0..6u8 {
+                let payload = Bytes::from(vec![i; 16]);
+                let id = wal.append(payload).await.unwrap();
+                written_ids.push(id);
+                // Force the writer to flush this record as its own batch
+                // so subsequent batches see a non-empty segment and trigger
+                // the rollover check. Without the flush, all 6 appends
+                // queue together into a single batch and the rollover never
+                // fires because the segment is empty when the batch starts.
+                wal.flush().await.unwrap();
+            }
+        }
+
+        // Verify multiple segment files exist.
+        let mut seqs = list_segment_seqs(&dir).await.unwrap();
+        seqs.sort_unstable();
+        assert!(seqs.len() >= 2, "expected at least 2 segments, got {seqs:?}");
+
+        // Reopen and read everything back.
+        let wal = WriteAheadLog::open_with_config(&dir, config).await.unwrap();
+        let records = wal.iterate_from(written_ids[0]).await.unwrap();
+        assert_eq!(records.len(), 6);
+        for (i, rec) in records.iter().enumerate() {
+            assert_eq!(rec.id, written_ids[i]);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_guard_rejects_old_single_file_wal() {
+        // Create a regular file at the WAL path; open() must reject it
+        // rather than silently shadowing it.
+        let mut path = std::env::temp_dir();
+        path.push("wal_test_old_file");
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"v2 single-file wal contents").unwrap();
+
+        let err = WriteAheadLog::open(&path).await.unwrap_err();
+        assert!(
+            matches!(err, WalError::InvalidConfig(_)),
+            "expected InvalidConfig, got {err:?}",
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
