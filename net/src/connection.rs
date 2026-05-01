@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use corelib::{DeliveryHandle, PushReceiver, PushSender};
+use corelib::{DeliveryEncoder, PushSlot, QoSLevel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -18,27 +18,14 @@ use crate::frame::{
 use crate::server::{FrameResponse, MessageHandler, PublishTopicCache};
 
 const INITIAL_BUFFER_SIZE: usize = 16 * 1024;
-/// Max frames coalesced into one writev/write_all on the wire.
-const MAX_BATCH_FRAMES: usize = 128;
-/// Max bytes coalesced into one writev/write_all on the wire.
+/// Soft byte ceiling on a single `write_all` batch. The writer drains the
+/// shared push slot into a local buffer; once the local buffer reaches this
+/// size, we issue the syscall.
 const MAX_BATCH_BYTES: usize = 256 * 1024;
-/// Bound on per-connection push channel; once full, broker increments
-/// `push_dropped_total` and drops the message (slow-consumer policy in
-/// Phase 6 will replace this with disconnect/configurable behavior).
-const PUSH_CHANNEL_CAPACITY: usize = 65_536;
 /// Bound on the in-band response channel from reader to writer. Holds
 /// ACK/NACK/PONG frames synthesized by the handler. 64 is plenty since
 /// reader awaits the handler one frame at a time.
 const INBAND_CHANNEL_CAPACITY: usize = 64;
-
-/// One frame to be written to the wire. Comes either from a server-initiated
-/// push (DELIVER) or from a synchronous response synthesized by the reader
-/// task (ACK / NACK / PONG / etc).
-#[derive(Debug)]
-enum WriterItem {
-    Deliver(DeliveryHandle),
-    Frame(Frame),
-}
 
 pub struct Connection<H>
 where
@@ -80,25 +67,29 @@ where
 
         let (read_half, write_half) = self.stream.into_split();
 
-        // Push channel: broker -> writer task. Sender is cloned into every
-        // SUBSCRIBE for this connection; receiver lives in the writer task.
-        // We use `flume` here (not `tokio::sync::mpsc`) because per-op
-        // overhead measurably matters at multi-million msg/s; recv_async
-        // integrates cleanly with tokio's runtime.
-        let (push_tx, push_rx) = flume::bounded::<DeliveryHandle>(PUSH_CHANNEL_CAPACITY);
+        // Per-conn shared push slot: broker encodes DELIVER frames directly
+        // into `slot.buf` under the parking_lot mutex and pings
+        // `slot.notify`. Writer task wakes, swaps `slot.buf` for an empty
+        // local buffer, and `write_all`s the swapped buffer.
+        //
+        // This replaces the previous flume::Sender<DeliveryHandle> hop with
+        // a single mutex acquire + `notify_one` per delivery. The writer's
+        // per-frame encode step is also gone — encoding happens inline on
+        // the broker side via the `DeliveryEncoder` registered at
+        // subscribe time.
+        let push_slot = Arc::new(PushSlot::new(INITIAL_BUFFER_SIZE));
 
         // In-band channel: reader -> writer for handler-synthesized frames
-        // (ACK/NACK/PONG/Subscribe-ACK/etc). Decouples reader from blocking
-        // on the wire. Stays on tokio::sync::mpsc because (a) it's not on
-        // the hot path and (b) we already use tokio::select! over both
-        // channels together.
+        // (ACK/NACK/PONG/Subscribe-ACK/etc). Stays on tokio::sync::mpsc
+        // because it's not on the hot path.
         let (inband_tx, inband_rx) = mpsc::channel::<Frame>(INBAND_CHANNEL_CAPACITY);
 
         let writer_shutdown = self.shutdown.clone();
+        let writer_slot = push_slot.clone();
         let writer_jh = tokio::spawn(writer_task(
             conn_id,
             write_half,
-            push_rx,
+            writer_slot,
             inband_rx,
             writer_shutdown,
         ));
@@ -106,6 +97,7 @@ where
         let reader_shutdown = self.shutdown.clone();
         let reader_handler = handler.clone();
         let reader_auth = self.auth_validator.clone();
+        let reader_slot = push_slot.clone();
         let reader_jh = tokio::spawn(async move {
             let mut reader = ReaderState::new(
                 conn_id,
@@ -113,7 +105,7 @@ where
                 reader_handler,
                 reader_auth,
                 reader_shutdown,
-                push_tx,
+                reader_slot,
                 inband_tx,
             );
             if let Err(err) = reader.run().await {
@@ -137,105 +129,102 @@ where
 async fn writer_task(
     conn_id: u64,
     mut write_half: OwnedWriteHalf,
-    push_rx: PushReceiver,
+    slot: Arc<PushSlot>,
     mut inband_rx: mpsc::Receiver<Frame>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut buf = BytesMut::with_capacity(INITIAL_BUFFER_SIZE);
+    // Local "active" buffer: we swap it for the shared `slot.buf` so the
+    // broker never blocks on us holding the lock during write_all.
+    let mut local = BytesMut::with_capacity(INITIAL_BUFFER_SIZE);
 
     loop {
-        // Block until we have something to write, or shutdown. flume's
-        // recv_async returns Err once the last Sender is dropped.
-        let first = tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            d = push_rx.recv_async() => match d {
-                Ok(d) => WriterItem::Deliver(d),
-                Err(_) => {
-                    // No more push senders; only inband can fire from now on.
-                    match inband_rx.recv().await {
-                        Some(f) => WriterItem::Frame(f),
-                        None => break,
-                    }
-                }
-            },
-            f = inband_rx.recv() => match f {
-                Some(f) => WriterItem::Frame(f),
-                None => {
-                    match push_rx.recv_async().await {
-                        Ok(d) => WriterItem::Deliver(d),
-                        Err(_) => break,
-                    }
-                }
-            },
-        };
-
-        if let Err(err) = encode_into(&mut buf, first) {
-            error!("conn {} encode error: {}", conn_id, err);
-            return;
-        }
-        let mut frames_in_batch = 1usize;
-
-        // Drain push channel as fast as possible — this is the hot path for
-        // server-initiated DELIVERs. Only fall back to checking inband once
-        // push is empty.
-        while frames_in_batch < MAX_BATCH_FRAMES && buf.len() < MAX_BATCH_BYTES {
-            match push_rx.try_recv() {
-                Ok(d) => {
-                    if encode_into(&mut buf, WriterItem::Deliver(d)).is_err() {
-                        break;
-                    }
-                    frames_in_batch += 1;
-                }
-                Err(flume::TryRecvError::Empty) => break,
-                Err(flume::TryRecvError::Disconnected) => break,
+        // 1. Take whatever the broker has accumulated in the shared slot.
+        {
+            let mut shared = slot.buf.lock();
+            if !shared.is_empty() {
+                std::mem::swap(&mut *shared, &mut local);
             }
         }
-        // Drain any inband responses (ACK/NACK/PONG) that piled up.
-        while frames_in_batch < MAX_BATCH_FRAMES && buf.len() < MAX_BATCH_BYTES {
+
+        // 2. Drain any in-band responses (ACK/NACK/PONG) that piled up.
+        while local.len() < MAX_BATCH_BYTES {
             match inband_rx.try_recv() {
                 Ok(f) => {
-                    if encode_into(&mut buf, WriterItem::Frame(f)).is_err() {
+                    if frame::encode_frame(&f, &mut local).is_err() {
                         break;
                     }
-                    frames_in_batch += 1;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
 
-        // Single syscall for the whole batch (TCP_NODELAY ensures it goes
-        // straight to the wire without additional Nagle coalescing).
-        if let Err(err) = write_half.write_all(&buf).await {
-            debug!("conn {} write error: {}", conn_id, err);
-            return;
+        // 3. Flush whatever we have in one syscall (TCP_NODELAY is on, so
+        //    the kernel hands it straight to the wire).
+        if !local.is_empty() {
+            if let Err(err) = write_half.write_all(&local).await {
+                debug!("conn {} write error: {}", conn_id, err);
+                return;
+            }
+            local.clear();
+            continue; // immediately re-check the slot in case more arrived
         }
-        buf.clear();
+
+        // 4. Nothing to flush -- wait for either a push notification or a
+        //    new inband frame. `notified()` consumes any pending permit
+        //    that fired between (1) and now, so we don't deadlock.
+        let notified = slot.notify.notified();
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = notified => {}
+            f = inband_rx.recv() => {
+                match f {
+                    Some(f) => {
+                        if frame::encode_frame(&f, &mut local).is_err() {
+                            return;
+                        }
+                    }
+                    None => {
+                        // Reader dropped; finish anything pending in the
+                        // shared slot, then exit. Lock-and-swap, then drop
+                        // the guard before awaiting (parking_lot guards
+                        // aren't Send).
+                        {
+                            let mut shared = slot.buf.lock();
+                            if !shared.is_empty() {
+                                std::mem::swap(&mut *shared, &mut local);
+                            }
+                        }
+                        if !local.is_empty() {
+                            let _ = write_half.write_all(&local).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
-    // Best-effort graceful close. Ignore errors here; the peer may already
-    // be gone.
+    // Best-effort graceful close.
     let _ = write_half.shutdown().await;
 }
 
-#[inline(always)]
-fn encode_into(buf: &mut BytesMut, item: WriterItem) -> Result<(), Error> {
-    match item {
-        WriterItem::Deliver(d) => {
-            let qos_byte = match d.qos {
-                corelib::QoSLevel::AtMostOnce => 0,
-                corelib::QoSLevel::AtLeastOnce => 1,
-            };
-            // Single-pass encode: no intermediate Bytes, no topic.to_string()
-            // clone, no payload memcpy beyond the one into `buf`.
-            encode_deliver_frame(buf, qos_byte, d.delivery_tag, d.topic.as_str(), &d.payload)?;
-        }
-        WriterItem::Frame(f) => {
-            frame::encode_frame(&f, buf)?;
-        }
-    }
-    Ok(())
+/// Build the encoder closure used by the broker on every push delivery.
+/// Encodes a complete DELIVER frame (length-prefix + header + payload) into
+/// the shared push buffer with no intermediate allocations.
+fn make_deliver_encoder() -> DeliveryEncoder {
+    Arc::new(|buf, qos, tag, topic, payload| {
+        let qos_byte = match qos {
+            QoSLevel::AtMostOnce => 0,
+            QoSLevel::AtLeastOnce => 1,
+        };
+        // encode_deliver_frame returns Err only on absurdly large payloads
+        // (>16 MiB topic/message); in that case we drop the frame rather
+        // than poison the buffer mid-encode. The broker's QoS1 inflight
+        // tracking still has the record so retries can recover.
+        let _ = encode_deliver_frame(buf, qos_byte, tag, topic, payload);
+    })
 }
 
 // ---- reader task -----------------------------------------------------------
@@ -249,7 +238,8 @@ where
     handler: H,
     auth_validator: Arc<dyn ApiKeyValidator>,
     shutdown: watch::Receiver<bool>,
-    push_tx: PushSender,
+    push_slot: Arc<PushSlot>,
+    push_encoder: DeliveryEncoder,
     inband_tx: mpsc::Sender<Frame>,
     read_buf: BytesMut,
     hello_performed: bool,
@@ -270,7 +260,7 @@ where
         handler: H,
         auth_validator: Arc<dyn ApiKeyValidator>,
         shutdown: watch::Receiver<bool>,
-        push_tx: PushSender,
+        push_slot: Arc<PushSlot>,
         inband_tx: mpsc::Sender<Frame>,
     ) -> Self {
         Self {
@@ -279,7 +269,8 @@ where
             handler,
             auth_validator,
             shutdown,
-            push_tx,
+            push_slot,
+            push_encoder: make_deliver_encoder(),
             inband_tx,
             read_buf: BytesMut::with_capacity(INITIAL_BUFFER_SIZE),
             hello_performed: false,
@@ -341,7 +332,12 @@ where
 
                 let response = if frame.msg_type == FrameType::Subscribe {
                     self.handler
-                        .handle_subscribe_push(self.id, frame, self.push_tx.clone())
+                        .handle_subscribe_slot(
+                            self.id,
+                            frame,
+                            self.push_slot.clone(),
+                            self.push_encoder.clone(),
+                        )
                         .await
                 } else {
                     self.handler.handle_frame(self.id, frame).await

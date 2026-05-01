@@ -4,7 +4,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use auth::ApiKeyValidator;
 use bytes::Bytes;
-use corelib::{Broker, ClientId, DeliveryTag, PushSender, QoSLevel, SubscriptionId, TopicName};
+use corelib::{
+    Broker, ClientId, DeliveryEncoder, DeliveryTag, PushSender, PushSlot, QoSLevel, SubscriptionId,
+    TopicName,
+};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
@@ -30,15 +33,29 @@ pub enum FrameResponse {
 pub trait MessageHandler: Send + Sync + 'static {
     async fn handle_frame(&self, conn_id: u64, frame: Frame) -> Result<FrameResponse, Error>;
 
-    /// Handle a SUBSCRIBE frame in v2 push mode. The handler is given the
-    /// connection's push Sender so it can register the subscription with the
-    /// broker via `subscribe_with_conn`. Default impl falls back to the
-    /// non-push `handle_frame`, which keeps tests/mocks working.
+    /// Handle a SUBSCRIBE frame in v2 push mode (legacy channel-based).
+    /// The handler is given the connection's push Sender so it can register
+    /// the subscription with the broker via `subscribe_with_conn`. Default
+    /// impl falls back to the non-push `handle_frame`.
     async fn handle_subscribe_push(
         &self,
         conn_id: u64,
         frame: Frame,
         _push_tx: PushSender,
+    ) -> Result<FrameResponse, Error> {
+        self.handle_frame(conn_id, frame).await
+    }
+
+    /// Handle a SUBSCRIBE frame using the shared-buffer push path (v2 fast
+    /// path). The handler registers the subscription via
+    /// `subscribe_with_slot`, providing the slot + encoder pair created by
+    /// the connection. Default impl falls back to the channel-based push.
+    async fn handle_subscribe_slot(
+        &self,
+        conn_id: u64,
+        frame: Frame,
+        _slot: Arc<PushSlot>,
+        _encoder: DeliveryEncoder,
     ) -> Result<FrameResponse, Error> {
         self.handle_frame(conn_id, frame).await
     }
@@ -288,6 +305,62 @@ impl MessageHandler for BrokerHandler {
         let sub_id = self
             .broker
             .subscribe_with_conn(client_id, topic, qos, conn_id, push_tx);
+
+        let ack_payload = AckPayload {
+            subscription_id: sub_id.value(),
+        }
+        .encode()?;
+
+        Ok(FrameResponse::Frame(Frame {
+            msg_type: FrameType::Ack,
+            correlation_id: frame.correlation_id,
+            payload: ack_payload,
+        }))
+    }
+
+    async fn handle_subscribe_slot(
+        &self,
+        conn_id: u64,
+        frame: Frame,
+        slot: Arc<PushSlot>,
+        encoder: DeliveryEncoder,
+    ) -> Result<FrameResponse, Error> {
+        let payload = match SubscribePayload::decode(&frame.payload) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(FrameResponse::Frame(self.make_nack(
+                    frame.correlation_id,
+                    400,
+                    "invalid SUBSCRIBE payload",
+                )?));
+            }
+        };
+
+        if payload.topic.is_empty() {
+            return Ok(FrameResponse::Frame(self.make_nack(
+                frame.correlation_id,
+                400,
+                "empty topic",
+            )?));
+        }
+
+        let qos = match self.qos_from_u8(payload.qos) {
+            Some(q) => q,
+            None => {
+                return Ok(FrameResponse::Frame(self.make_nack(
+                    frame.correlation_id,
+                    400,
+                    "invalid QoS value",
+                )?));
+            }
+        };
+
+        let client_id = ClientId::new(format!("conn-{conn_id}"));
+        let topic = TopicName::new(payload.topic);
+
+        let sub_id = self
+            .broker
+            .subscribe_with_slot(client_id, topic, qos, conn_id, slot, encoder);
 
         let ack_payload = AckPayload {
             subscription_id: sub_id.value(),

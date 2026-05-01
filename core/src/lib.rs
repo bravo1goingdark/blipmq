@@ -8,16 +8,51 @@ use std::time::Duration;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
+use tokio::sync::Notify;
 use wal::{WalError as LogError, WalRecord, WriteAheadLog};
 
 /// Push channel type used to forward `DeliveryHandle`s from the broker hot
-/// path to a connection's writer task. We use `flume` instead of
-/// `tokio::sync::mpsc` because the per-op overhead is materially lower
-/// (measured ~3-5x faster on `try_send`/`try_recv` workloads) and it has
-/// the same single-consumer / multi-producer shape we need. `flume`'s
-/// `Receiver::recv_async` integrates cleanly with tokio's runtime.
+/// path to a connection's writer task. Used for the **legacy push path**
+/// (`subscribe_with_conn`); the newer `subscribe_with_slot` path is the
+/// faster shared-buffer alternative used by the v2 wire layer.
 pub type PushSender = flume::Sender<DeliveryHandle>;
 pub type PushReceiver = flume::Receiver<DeliveryHandle>;
+
+/// Shared push buffer for the v2 high-throughput delivery path. The broker
+/// encodes DELIVER frames directly into `buf` under the mutex and pings
+/// `notify`; the connection's writer task wakes, swaps `buf` for an empty
+/// `BytesMut`, and `write_all`s the swapped buffer in one syscall.
+///
+/// This is the alternative to the flume-channel push path. It removes the
+/// per-frame channel-op overhead (~150 ns / frame) and the writer's
+/// per-frame DELIVER-encode step by collapsing both into a single
+/// "encode-into-shared-buffer" step on the broker side.
+#[derive(Debug)]
+pub struct PushSlot {
+    pub buf: Mutex<BytesMut>,
+    pub notify: Notify,
+}
+
+impl PushSlot {
+    pub fn new(initial_capacity: usize) -> Self {
+        Self {
+            buf: Mutex::new(BytesMut::with_capacity(initial_capacity)),
+            notify: Notify::new(),
+        }
+    }
+}
+
+/// Closure type that encodes a single DELIVER frame into a `BytesMut`. The
+/// broker calls this once per push delivery; the connection's writer task
+/// later flushes the buffer to the wire. Defined here (rather than in
+/// `net`) so corelib can drive the broker hot path without taking a net
+/// dependency; the actual frame format lives in the net crate and is
+/// passed in via this closure at subscribe time.
+pub type DeliveryEncoder = Arc<
+    dyn Fn(&mut BytesMut, /*qos*/ QoSLevel, /*tag*/ u64, /*topic*/ &str, /*payload*/ &Bytes)
+        + Send
+        + Sync,
+>;
 
 /// Inline capacity for the per-publish subscriber snapshot. Most topics in
 /// the wild have a handful of subscribers; sizing the inline buffer at 16
@@ -246,20 +281,36 @@ impl SubscriptionShards {
     }
 }
 
-#[derive(Debug)]
 struct Subscriber {
     #[allow(dead_code)]
     client_id: ClientId,
     queue: SubscriberQueue,
-    /// When `Some`, this is a v2 push subscription: enqueue forwards
-    /// directly to this Sender (no Mutex on the QoS0 path) and the
-    /// connection's writer task drains the corresponding Receiver.
-    /// When `None`, this is a v1 poll subscription using `queue` only.
+    /// When `Some`, this is a legacy v2-channel push subscription: enqueue
+    /// forwards directly to this `flume::Sender`. Kept for tests and any
+    /// caller still using the channel API.
     push_sender: Option<PushSender>,
+    /// When `Some`, this is the v2 shared-buffer push subscription: the
+    /// broker encodes DELIVER frames directly into `slot.buf` under the
+    /// mutex and pings `slot.notify`. Used by the network layer's writer
+    /// task on the hot path.
+    push_slot: Option<(Arc<PushSlot>, DeliveryEncoder)>,
     /// Lock-free monotonic delivery-tag source for the push path. Decoupled
     /// from `SubscriberQueueInner::next_tag` so QoS0 push enqueue takes no
     /// mutex.
     push_next_tag: AtomicU64,
+}
+
+// Manual Debug impl: DeliveryEncoder is a `dyn Fn` and doesn't impl Debug.
+impl std::fmt::Debug for Subscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscriber")
+            .field("client_id", &self.client_id)
+            .field("queue", &self.queue)
+            .field("push_sender", &self.push_sender.is_some())
+            .field("push_slot", &self.push_slot.is_some())
+            .field("push_next_tag", &self.push_next_tag)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -731,7 +782,7 @@ impl Broker {
         topic: TopicName,
         qos: QoSLevel,
     ) -> SubscriptionId {
-        self.subscribe_inner(client_id, topic, qos, None, None)
+        self.subscribe_inner(client_id, topic, qos, None, None, None)
     }
 
     /// Subscribe in push mode (v2). Messages are forwarded directly into the
@@ -746,7 +797,30 @@ impl Broker {
         conn_id: u64,
         push_sender: PushSender,
     ) -> SubscriptionId {
-        self.subscribe_inner(client_id, topic, qos, Some(conn_id), Some(push_sender))
+        self.subscribe_inner(client_id, topic, qos, Some(conn_id), Some(push_sender), None)
+    }
+
+    /// Subscribe in shared-buffer push mode (v2 fast path). Messages are
+    /// encoded directly into `slot.buf` by `encoder` and signaled via
+    /// `slot.notify`. The connection's writer task drains the buffer with
+    /// a single `write_all` per drain.
+    pub fn subscribe_with_slot(
+        &self,
+        client_id: ClientId,
+        topic: TopicName,
+        qos: QoSLevel,
+        conn_id: u64,
+        slot: Arc<PushSlot>,
+        encoder: DeliveryEncoder,
+    ) -> SubscriptionId {
+        self.subscribe_inner(
+            client_id,
+            topic,
+            qos,
+            Some(conn_id),
+            None,
+            Some((slot, encoder)),
+        )
     }
 
     fn subscribe_inner(
@@ -756,12 +830,14 @@ impl Broker {
         qos: QoSLevel,
         conn_id: Option<u64>,
         push_sender: Option<PushSender>,
+        push_slot: Option<(Arc<PushSlot>, DeliveryEncoder)>,
     ) -> SubscriptionId {
         let queue = SubscriberQueue::new(qos, self.config.per_subscriber_queue_capacity);
         let subscriber = Arc::new(Subscriber {
             client_id,
             queue,
             push_sender,
+            push_slot,
             push_next_tag: AtomicU64::new(1),
         });
 
@@ -863,16 +939,32 @@ impl Broker {
         };
 
         for (sub_id, subscriber) in snapshot.iter() {
-            if let Some(sender) = &subscriber.push_sender {
-                // Push fast path. QoS0: zero locks (atomic tag + try_send).
-                // QoS1: still atomic tag + try_send, plus a brief inner lock
-                // to register inflight for ack/retry tracking.
+            if let Some((slot, encoder)) = &subscriber.push_slot {
+                // Shared-buffer push (v2 fast path): encode the DELIVER
+                // frame directly into the conn's shared BytesMut and ping
+                // the writer. No channel hop, no separate writer-side
+                // encode step.
+                let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
+                if qos == QoSLevel::AtLeastOnce {
+                    subscriber.queue.register_push_inflight(
+                        DeliveryTag(tag),
+                        payload.clone(),
+                        wal_id,
+                        Some(self.config.message_ttl),
+                    );
+                }
+                let wire_tag = if qos == QoSLevel::AtLeastOnce { tag } else { 0 };
+                {
+                    let mut buf = slot.buf.lock();
+                    encoder(&mut buf, qos, wire_tag, topic_name.as_str(), &payload);
+                }
+                slot.notify.notify_one();
+                let _ = sub_id; // unused on this path
+            } else if let Some(sender) = &subscriber.push_sender {
+                // Legacy channel-based push.
                 let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
 
                 if qos == QoSLevel::AtLeastOnce {
-                    // Track inflight for ack/retry. Reuses the existing inner
-                    // mutex; this lock is per-subscriber and only contended
-                    // by ack/maintenance, never by other publishers.
                     subscriber.queue.register_push_inflight(
                         DeliveryTag(tag),
                         payload.clone(),
@@ -892,8 +984,6 @@ impl Broker {
                 if sender.try_send(handle).is_err() {
                     self.push_dropped_total.fetch_add(1, Ordering::Relaxed);
                     if qos == QoSLevel::AtLeastOnce {
-                        // Roll back the inflight registration we just made,
-                        // since the message will not be delivered.
                         subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
                     }
                 }
