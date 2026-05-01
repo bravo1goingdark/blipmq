@@ -389,6 +389,48 @@ impl PartialOrd for RetryEntry {
     }
 }
 
+/// Discriminator for WAL record payload kinds. The first byte of every
+/// broker-level WAL record encoding is one of these. The on-wire WAL
+/// record framing (id/len/crc/payload) is unchanged; this is purely a
+/// payload-level convention so we can distinguish published-message
+/// records from acknowledgement records.
+const WAL_KIND_MESSAGE: u8 = 1;
+const WAL_KIND_ACK: u8 = 2;
+
+/// Broker-level entry stored in the WAL. Messages are durable
+/// publications; Acks record that a particular (client, topic) consumer
+/// has acknowledged delivery of `acked_wal_id`. Ack records let
+/// `replay_from_wal` skip messages already delivered before a crash.
+#[derive(Debug, Clone)]
+enum WalEntry {
+    Message(WalMessageRecord),
+    Ack(WalAckRecord),
+}
+
+impl WalEntry {
+    fn encode(&self) -> Result<Bytes, LogError> {
+        match self {
+            WalEntry::Message(m) => m.encode_with_kind(),
+            WalEntry::Ack(a) => a.encode_with_kind(),
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, LogError> {
+        if bytes.is_empty() {
+            return Err(LogError::Corruption("empty WAL entry".to_string()));
+        }
+        match bytes[0] {
+            WAL_KIND_MESSAGE => {
+                Ok(WalEntry::Message(WalMessageRecord::decode_after_kind(&bytes[1..])?))
+            }
+            WAL_KIND_ACK => Ok(WalEntry::Ack(WalAckRecord::decode_after_kind(&bytes[1..])?)),
+            other => Err(LogError::Corruption(format!(
+                "unknown WAL entry kind {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WalMessageRecord {
     topic: String,
@@ -396,9 +438,68 @@ struct WalMessageRecord {
     payload: Bytes,
 }
 
+#[derive(Debug, Clone)]
+struct WalAckRecord {
+    client_id: String,
+    topic: String,
+    acked_wal_id: u64,
+}
+
+impl WalAckRecord {
+    fn encode_with_kind(&self) -> Result<Bytes, LogError> {
+        let cid_bytes = self.client_id.as_bytes();
+        let topic_bytes = self.topic.as_bytes();
+        let cid_len = u16::try_from(cid_bytes.len())
+            .map_err(|_| LogError::Corruption("client_id too long for WAL ack".to_string()))?;
+        let topic_len = u16::try_from(topic_bytes.len())
+            .map_err(|_| LogError::Corruption("topic too long for WAL ack".to_string()))?;
+
+        let mut buf = BytesMut::with_capacity(
+            1 + 2 + cid_bytes.len() + 2 + topic_bytes.len() + 8,
+        );
+        buf.put_u8(WAL_KIND_ACK);
+        buf.put_u16(cid_len);
+        buf.put_slice(cid_bytes);
+        buf.put_u16(topic_len);
+        buf.put_slice(topic_bytes);
+        buf.put_u64(self.acked_wal_id);
+        Ok(buf.freeze())
+    }
+
+    fn decode_after_kind(bytes: &[u8]) -> Result<Self, LogError> {
+        if bytes.len() < 2 {
+            return Err(LogError::Corruption("ack record too short".to_string()));
+        }
+        let mut slice = bytes;
+        let cid_len = slice.get_u16() as usize;
+        if slice.remaining() < cid_len + 2 {
+            return Err(LogError::Corruption("ack: cid len overflow".to_string()));
+        }
+        let cid_bytes = slice.copy_to_bytes(cid_len);
+        let client_id = String::from_utf8(cid_bytes.to_vec())
+            .map_err(|_| LogError::Corruption("ack: invalid client_id utf8".to_string()))?;
+
+        let topic_len = slice.get_u16() as usize;
+        if slice.remaining() < topic_len + 8 {
+            return Err(LogError::Corruption("ack: topic len overflow".to_string()));
+        }
+        let topic_bytes = slice.copy_to_bytes(topic_len);
+        let topic = String::from_utf8(topic_bytes.to_vec())
+            .map_err(|_| LogError::Corruption("ack: invalid topic utf8".to_string()))?;
+
+        let acked_wal_id = slice.get_u64();
+        Ok(Self {
+            client_id,
+            topic,
+            acked_wal_id,
+        })
+    }
+}
+
 impl WalMessageRecord {
-    fn encode(&self) -> Result<Bytes, LogError> {
+    fn encode_with_kind(&self) -> Result<Bytes, LogError> {
         let mut buf = BytesMut::new();
+        buf.put_u8(WAL_KIND_MESSAGE);
 
         let qos_byte = match self.qos {
             QoSLevel::AtMostOnce => 0u8,
@@ -418,10 +519,12 @@ impl WalMessageRecord {
         Ok(buf.freeze())
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, LogError> {
+    /// Decode the payload of a `WAL_KIND_MESSAGE` entry. The kind byte has
+    /// already been consumed by the caller.
+    fn decode_after_kind(bytes: &[u8]) -> Result<Self, LogError> {
         if bytes.len() < 3 {
             return Err(LogError::Corruption(
-                "WAL record too short to contain header".to_string(),
+                "WAL message record too short".to_string(),
             ));
         }
 
@@ -617,9 +720,13 @@ impl SubscriberQueue {
             .find_map(|tag| inner.pending_entries.get(tag).map(|e| e.payload.clone()))
     }
 
-    fn ack(&self, tag: DeliveryTag) -> bool {
+    /// Returns `Some(wal_id)` if the tag matched an inflight QoS1 entry
+    /// (caller can then journal the ack), or `None` if the tag was unknown.
+    /// `wal_id` is `None` inside the Some when the message was published
+    /// non-durably (no WAL backing).
+    fn ack(&self, tag: DeliveryTag) -> Option<Option<u64>> {
         let mut inner = self.inner.lock();
-        inner.inflight.remove(&tag).is_some()
+        inner.inflight.remove(&tag).map(|entry| entry.wal_id)
     }
 
     fn inflight_len(&self) -> usize {
@@ -1018,13 +1125,13 @@ impl Broker {
             }
         };
 
-        let record = WalMessageRecord {
+        let entry = WalEntry::Message(WalMessageRecord {
             topic: topic.as_str().to_string(),
             qos,
             payload: payload.clone(),
-        };
+        });
 
-        let encoded = record.encode()?;
+        let encoded = entry.encode()?;
         // append_durable returns only after fsync covers this record. This
         // is what makes "publish_durable returned Ok" mean "on disk".
         let wal_id = wal.append_durable(encoded).await?;
@@ -1035,7 +1142,11 @@ impl Broker {
     }
 
     /// Replay all records currently present in the WAL and enqueue them to
-    /// existing subscribers. This is intended for crash recovery.
+    /// the subscriptions present on this broker, **skipping any message
+    /// already covered by an Ack record for the same `(client_id, topic)`
+    /// pair**. The two-pass design lets a restarted broker re-attach
+    /// previously-known consumers (by `client_id`) and recover only the
+    /// undelivered tail of the log instead of replaying everything.
     pub async fn replay_from_wal(&self) -> Result<(), LogError> {
         let wal = match &self.wal {
             Some(w) => w.clone(),
@@ -1043,10 +1154,81 @@ impl Broker {
         };
 
         let records: Vec<WalRecord> = wal.iterate_from(1).await?;
+
+        // Pass 1: build per-(client_id, topic) cursor of "highest acked
+        // wal_id". Any message with wal_id <= cursor for that consumer was
+        // delivered before the crash and should not be re-enqueued.
+        let mut ack_cursors: HashMap<(String, String), u64> = HashMap::new();
+        for record in &records {
+            if let Ok(WalEntry::Ack(ack)) = WalEntry::decode(&record.payload) {
+                let key = (ack.client_id, ack.topic);
+                let entry = ack_cursors.entry(key).or_insert(0);
+                if ack.acked_wal_id > *entry {
+                    *entry = ack.acked_wal_id;
+                }
+            }
+        }
+
+        // Pass 2: re-enqueue Message records to subscribers, filtering by
+        // ack cursors. We bypass the normal fanout (publish_with_wal_id)
+        // because that doesn't know about per-consumer cursors; instead
+        // we walk the topic's subscriber snapshot directly so we can
+        // consult `client_id` per subscriber.
         for record in records {
-            let msg = WalMessageRecord::decode(&record.payload)?;
-            let topic = TopicName::new(msg.topic);
-            self.publish_with_wal_id(&topic, msg.payload, msg.qos, Some(record.id));
+            let entry = match WalEntry::decode(&record.payload) {
+                Ok(e) => e,
+                Err(_) => continue, // already-rotten records are skipped, not fatal
+            };
+            let msg = match entry {
+                WalEntry::Message(m) => m,
+                WalEntry::Ack(_) => continue,
+            };
+
+            let topic_name = TopicName::new(msg.topic.clone());
+            let topic = match self.topics.get(&topic_name) {
+                Some(t) => t,
+                None => continue, // no subscribers for this topic on this broker
+            };
+
+            let snapshot: SubscriberSnapshot<'_> = {
+                let subs = topic.subscribers.read();
+                subs.iter().map(|(id, s)| (*id, s.clone())).collect()
+            };
+
+            for (_sub_id, subscriber) in snapshot.iter() {
+                let cursor_key = (subscriber.client_id.as_str().to_string(), msg.topic.clone());
+                let acked_up_to = ack_cursors.get(&cursor_key).copied().unwrap_or(0);
+                if record.id <= acked_up_to {
+                    // Already delivered + acked before the crash.
+                    continue;
+                }
+                // Re-deliver: enqueue exactly as a fresh publish would,
+                // preserving wal_id so a future ack journals correctly.
+                let payload = msg.payload.clone();
+                let qos = msg.qos;
+                let ttl = Some(self.config.message_ttl);
+                if let Some((slot, encoder)) = &subscriber.push_slot {
+                    let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
+                    if qos == QoSLevel::AtLeastOnce {
+                        subscriber.queue.register_push_inflight(
+                            DeliveryTag(tag),
+                            payload.clone(),
+                            Some(record.id),
+                            ttl,
+                        );
+                    }
+                    let wire_tag = if qos == QoSLevel::AtLeastOnce { tag } else { 0 };
+                    {
+                        let mut buf = slot.buf.lock();
+                        encoder(&mut buf, qos, wire_tag, topic_name.as_str(), &payload);
+                    }
+                    slot.notify.notify_one();
+                } else {
+                    subscriber
+                        .queue
+                        .enqueue(payload, qos, Some(record.id), ttl);
+                }
+            }
         }
 
         Ok(())
@@ -1071,13 +1253,47 @@ impl Broker {
     }
 
     pub fn ack(&self, sub_id: SubscriptionId, tag: DeliveryTag) -> bool {
-        let shard = self.subscriptions.shard_for(sub_id).read();
-        let sub_ref = match shard.get(&sub_id) {
-            Some(r) => r,
-            None => return false,
+        // Look up the inflight entry; capture client_id/topic/wal_id so we
+        // can journal the ack after dropping the shard read lock.
+        let (client_id, topic, wal_id_opt) = {
+            let shard = self.subscriptions.shard_for(sub_id).read();
+            let sub_ref = match shard.get(&sub_id) {
+                Some(r) => r,
+                None => return false,
+            };
+            let wal_id_opt = match sub_ref.subscriber.queue.ack(tag) {
+                Some(wid) => wid,
+                None => return false,
+            };
+            (
+                sub_ref.subscriber.client_id.as_str().to_string(),
+                sub_ref.topic.as_str().to_string(),
+                wal_id_opt,
+            )
         };
 
-        sub_ref.subscriber.queue.ack(tag)
+        // Journal the ack if (a) the message was WAL-backed and (b) the
+        // broker is configured with a WAL. Channel-gated (no fsync wait):
+        // ack records are idempotent, so losing the trailing ack on a
+        // crash just means the message gets redelivered, which the client
+        // is already prepared to handle.
+        if let (Some(wal_id), Some(wal)) = (wal_id_opt, &self.wal) {
+            let entry = WalEntry::Ack(WalAckRecord {
+                client_id,
+                topic,
+                acked_wal_id: wal_id,
+            });
+            if let Ok(encoded) = entry.encode() {
+                // Best-effort: backpressure / writer-stopped errors during
+                // ack-journaling are non-fatal here; the worst case is a
+                // redelivery on replay.
+                let wal = wal.clone();
+                tokio::spawn(async move {
+                    let _ = wal.append(encoded).await;
+                });
+            }
+        }
+        true
     }
 
     /// Total number of QoS1 messages currently tracked as in-flight across
@@ -1475,5 +1691,83 @@ mod tests {
         }
         assert_eq!(received, 2);
         assert_eq!(broker.push_dropped_total(), 8);
+    }
+
+    /// Phase 4: replay must skip already-acked messages on restart. Publish
+    /// 5 messages durably, ack 4 of them, drop the broker, restart with
+    /// the same WAL, re-subscribe with the *same client_id*, replay --
+    /// only the unacked tail (1 message) should be re-delivered.
+    #[tokio::test]
+    async fn ack_journal_skips_already_acked_on_replay() {
+        let mut path = std::env::temp_dir();
+        path.push("core_ack_journal_replay");
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let wal = Arc::new(
+            WriteAheadLog::open(&path)
+                .await
+                .expect("open WAL"),
+        );
+
+        let config = BrokerConfig {
+            default_qos: QoSLevel::AtLeastOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 32,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+        };
+
+        let topic = TopicName::new("ack-journal-topic");
+        let client_id = ClientId::new("client-A");
+
+        // -- pre-crash session --
+        let acked_tags = {
+            let broker = Broker::new_with_wal(config.clone(), wal.clone());
+            let sub_id = broker.subscribe(
+                client_id.clone(),
+                topic.clone(),
+                QoSLevel::AtLeastOnce,
+            );
+
+            let mut tags = Vec::new();
+            for i in 0..5u8 {
+                let payload = Bytes::from(vec![i; 8]);
+                broker
+                    .publish_durable(&topic, payload, QoSLevel::AtLeastOnce)
+                    .await
+                    .unwrap();
+                let polled = broker.poll(sub_id).expect("expected delivery");
+                tags.push(polled.delivery_tag.expect("QoS1 has tag"));
+            }
+            // Ack the first 4 of 5; the last stays inflight at "crash".
+            for tag in &tags[..4] {
+                assert!(broker.ack(sub_id, *tag));
+            }
+            // Give the spawned ack-journal write tasks a moment to flush
+            // through the WAL channel.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            wal.flush().await.unwrap();
+            tags
+        };
+
+        // -- post-crash session: same WAL, same client_id, fresh broker --
+        let broker2 = Broker::new_with_wal(config, wal.clone());
+        let sub_id2 =
+            broker2.subscribe(client_id, topic.clone(), QoSLevel::AtLeastOnce);
+        broker2.replay_from_wal().await.unwrap();
+
+        // Drain whatever the replay enqueued. Should be exactly the 1
+        // unacked message (acked_tags[4] was never acked).
+        let mut redelivered = 0;
+        while let Some(_msg) = broker2.poll(sub_id2) {
+            redelivered += 1;
+        }
+        assert_eq!(
+            redelivered, 1,
+            "expected exactly 1 unacked message to be re-delivered, got {redelivered}",
+        );
+
+        let _ = acked_tags; // silence unused
     }
 }
