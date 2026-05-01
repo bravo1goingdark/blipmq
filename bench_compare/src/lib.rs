@@ -309,7 +309,7 @@ impl BmqClient {
         message: Bytes,
     ) -> Result<(), BenchError> {
         let payload = PublishPayload {
-            topic: topic.to_string(),
+            topic: Bytes::copy_from_slice(topic.as_bytes()),
             qos,
             message,
         }

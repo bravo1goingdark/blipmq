@@ -7,7 +7,10 @@ pub const LENGTH_FIELD_LEN: usize = 4;
 #[allow(dead_code)]
 pub const HEADER_FIXED_LEN: usize = LENGTH_FIELD_LEN + 1 + 8;
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u16 = 1;
+// v1: poll-only delivery (HELLO/AUTH/PUBLISH/SUBSCRIBE/ACK/NACK/PING/PONG/POLL).
+// v2: server-initiated push delivery via DELIVER frames. v1 clients still
+// receive messages via POLL; v2 clients receive DELIVER frames and ignore POLL.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -21,6 +24,7 @@ pub enum FrameType {
     Ping = 0x07,
     Pong = 0x08,
     Poll = 0x09,
+    Deliver = 0x0A,
 }
 
 impl From<FrameType> for u8 {
@@ -43,6 +47,7 @@ impl TryFrom<u8> for FrameType {
             0x07 => Ok(FrameType::Ping),
             0x08 => Ok(FrameType::Pong),
             0x09 => Ok(FrameType::Poll),
+            0x0A => Ok(FrameType::Deliver),
             other => Err(FrameDecodeError::UnknownFrameType(other)),
         }
     }
@@ -204,17 +209,22 @@ impl NackPayload {
 }
 
 /// PUBLISH payload: [u8 qos][u16 topic_len][topic_bytes][message_bytes...]
+///
+/// `topic` and `message` are zero-copy slices of the originating buffer
+/// (they share the underlying `Bytes` allocation). Constructing the topic
+/// as `Bytes` rather than `String` avoids a per-PUBLISH heap allocation on
+/// the broker ingress hot path; UTF-8 is validated in `decode` without
+/// copying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishPayload {
-    pub topic: String,
+    pub topic: Bytes,
     pub qos: u8,
     pub message: Bytes,
 }
 
 impl PublishPayload {
     pub fn encode(&self) -> Result<Bytes, FrameEncodeError> {
-        let topic_bytes = self.topic.as_bytes();
-        let topic_len = topic_bytes.len();
+        let topic_len = self.topic.len();
         let topic_len_u16 =
             u16::try_from(topic_len).map_err(|_| FrameEncodeError::PayloadTooLarge(topic_len))?;
 
@@ -222,7 +232,7 @@ impl PublishPayload {
         let mut buf = BytesMut::with_capacity(1 + 2 + topic_len + message_len);
         buf.put_u8(self.qos);
         buf.put_u16(topic_len_u16);
-        buf.put_slice(topic_bytes);
+        buf.put_slice(&self.topic);
         buf.put_slice(&self.message);
         Ok(buf.freeze())
     }
@@ -240,6 +250,78 @@ impl PublishPayload {
             return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
         }
 
+        // Slice topic out of the parent buffer (refcount bump, no copy).
+        let header_len = 1 + 2;
+        let topic = payload.slice(header_len..header_len + topic_len);
+        // Validate UTF-8 in place; if invalid, refuse the frame.
+        if std::str::from_utf8(&topic).is_err() {
+            return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+        }
+        let message = payload.slice(header_len + topic_len..);
+
+        Ok(Self {
+            topic,
+            qos,
+            message,
+        })
+    }
+
+    /// Convenience for callers that want the topic as `&str`. Since `decode`
+    /// validates UTF-8, this never panics on a `PublishPayload` produced by
+    /// `decode`. For payloads constructed manually, callers must guarantee
+    /// the bytes are valid UTF-8.
+    #[inline]
+    pub fn topic_str(&self) -> &str {
+        // SAFETY: invariant maintained by `decode` and by the public API
+        // contract (manually-built payloads must use UTF-8 bytes).
+        unsafe { std::str::from_utf8_unchecked(&self.topic) }
+    }
+}
+
+/// DELIVER payload (server-initiated, v2): [u8 qos][u64 delivery_tag][u16 topic_len][topic_bytes][message_bytes...]
+///
+/// Mirrors `PublishPayload` plus a `delivery_tag`. The tag is 0 for QoS0
+/// (fire-and-forget) and the broker's monotonic per-subscription tag for QoS1
+/// (used by the client in the subsequent ACK frame).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverPayload {
+    pub qos: u8,
+    pub delivery_tag: u64,
+    pub topic: String,
+    pub message: Bytes,
+}
+
+impl DeliverPayload {
+    pub fn encode(&self) -> Result<Bytes, FrameEncodeError> {
+        let topic_bytes = self.topic.as_bytes();
+        let topic_len = topic_bytes.len();
+        let topic_len_u16 =
+            u16::try_from(topic_len).map_err(|_| FrameEncodeError::PayloadTooLarge(topic_len))?;
+
+        let message_len = self.message.len();
+        let mut buf = BytesMut::with_capacity(1 + 8 + 2 + topic_len + message_len);
+        buf.put_u8(self.qos);
+        buf.put_u64(self.delivery_tag);
+        buf.put_u16(topic_len_u16);
+        buf.put_slice(topic_bytes);
+        buf.put_slice(&self.message);
+        Ok(buf.freeze())
+    }
+
+    pub fn decode(payload: &Bytes) -> Result<Self, FrameDecodeError> {
+        if payload.len() < 1 + 8 + 2 {
+            return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+        }
+
+        let mut slice = &payload[..];
+        let qos = slice.get_u8();
+        let delivery_tag = slice.get_u64();
+        let topic_len = slice.get_u16() as usize;
+
+        if slice.remaining() < topic_len {
+            return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+        }
+
         let topic_bytes = slice.copy_to_bytes(topic_len);
         let topic = String::from_utf8(topic_bytes.to_vec())
             .map_err(|_| FrameDecodeError::InvalidLength(payload.len() as u32))?;
@@ -247,8 +329,9 @@ impl PublishPayload {
         let message = slice.copy_to_bytes(slice.remaining());
 
         Ok(Self {
-            topic,
             qos,
+            delivery_tag,
+            topic,
             message,
         })
     }
@@ -351,6 +434,57 @@ pub fn encode_frame(frame: &Frame, dst: &mut BytesMut) -> Result<(), FrameEncode
     Ok(())
 }
 
+/// Encode a complete DELIVER frame (length prefix + header + payload) into
+/// `dst` in a single pass, with no intermediate `Bytes` allocation. This is
+/// the writer task's hot path; avoiding the allocate→freeze→copy pattern
+/// from `DeliverPayload::encode` + `encode_frame` matters at multi-million
+/// msg/s.
+///
+/// Wire format mirrors `DeliverPayload`:
+///   [u32 frame_len][u8 msg_type=Deliver][u64 correlation_id]
+///     [u8 qos][u64 delivery_tag][u16 topic_len][topic_bytes][message_bytes]
+///
+/// `correlation_id` is set to `delivery_tag` so QoS1 ACKs from the client
+/// can identify which delivery they're acking.
+#[inline(always)]
+pub fn encode_deliver_frame(
+    dst: &mut BytesMut,
+    qos: u8,
+    delivery_tag: u64,
+    topic: &str,
+    message: &[u8],
+) -> Result<(), FrameEncodeError> {
+    let topic_bytes = topic.as_bytes();
+    let topic_len = topic_bytes.len();
+    let topic_len_u16 =
+        u16::try_from(topic_len).map_err(|_| FrameEncodeError::PayloadTooLarge(topic_len))?;
+
+    let message_len = message.len();
+
+    // Frame body = msg_type(1) + correlation_id(8) + qos(1) + delivery_tag(8)
+    //              + topic_len(2) + topic_bytes + message_bytes
+    //            = 20 + topic_len + message_len
+    let frame_body_len: usize = 20usize
+        .checked_add(topic_len)
+        .and_then(|v| v.checked_add(message_len))
+        .ok_or(FrameEncodeError::PayloadTooLarge(message_len))?;
+
+    if frame_body_len > MAX_FRAME_SIZE as usize {
+        return Err(FrameEncodeError::PayloadTooLarge(frame_body_len));
+    }
+
+    dst.reserve(LENGTH_FIELD_LEN + frame_body_len);
+    dst.put_u32(frame_body_len as u32);
+    dst.put_u8(FrameType::Deliver.into());
+    dst.put_u64(delivery_tag); // correlation_id
+    dst.put_u8(qos);
+    dst.put_u64(delivery_tag); // payload tag (mirror; client also reads from frame correlation_id)
+    dst.put_u16(topic_len_u16);
+    dst.put_slice(topic_bytes);
+    dst.put_slice(message);
+    Ok(())
+}
+
 /// Try to decode a single frame from the buffer.
 ///
 /// Returns `Ok(None)` if there is not yet enough data to decode a full frame.
@@ -388,7 +522,9 @@ pub fn try_decode_frame(src: &mut BytesMut) -> Result<Option<Frame>, FrameDecode
     let msg_type_raw = frame_bytes.get_u8();
     let msg_type = FrameType::try_from(msg_type_raw)?;
     let correlation_id = frame_bytes.get_u64();
-    let payload = frame_bytes.copy_to_bytes(frame_bytes.remaining());
+    // Zero-copy: hand the remaining BytesMut tail to the caller as immutable
+    // Bytes via freeze() instead of copying with copy_to_bytes.
+    let payload = frame_bytes.freeze();
 
     Ok(Some(Frame {
         msg_type,
@@ -463,5 +599,34 @@ mod tests {
         // Take only part of the encoded frame.
         let mut partial = full.split_to(3);
         assert!(try_decode_frame(&mut partial).unwrap().is_none());
+    }
+
+    #[test]
+    fn deliver_payload_roundtrip() {
+        let original = DeliverPayload {
+            qos: 1,
+            delivery_tag: 0xDEAD_BEEF_CAFE_F00D,
+            topic: "orders.us.created".to_string(),
+            message: Bytes::from_static(b"hello, deliver"),
+        };
+
+        let encoded = original.encode().expect("encode");
+        // Sanity: 5-byte fixed prefix [qos:1][tag:8][topic_len:2] before topic+message.
+        assert_eq!(encoded.len(), 1 + 8 + 2 + original.topic.len() + original.message.len());
+
+        let decoded = DeliverPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn protocol_version_is_v2() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn deliver_frame_type_decodes() {
+        let raw: u8 = FrameType::Deliver.into();
+        assert_eq!(raw, 0x0A);
+        assert_eq!(FrameType::try_from(0x0A).unwrap(), FrameType::Deliver);
     }
 }

@@ -324,7 +324,7 @@ impl BenchClient {
             QoSLevel::AtLeastOnce => 1,
         };
         let payload = PublishPayload {
-            topic: topic.to_string(),
+            topic: Bytes::copy_from_slice(topic.as_bytes()),
             qos: qos_byte,
             message,
         }

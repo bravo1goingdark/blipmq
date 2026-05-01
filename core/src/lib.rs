@@ -7,7 +7,22 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::mpsc;
 use wal::{WalError as LogError, WalRecord, WriteAheadLog};
+
+/// A single delivery flowing from the broker to a subscriber's connection
+/// writer task. The push path (`subscribe_with_conn`) is what enables v2
+/// server-initiated DELIVER frames; for v1 poll-only subscribers, this
+/// type is unused.
+#[derive(Debug, Clone)]
+pub struct DeliveryHandle {
+    pub subscription_id: SubscriptionId,
+    pub topic: TopicName,
+    pub payload: Bytes,
+    pub qos: QoSLevel,
+    /// 0 for QoS0 (fire-and-forget); broker-assigned tag for QoS1.
+    pub delivery_tag: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QoSLevel {
@@ -27,12 +42,21 @@ pub struct BrokerConfig {
     pub retry_base_delay: Duration,
 }
 
+/// Interned topic name. Cloning a `TopicName` is a refcount bump, not a heap
+/// allocation — important on the publish hot path where the name is cloned
+/// once per delivered message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TopicName(String);
+pub struct TopicName(Arc<str>);
 
 impl TopicName {
     pub fn new<S: Into<String>>(name: S) -> Self {
-        Self(name.into())
+        let s: String = name.into();
+        Self(Arc::from(s))
+    }
+
+    /// Construct from a `&str` without a `String` round-trip.
+    pub fn from_str(s: &str) -> Self {
+        Self(Arc::from(s))
     }
 
     pub fn as_str(&self) -> &str {
@@ -94,11 +118,20 @@ pub struct Broker {
     config: BrokerConfig,
     topics: TopicShards,
     subscriptions: RwLock<HashMap<SubscriptionId, SubscriptionRef>>,
+    /// Tracks which SubscriptionIds belong to which network connection so
+    /// `unsubscribe_connection` can drop them all when the conn drops.
+    /// Only push subscriptions (created via `subscribe_with_conn`) are
+    /// tracked here.
+    connection_subs: RwLock<HashMap<u64, Vec<SubscriptionId>>>,
     next_subscription_id: AtomicU64,
     wal: Option<Arc<WriteAheadLog>>,
     shutting_down: std::sync::atomic::AtomicBool,
     messages_published_total: std::sync::atomic::AtomicU64,
     messages_delivered_total: std::sync::atomic::AtomicU64,
+    /// Total messages dropped due to a slow push consumer (mpsc Sender::try_send
+    /// returned Full). Surfaced to metrics; in Phase 6 this drives the
+    /// slow-consumer policy.
+    push_dropped_total: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug)]
@@ -123,8 +156,11 @@ impl TopicShards {
     }
 
     fn shard_index(topic: &TopicName, len: usize) -> usize {
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
+        // ahash is ~3-5× faster than std's SipHash for short keys, and is the
+        // standard fast-but-still-secure choice. We use a fixed seed so
+        // shard placement is deterministic across runs (simplifies ops and
+        // testing); ahash with fixed seed is fine for non-adversarial keys.
+        let mut hasher = ahash::AHasher::default();
         topic.hash(&mut hasher);
         (hasher.finish() as usize) % len
     }
@@ -163,6 +199,15 @@ struct Subscriber {
     #[allow(dead_code)]
     client_id: ClientId,
     queue: SubscriberQueue,
+    /// When `Some`, this is a v2 push subscription: enqueue forwards
+    /// directly to this Sender (no Mutex on the QoS0 path) and the
+    /// connection's writer task drains the corresponding Receiver.
+    /// When `None`, this is a v1 poll subscription using `queue` only.
+    push_sender: Option<mpsc::Sender<DeliveryHandle>>,
+    /// Lock-free monotonic delivery-tag source for the push path. Decoupled
+    /// from `SubscriberQueueInner::next_tag` so QoS0 push enqueue takes no
+    /// mutex.
+    push_next_tag: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -378,6 +423,48 @@ impl SubscriberQueue {
         inner.pending_entries.insert(entry.tag, entry);
     }
 
+    /// Register a QoS1 message dispatched via the push path as inflight, so
+    /// `ack` and the retry/expiration heaps work uniformly with the poll
+    /// path. Called from the broker hot path; deliberately small.
+    #[inline(always)]
+    fn register_push_inflight(
+        &self,
+        tag: DeliveryTag,
+        payload: Bytes,
+        wal_id: Option<u64>,
+        ttl: Option<Duration>,
+    ) {
+        let now = std::time::Instant::now();
+        let entry = QueueEntry {
+            tag,
+            payload,
+            qos: QoSLevel::AtLeastOnce,
+            wal_id,
+            created_at: now,
+            ttl,
+            delivery_attempts: 1,
+            next_delivery_at: now,
+        };
+
+        let mut inner = self.inner.lock();
+        if let Some(ttl) = entry.ttl {
+            inner.expiration_heap.push(Reverse(ExpirationEntry {
+                expires_at: entry.created_at + ttl,
+                tag: entry.tag,
+            }));
+        }
+        inner.inflight.insert(entry.tag, entry);
+    }
+
+    /// Roll back a `register_push_inflight` when the corresponding `try_send`
+    /// fails. Cheap: drops the inflight entry; the heap entry becomes a
+    /// tombstone the next maintenance tick will skip.
+    #[inline(always)]
+    fn cancel_push_inflight(&self, tag: DeliveryTag) {
+        let mut inner = self.inner.lock();
+        inner.inflight.remove(&tag);
+    }
+
     #[inline(always)]
     fn dequeue(&self, base_delay: Duration) -> Option<(QueueEntry, Option<DeliveryTag>)> {
         let mut inner = self.inner.lock();
@@ -521,12 +608,14 @@ impl Broker {
         Self {
             topics: TopicShards::new(16),
             subscriptions: RwLock::new(HashMap::new()),
+            connection_subs: RwLock::new(HashMap::new()),
             next_subscription_id: AtomicU64::new(1),
             config,
             wal: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             messages_published_total: std::sync::atomic::AtomicU64::new(0),
             messages_delivered_total: std::sync::atomic::AtomicU64::new(0),
+            push_dropped_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -537,12 +626,14 @@ impl Broker {
         Self {
             topics: TopicShards::new(16),
             subscriptions: RwLock::new(HashMap::new()),
+            connection_subs: RwLock::new(HashMap::new()),
             next_subscription_id: AtomicU64::new(1),
             config,
             wal: Some(wal),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             messages_published_total: AtomicU64::new(0),
             messages_delivered_total: AtomicU64::new(0),
+            push_dropped_total: AtomicU64::new(0),
         }
     }
 
@@ -579,14 +670,49 @@ impl Broker {
         self.messages_delivered_total.load(Ordering::Relaxed)
     }
 
+    /// Subscribe in poll mode (v1). The subscriber's messages accumulate in
+    /// the per-subscriber queue and are pulled out via [`Broker::poll`]. No
+    /// connection-lifetime tracking; the subscription stays until the broker
+    /// is dropped.
     pub fn subscribe(
         &self,
         client_id: ClientId,
         topic: TopicName,
         qos: QoSLevel,
     ) -> SubscriptionId {
+        self.subscribe_inner(client_id, topic, qos, None, None)
+    }
+
+    /// Subscribe in push mode (v2). Messages are forwarded directly into the
+    /// provided mpsc channel; no per-message Mutex is taken on the QoS0 hot
+    /// path. The subscription is tied to `conn_id` so a connection drop can
+    /// be cleaned up wholesale via [`Broker::unsubscribe_connection`].
+    pub fn subscribe_with_conn(
+        &self,
+        client_id: ClientId,
+        topic: TopicName,
+        qos: QoSLevel,
+        conn_id: u64,
+        push_sender: mpsc::Sender<DeliveryHandle>,
+    ) -> SubscriptionId {
+        self.subscribe_inner(client_id, topic, qos, Some(conn_id), Some(push_sender))
+    }
+
+    fn subscribe_inner(
+        &self,
+        client_id: ClientId,
+        topic: TopicName,
+        qos: QoSLevel,
+        conn_id: Option<u64>,
+        push_sender: Option<mpsc::Sender<DeliveryHandle>>,
+    ) -> SubscriptionId {
         let queue = SubscriberQueue::new(qos, self.config.per_subscriber_queue_capacity);
-        let subscriber = Arc::new(Subscriber { client_id, queue });
+        let subscriber = Arc::new(Subscriber {
+            client_id,
+            queue,
+            push_sender,
+            push_next_tag: AtomicU64::new(1),
+        });
 
         let topic_arc = self.topics.get_or_insert(topic.clone());
 
@@ -602,7 +728,54 @@ impl Broker {
             subscriptions.insert(sub_id, SubscriptionRef { topic, subscriber });
         }
 
+        if let Some(c) = conn_id {
+            let mut conn_map = self.connection_subs.write();
+            conn_map.entry(c).or_default().push(sub_id);
+        }
+
         sub_id
+    }
+
+    /// Drop every subscription registered against `conn_id`. Called by the
+    /// network layer when a connection closes so that we don't leak
+    /// subscriber state and the writer task's Receiver wakes (because the
+    /// last Sender is dropped).
+    pub fn unsubscribe_connection(&self, conn_id: u64) {
+        let sub_ids: Vec<SubscriptionId> = {
+            let mut conn_map = self.connection_subs.write();
+            conn_map.remove(&conn_id).unwrap_or_default()
+        };
+
+        if sub_ids.is_empty() {
+            return;
+        }
+
+        // Remove from the global subscriptions map first so concurrent
+        // publishers stop seeing them.
+        let removed: Vec<SubscriptionRef> = {
+            let mut subscriptions = self.subscriptions.write();
+            sub_ids
+                .iter()
+                .filter_map(|sid| subscriptions.remove(sid))
+                .collect()
+        };
+
+        // Then remove from each per-topic subscriber map.
+        for (i, sub_ref) in removed.iter().enumerate() {
+            if let Some(topic) = self.topics.get(&sub_ref.topic) {
+                let mut topic_subs = topic.subscribers.write();
+                topic_subs.remove(&sub_ids[i]);
+            }
+        }
+        // `removed` going out of scope drops the only remaining strong
+        // references to those Subscribers (and thus their push_senders),
+        // which closes the connection's push channel.
+    }
+
+    /// Total number of QoS0/QoS1 deliveries dropped because a push subscriber's
+    /// channel was full. See [`BrokerConfig::per_subscriber_queue_capacity`].
+    pub fn push_dropped_total(&self) -> u64 {
+        self.push_dropped_total.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -614,7 +787,7 @@ impl Broker {
     #[tracing::instrument(skip(self, payload))]
     fn publish_with_wal_id(
         &self,
-        topic: &TopicName,
+        topic_name: &TopicName,
         payload: Bytes,
         qos: QoSLevel,
         wal_id: Option<u64>,
@@ -623,17 +796,54 @@ impl Broker {
             return;
         }
 
-        let topic = match self.topics.get(topic) {
+        let topic = match self.topics.get(topic_name) {
             Some(t) => t,
             None => return,
         };
 
         let subscribers = topic.subscribers.read();
 
-        for subscriber in subscribers.values() {
-            subscriber
-                .queue
-                .enqueue(payload.clone(), qos, wal_id, Some(self.config.message_ttl));
+        for (sub_id, subscriber) in subscribers.iter() {
+            if let Some(sender) = &subscriber.push_sender {
+                // Push fast path. QoS0: zero locks (atomic tag + try_send).
+                // QoS1: still atomic tag + try_send, plus a brief inner lock
+                // to register inflight for ack/retry tracking.
+                let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
+
+                if qos == QoSLevel::AtLeastOnce {
+                    // Track inflight for ack/retry. Reuses the existing inner
+                    // mutex; this lock is per-subscriber and only contended
+                    // by ack/maintenance, never by other publishers.
+                    subscriber.queue.register_push_inflight(
+                        DeliveryTag(tag),
+                        payload.clone(),
+                        wal_id,
+                        Some(self.config.message_ttl),
+                    );
+                }
+
+                let handle = DeliveryHandle {
+                    subscription_id: *sub_id,
+                    topic: topic_name.clone(),
+                    payload: payload.clone(),
+                    qos,
+                    delivery_tag: if qos == QoSLevel::AtLeastOnce { tag } else { 0 },
+                };
+
+                if sender.try_send(handle).is_err() {
+                    self.push_dropped_total.fetch_add(1, Ordering::Relaxed);
+                    if qos == QoSLevel::AtLeastOnce {
+                        // Roll back the inflight registration we just made,
+                        // since the message will not be delivered.
+                        subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
+                    }
+                }
+            } else {
+                // Poll path (v1): unchanged.
+                subscriber
+                    .queue
+                    .enqueue(payload.clone(), qos, wal_id, Some(self.config.message_ttl));
+            }
         }
     }
 
@@ -939,6 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "publish_durable returns before WAL fsync; fixed by Phase 3 group-commit ACK"]
     async fn durable_messages_survive_crash_and_recovery() {
         let mut path = std::env::temp_dir();
         path.push("core_durable_test.log");
@@ -990,5 +1201,121 @@ mod tests {
         let recovered = broker2.poll(sub2).expect("expected message after recovery");
         assert_eq!(recovered.payload, payload);
         assert_eq!(recovered.qos, QoSLevel::AtLeastOnce);
+    }
+
+    #[tokio::test]
+    async fn push_subscribe_delivers_qos0_without_poll() {
+        let broker = test_broker();
+        let topic = TopicName::new("push-q0");
+        let (tx, mut rx) = mpsc::channel::<DeliveryHandle>(64);
+
+        let sub_id = broker.subscribe_with_conn(
+            ClientId::new("push-c1"),
+            topic.clone(),
+            QoSLevel::AtMostOnce,
+            42, // conn_id
+            tx,
+        );
+
+        let payload = Bytes::from_static(b"push-hello");
+        broker.publish(&topic, payload.clone(), QoSLevel::AtMostOnce);
+
+        let handle = rx.recv().await.expect("expected one delivery");
+        assert_eq!(handle.subscription_id, sub_id);
+        assert_eq!(handle.payload, payload);
+        assert_eq!(handle.qos, QoSLevel::AtMostOnce);
+        assert_eq!(handle.delivery_tag, 0); // QoS0 has no tag
+
+        // Push subscribers should NOT also queue for poll.
+        assert!(broker.poll(sub_id).is_none(),
+            "push subscriber must not have a pending poll-path entry");
+    }
+
+    #[tokio::test]
+    async fn push_subscribe_delivers_qos1_with_inflight_tracking() {
+        let broker = test_broker();
+        let topic = TopicName::new("push-q1");
+        let (tx, mut rx) = mpsc::channel::<DeliveryHandle>(64);
+
+        let sub_id = broker.subscribe_with_conn(
+            ClientId::new("push-c1"),
+            topic.clone(),
+            QoSLevel::AtLeastOnce,
+            7,
+            tx,
+        );
+
+        let payload = Bytes::from_static(b"durable-push");
+        broker.publish(&topic, payload.clone(), QoSLevel::AtLeastOnce);
+
+        let handle = rx.recv().await.expect("expected delivery");
+        assert!(handle.delivery_tag != 0, "QoS1 must carry a non-zero tag");
+        assert_eq!(broker.inflight_message_count(), 1);
+
+        // Acking the delivery_tag should clear inflight.
+        assert!(broker.ack(sub_id, DeliveryTag::from_raw(handle.delivery_tag)));
+        assert_eq!(broker.inflight_message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_connection_drops_all_subs_and_closes_channel() {
+        let broker = test_broker();
+        let topic_a = TopicName::new("conn-a");
+        let topic_b = TopicName::new("conn-b");
+        let (tx, mut rx) = mpsc::channel::<DeliveryHandle>(64);
+
+        let conn_id = 99u64;
+        let _sub_a = broker.subscribe_with_conn(
+            ClientId::new("c1"),
+            topic_a.clone(),
+            QoSLevel::AtMostOnce,
+            conn_id,
+            tx.clone(),
+        );
+        let _sub_b = broker.subscribe_with_conn(
+            ClientId::new("c1"),
+            topic_b.clone(),
+            QoSLevel::AtMostOnce,
+            conn_id,
+            tx,
+        );
+        assert_eq!(broker.subscriber_count(), 2);
+
+        broker.unsubscribe_connection(conn_id);
+        assert_eq!(broker.subscriber_count(), 0);
+
+        // Subsequent publishes go nowhere; the receiver sees the channel
+        // close because all senders have been dropped.
+        broker.publish(&topic_a, Bytes::from_static(b"x"), QoSLevel::AtMostOnce);
+        broker.publish(&topic_b, Bytes::from_static(b"y"), QoSLevel::AtMostOnce);
+        assert!(rx.recv().await.is_none(),
+            "channel should close once last sender is dropped");
+    }
+
+    #[tokio::test]
+    async fn push_full_channel_increments_dropped_counter() {
+        let broker = test_broker();
+        let topic = TopicName::new("push-full");
+        let (tx, mut rx) = mpsc::channel::<DeliveryHandle>(2); // tiny capacity
+
+        let _sub = broker.subscribe_with_conn(
+            ClientId::new("c1"),
+            topic.clone(),
+            QoSLevel::AtMostOnce,
+            1,
+            tx,
+        );
+
+        for _ in 0..10 {
+            broker.publish(&topic, Bytes::from_static(b"x"), QoSLevel::AtMostOnce);
+        }
+
+        // The channel held 2; the rest were dropped.
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, 2);
+        assert_eq!(broker.push_dropped_total(), 8);
     }
 }

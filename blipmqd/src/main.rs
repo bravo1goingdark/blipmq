@@ -63,7 +63,7 @@ async fn run_integration_flow(
 
     // 2) Publish a QoS1 message.
     let publish_payload = PublishPayload {
-        topic: "test".to_string(),
+        topic: Bytes::from_static(b"test"),
         qos: 1,
         message: Bytes::from_static(b"hello"),
     }
@@ -106,7 +106,7 @@ async fn run_integration_flow(
         }
     };
 
-    if delivery_payload.topic != "test" || delivery_payload.qos != 1 {
+    if delivery_payload.topic_str() != "test" || delivery_payload.qos != 1 {
         return Err("delivered payload does not match expectations".into());
     }
 

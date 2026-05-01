@@ -4,9 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use auth::ApiKeyValidator;
 use bytes::Bytes;
-use corelib::{Broker, ClientId, DeliveryTag, QoSLevel, SubscriptionId, TopicName};
+use corelib::{Broker, ClientId, DeliveryHandle, DeliveryTag, QoSLevel, SubscriptionId, TopicName};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
 
 use crate::connection::Connection;
@@ -29,6 +29,23 @@ pub enum FrameResponse {
 #[async_trait]
 pub trait MessageHandler: Send + Sync + 'static {
     async fn handle_frame(&self, conn_id: u64, frame: Frame) -> Result<FrameResponse, Error>;
+
+    /// Handle a SUBSCRIBE frame in v2 push mode. The handler is given the
+    /// connection's push Sender so it can register the subscription with the
+    /// broker via `subscribe_with_conn`. Default impl falls back to the
+    /// non-push `handle_frame`, which keeps tests/mocks working.
+    async fn handle_subscribe_push(
+        &self,
+        conn_id: u64,
+        frame: Frame,
+        _push_tx: mpsc::Sender<DeliveryHandle>,
+    ) -> Result<FrameResponse, Error> {
+        self.handle_frame(conn_id, frame).await
+    }
+
+    /// Notify the handler that a connection has dropped, so it can clean up
+    /// any per-connection state (subscriptions, etc). Default: no-op.
+    fn handle_connection_close(&self, _conn_id: u64) {}
 }
 
 pub struct Server<H>
@@ -81,6 +98,12 @@ where
                             let handler = self.handler.clone();
                             let conn_shutdown = shutdown_rx.clone();
                             let auth = self.auth_validator.clone();
+
+                            // Disable Nagle: writer task issues already-batched frames; we want
+                            // each batched write on the wire immediately, not coalesced again.
+                            if let Err(err) = stream.set_nodelay(true) {
+                                debug!("set_nodelay failed on conn {}: {}", conn_id, err);
+                            }
 
                             debug!("accepted connection {} from {}", conn_id, addr);
 
@@ -161,10 +184,68 @@ impl MessageHandler for BrokerHandler {
                 Ok(FrameResponse::Frame(pong))
             }
             FrameType::Poll => self.handle_poll(conn_id, frame).await,
-            FrameType::Pong | FrameType::Nack | FrameType::Hello | FrameType::Auth => {
+            FrameType::Pong
+            | FrameType::Nack
+            | FrameType::Hello
+            | FrameType::Auth
+            | FrameType::Deliver => {
+                // DELIVER is server-initiated; receiving one from the client is
+                // protocol misuse but harmless to ignore here.
                 Ok(FrameResponse::None)
             }
         }
+    }
+
+    async fn handle_subscribe_push(
+        &self,
+        conn_id: u64,
+        frame: Frame,
+        push_tx: mpsc::Sender<DeliveryHandle>,
+    ) -> Result<FrameResponse, Error> {
+        let decoded = SubscribePayload::decode(&frame.payload);
+        let payload = match decoded {
+            Ok(p) => p,
+            Err(_) => {
+                let nack =
+                    self.make_nack(frame.correlation_id, 400, "invalid SUBSCRIBE payload")?;
+                return Ok(FrameResponse::Frame(nack));
+            }
+        };
+
+        if payload.topic.is_empty() {
+            let nack = self.make_nack(frame.correlation_id, 400, "empty topic")?;
+            return Ok(FrameResponse::Frame(nack));
+        }
+
+        let qos = match self.qos_from_u8(payload.qos) {
+            Some(q) => q,
+            None => {
+                let nack = self.make_nack(frame.correlation_id, 400, "invalid QoS value")?;
+                return Ok(FrameResponse::Frame(nack));
+            }
+        };
+
+        let client_id = ClientId::new(format!("conn-{conn_id}"));
+        let topic = TopicName::new(payload.topic);
+
+        let sub_id = self
+            .broker
+            .subscribe_with_conn(client_id, topic, qos, conn_id, push_tx);
+
+        let ack_payload = AckPayload {
+            subscription_id: sub_id.value(),
+        }
+        .encode()?;
+
+        Ok(FrameResponse::Frame(Frame {
+            msg_type: FrameType::Ack,
+            correlation_id: frame.correlation_id,
+            payload: ack_payload,
+        }))
+    }
+
+    fn handle_connection_close(&self, conn_id: u64) {
+        self.broker.unsubscribe_connection(conn_id);
     }
 }
 
@@ -192,7 +273,7 @@ impl BrokerHandler {
             }
         };
 
-        let topic = TopicName::new(payload.topic);
+        let topic = TopicName::from_str(payload.topic_str());
         if qos == QoSLevel::AtLeastOnce && self.broker.has_wal() {
             // Use the WAL-backed path when configured for QoS1 messages.
             if let Err(e) = self
@@ -322,7 +403,7 @@ impl BrokerHandler {
         };
 
         let payload_bytes = PublishPayload {
-            topic: polled.topic.as_str().to_string(),
+            topic: Bytes::copy_from_slice(polled.topic.as_str().as_bytes()),
             qos: qos_byte,
             message: polled.payload,
         }
