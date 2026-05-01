@@ -43,9 +43,66 @@ pub trait MessageHandler: Send + Sync + 'static {
         self.handle_frame(conn_id, frame).await
     }
 
+    /// Sync fast path for PUBLISH frames. Avoids the per-frame
+    /// `Box<dyn Future>` allocation and indirect call that `async_trait`
+    /// imposes. Returns:
+    ///   - `Ok(None)` on successful publish (no inband response).
+    ///   - `Ok(Some(nack))` on parse / validation error.
+    ///   - `Err(_)` on transport-fatal error.
+    /// Implementations that need to await (e.g. QoS1 + WAL) may return
+    /// `Ok(Some(_))` or fall back to the async path; the default impl
+    /// here panics, since it must be overridden by any handler that
+    /// participates in the v2 push hot path.
+    fn handle_publish_fast(
+        &self,
+        _conn_id: u64,
+        _frame: Frame,
+        _topic_cache: &mut PublishTopicCache,
+    ) -> Result<Option<Frame>, Error> {
+        // The default impl can be safely "unreachable" because the
+        // Connection only routes PUBLISH frames through this method when
+        // the handler implements it; mocks / tests that do not opt in
+        // never see PUBLISH on the fast path.
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "handle_publish_fast not implemented",
+        )))
+    }
+
     /// Notify the handler that a connection has dropped, so it can clean up
     /// any per-connection state (subscriptions, etc). Default: no-op.
     fn handle_connection_close(&self, _conn_id: u64) {}
+}
+
+/// Per-connection cache for the most recently resolved publish topic.
+/// Same publisher publishes to the same topic millions of times in a
+/// row; this single-slot cache turns each repeat lookup into a single
+/// `Bytes` equality check + `Arc<str>` clone (refcount bump).
+#[derive(Default)]
+pub struct PublishTopicCache {
+    last_bytes: Option<Bytes>,
+    last_topic: Option<TopicName>,
+}
+
+impl PublishTopicCache {
+    /// Fetch a `TopicName` for `topic_bytes`. If it matches the cached
+    /// entry, returns a refcount-bumped clone; otherwise allocates a
+    /// new `Arc<str>` and updates the cache.
+    #[inline(always)]
+    pub fn get(&mut self, topic_bytes: &Bytes) -> TopicName {
+        if let (Some(prev_bytes), Some(prev_topic)) = (&self.last_bytes, &self.last_topic) {
+            if prev_bytes == topic_bytes {
+                return prev_topic.clone();
+            }
+        }
+        // SAFETY: `PublishPayload::decode` validated UTF-8 already; this is
+        // the same invariant `topic_str()` relies on.
+        let s = unsafe { std::str::from_utf8_unchecked(topic_bytes) };
+        let new_topic = TopicName::from_str(s);
+        self.last_bytes = Some(topic_bytes.clone());
+        self.last_topic = Some(new_topic.clone());
+        new_topic
+    }
 }
 
 pub struct Server<H>
@@ -246,6 +303,59 @@ impl MessageHandler for BrokerHandler {
 
     fn handle_connection_close(&self, conn_id: u64) {
         self.broker.unsubscribe_connection(conn_id);
+    }
+
+    fn handle_publish_fast(
+        &self,
+        _conn_id: u64,
+        frame: Frame,
+        topic_cache: &mut PublishTopicCache,
+    ) -> Result<Option<Frame>, Error> {
+        // Sync fast path: decode + dispatch with no async_trait box and no
+        // .await. QoS1 + WAL still needs an awaitable fsync, so for that
+        // case we fall through and force a NACK so the caller can retry on
+        // the async path. (In practice clients targeting v2 either use
+        // QoS0 here for max throughput or run a separate publisher
+        // strategy for durable QoS1.)
+        let payload = match PublishPayload::decode(&frame.payload) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(Some(self.make_nack(
+                    frame.correlation_id,
+                    400,
+                    "invalid PUBLISH payload",
+                )?));
+            }
+        };
+
+        if payload.topic.is_empty() {
+            return Ok(Some(self.make_nack(frame.correlation_id, 400, "empty topic")?));
+        }
+
+        let qos = match self.qos_from_u8(payload.qos) {
+            Some(q) => q,
+            None => {
+                return Ok(Some(self.make_nack(
+                    frame.correlation_id,
+                    400,
+                    "invalid QoS value",
+                )?));
+            }
+        };
+
+        // QoS1 + WAL must take the durable async path; punt back via a
+        // sentinel error so the reader retries on handle_frame. For QoS0
+        // (and QoS1 without WAL), publish synchronously.
+        if qos == QoSLevel::AtLeastOnce && self.broker.has_wal() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "qos1_durable_requires_async",
+            )));
+        }
+
+        let topic = topic_cache.get(&payload.topic);
+        self.broker.publish(&topic, payload.message, qos);
+        Ok(None)
     }
 }
 

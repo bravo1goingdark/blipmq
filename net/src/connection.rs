@@ -15,7 +15,7 @@ use crate::frame::{
     self, encode_deliver_frame, AckPayload, AuthPayload, Frame, FrameType, HelloPayload,
     NackPayload,
 };
-use crate::server::{FrameResponse, MessageHandler};
+use crate::server::{FrameResponse, MessageHandler, PublishTopicCache};
 
 const INITIAL_BUFFER_SIZE: usize = 16 * 1024;
 /// Max frames coalesced into one writev/write_all on the wire.
@@ -254,6 +254,10 @@ where
     read_buf: BytesMut,
     hello_performed: bool,
     authenticated: bool,
+    /// Single-slot cache of the most-recently resolved publish topic.
+    /// Common publisher pattern is "publish 1M to one topic" — this turns
+    /// per-frame `Arc<str>` allocation into a refcount bump.
+    topic_cache: PublishTopicCache,
 }
 
 impl<H> ReaderState<H>
@@ -280,6 +284,7 @@ where
             read_buf: BytesMut::with_capacity(INITIAL_BUFFER_SIZE),
             hello_performed: false,
             authenticated: false,
+            topic_cache: PublishTopicCache::default(),
         }
     }
 
@@ -310,6 +315,28 @@ where
                     self.send_nack(frame.correlation_id, 401, "unauthenticated")
                         .await?;
                     return Ok(());
+                }
+
+                // PUBLISH hot path: try the sync fast path first. Avoids
+                // the per-frame async_trait Box<dyn Future> alloc on the
+                // dominant frame type. If the fast path returns
+                // Unsupported (e.g. QoS1+WAL needs an awaitable fsync),
+                // fall through to the async handle_frame path.
+                if frame.msg_type == FrameType::Publish {
+                    match self.handler.handle_publish_fast(
+                        self.id,
+                        frame.clone(),
+                        &mut self.topic_cache,
+                    ) {
+                        Ok(None) => return Ok(()),
+                        Ok(Some(nack)) => return self.send_inband(nack).await,
+                        Err(Error::Io(e))
+                            if e.kind() == std::io::ErrorKind::Unsupported =>
+                        {
+                            // Falls through to the async path below.
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 let response = if frame.msg_type == FrameType::Subscribe {
