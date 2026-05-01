@@ -28,3 +28,7 @@ harness = false
 name = "wire_fanout"
 harness = false
 
+[[bench]]
+name = "wire_multi_pub"
+harness = false
+
