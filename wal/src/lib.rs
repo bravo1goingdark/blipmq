@@ -4,16 +4,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 const HEADER_MAGIC: &[u8; 8] = b"BLIPWAL\0";
-const HEADER_VERSION: u32 = 1;
+// v2: CRC covers `id` and `len` header fields in addition to the payload,
+// so a bit flip in the framing bytes is detected on replay (previously
+// `id` and `len` were not protected).
+const HEADER_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 32;
 const RECORD_HEADER_LEN: usize = 8 + 4 + 4;
 
@@ -78,6 +82,10 @@ struct WalWriteRequest {
     id: u64,
     header: [u8; RECORD_HEADER_LEN],
     payload: Bytes,
+    /// When `Some`, the writer signals after the next fsync covering this
+    /// record. This is how `append_durable` returns "on disk", enabling
+    /// fsync-gated QoS1 publish semantics.
+    durable_ack: Option<oneshot::Sender<Result<(), WalError>>>,
 }
 
 #[derive(Debug)]
@@ -95,6 +103,12 @@ struct WalWriter {
     receiver: mpsc::Receiver<WalMessage>,
     append_count: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
+    /// Reused per-batch encode buffer; `clear()` between batches so the
+    /// allocation is amortized across the writer's lifetime.
+    batch_buf: BytesMut,
+    /// Durability-ack senders waiting for the next fsync that covers their
+    /// record. Drained and signaled in `flush_file`.
+    pending_durable_acks: Vec<oneshot::Sender<Result<(), WalError>>>,
 }
 
 impl WriteAheadLog {
@@ -161,6 +175,8 @@ impl WriteAheadLog {
             receiver,
             append_count: Arc::clone(&append_count),
             bytes_written: Arc::clone(&bytes_written),
+            batch_buf: BytesMut::with_capacity(64 * 1024),
+            pending_durable_acks: Vec::new(),
         };
 
         let writer_index = Arc::clone(&index);
@@ -181,9 +197,39 @@ impl WriteAheadLog {
     }
 
     /// Append a record to the log, returning its logical id.
+    ///
+    /// **Channel-gated**: returns as soon as the record is queued for the
+    /// writer task. The record is *not* guaranteed to be on disk when this
+    /// returns. Use [`Self::append_durable`] for fsync-gated semantics.
+    ///
+    /// Takes `Bytes` rather than `&[u8]` so callers that already hold a
+    /// `Bytes` (e.g. inbound PUBLISH payload) avoid an extra copy.
     #[inline(always)]
     #[tracing::instrument(skip(self, data))]
-    pub async fn append(&self, data: &[u8]) -> Result<u64, WalError> {
+    pub async fn append(&self, data: Bytes) -> Result<u64, WalError> {
+        let (id, request) = self.build_request(data, None)?;
+        self.send_request(request)?;
+        Ok(id)
+    }
+
+    /// Append a record and wait for the next fsync that covers it. When this
+    /// returns `Ok`, the record is durable on disk. This is the strict-
+    /// durability path used for QoS1 publishes.
+    #[inline]
+    #[tracing::instrument(skip(self, data))]
+    pub async fn append_durable(&self, data: Bytes) -> Result<u64, WalError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (id, request) = self.build_request(data, Some(ack_tx))?;
+        self.send_request(request)?;
+        ack_rx.await.map_err(|_| WalError::WriterStopped)??;
+        Ok(id)
+    }
+
+    fn build_request(
+        &self,
+        data: Bytes,
+        durable_ack: Option<oneshot::Sender<Result<(), WalError>>>,
+    ) -> Result<(u64, WalWriteRequest), WalError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut header = [0u8; RECORD_HEADER_LEN];
         header[..8].copy_from_slice(&id.to_le_bytes());
@@ -191,17 +237,25 @@ impl WriteAheadLog {
             .map_err(|_| WalError::Corruption("record too large".to_string()))?;
         header[8..12].copy_from_slice(&len_u32.to_le_bytes());
 
+        // CRC covers (id, len, payload). v1 covered only payload.
         let mut hasher = Crc32Hasher::new();
-        hasher.update(data);
+        hasher.update(&header[..12]);
+        hasher.update(&data);
         let crc = hasher.finalize();
         header[12..16].copy_from_slice(&crc.to_le_bytes());
 
-        let request = WalWriteRequest {
+        Ok((
             id,
-            header,
-            payload: Bytes::copy_from_slice(data),
-        };
+            WalWriteRequest {
+                id,
+                header,
+                payload: data,
+                durable_ack,
+            },
+        ))
+    }
 
+    fn send_request(&self, request: WalWriteRequest) -> Result<(), WalError> {
         self.sender
             .try_send(WalMessage::Record(request))
             .map_err(|err| match err {
@@ -209,8 +263,7 @@ impl WriteAheadLog {
                     WalError::Backpressure("wal channel full".to_string())
                 }
                 mpsc::error::TrySendError::Closed(_) => WalError::WriterStopped,
-            })?;
-        Ok(id)
+            })
     }
 
     /// Force a flush of buffered data and an fsync, regardless of configuration.
@@ -236,7 +289,7 @@ impl WriteAheadLog {
     pub async fn iterate_from(&self, from_id: u64) -> Result<Vec<WalRecord>, WalError> {
         // Find starting file offset from the index.
         let (start_offset, min_id) = {
-            let inner = self.index.lock().await;
+            let inner = self.index.lock();
 
             if inner.is_empty() {
                 return Ok(Vec::new());
@@ -287,7 +340,7 @@ impl WriteAheadLog {
 
     /// Lookup the file offset for a given logical id. Mainly useful for tests and diagnostics.
     pub async fn lookup_offset(&self, id: u64) -> Option<u64> {
-        let inner = self.index.lock().await;
+        let inner = self.index.lock();
         inner.get(&id).copied()
     }
 }
@@ -346,49 +399,92 @@ impl WalWriter {
         records: Vec<WalWriteRequest>,
         index: &Arc<Mutex<HashMap<u64, u64>>>,
     ) -> Result<(), WalError> {
-        let mut buffer_len = 0usize;
-        for record in &records {
-            buffer_len += RECORD_HEADER_LEN + record.payload.len();
-        }
-
-        let mut buffer = Vec::with_capacity(buffer_len);
+        // Reuse the writer's batch buffer; clear (preserves capacity) instead
+        // of re-allocating per batch.
+        self.batch_buf.clear();
         let mut offsets = Vec::with_capacity(records.len());
         let mut current_offset = self.write_offset;
 
-        for record in &records {
+        // Drain durable_ack senders out of the records before we move
+        // payloads into the buffer; we'll signal them after fsync.
+        let mut new_acks: Vec<oneshot::Sender<Result<(), WalError>>> =
+            Vec::with_capacity(records.len());
+
+        for mut record in records {
             offsets.push((record.id, current_offset));
             current_offset += (RECORD_HEADER_LEN + record.payload.len()) as u64;
-            buffer.extend_from_slice(&record.header);
-            buffer.extend_from_slice(&record.payload);
+            self.batch_buf.extend_from_slice(&record.header);
+            self.batch_buf.extend_from_slice(&record.payload);
+            if let Some(ack) = record.durable_ack.take() {
+                new_acks.push(ack);
+            }
         }
 
-        self.file.write_all(&buffer).await?;
+        let total_records = offsets.len();
+        let total_bytes = self.batch_buf.len() as u64;
+
+        self.file.write_all(&self.batch_buf).await?;
         self.write_offset = current_offset;
 
         {
-            let mut guard = index.lock().await;
+            let mut guard = index.lock();
             for (id, offset) in offsets {
                 guard.insert(id, offset);
             }
         }
 
-        let total_bytes = buffer.len() as u64;
         self.append_count
-            .fetch_add(records.len() as u64, Ordering::Relaxed);
+            .fetch_add(total_records as u64, Ordering::Relaxed);
         self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
 
-        self.unflushed_records = self.unflushed_records.saturating_add(records.len());
-        self.maybe_sync().await?;
+        self.unflushed_records = self.unflushed_records.saturating_add(total_records);
+        // Defer durable acks to the next fsync. If `maybe_sync` fires below
+        // because of a record-count or interval threshold, all pending acks
+        // (including these new ones) get signaled inside `flush_file`.
+        // Otherwise they stay queued until the next fsync.
+        self.pending_durable_acks.extend(new_acks);
+
+        // If any record requested durable ack, force a sync now so callers
+        // don't wait for the next batch / interval. This keeps p99 latency
+        // bounded for QoS1 publishers; the cost is amortized across the
+        // whole batch (group commit).
+        if !self.pending_durable_acks.is_empty() {
+            self.flush_file().await?;
+        } else {
+            self.maybe_sync().await?;
+        }
 
         Ok(())
     }
 
     async fn flush_file(&mut self) -> Result<(), WalError> {
-        self.file.flush().await?;
-        self.file.sync_data().await?;
-        self.unflushed_records = 0;
-        self.last_fsync = Instant::now();
-        Ok(())
+        let result = async {
+            self.file.flush().await?;
+            self.file.sync_data().await?;
+            Ok::<(), WalError>(())
+        }
+        .await;
+
+        // Fan the outcome out to all queued durable-ack senders so callers
+        // wake. WalError isn't Clone, so on error we string-format once and
+        // hand each waiter a fresh Corruption with that message.
+        let err_msg: Option<String> = result
+            .as_ref()
+            .err()
+            .map(|e| format!("wal fsync failed: {e}"));
+        for ack in self.pending_durable_acks.drain(..) {
+            let payload: Result<(), WalError> = match &err_msg {
+                None => Ok(()),
+                Some(s) => Err(WalError::Corruption(s.clone())),
+            };
+            let _ = ack.send(payload);
+        }
+
+        if result.is_ok() {
+            self.unflushed_records = 0;
+            self.last_fsync = Instant::now();
+        }
+        result
     }
 
     async fn maybe_sync(&mut self) -> Result<(), WalError> {
@@ -538,7 +634,10 @@ async fn read_next_record_with_offset(
         read_payload += n;
     }
 
+    // CRC v2 covers the (id, len) header bytes plus the payload. v1 covered
+    // only the payload, so a flip in the framing bytes went undetected.
     let mut hasher = Crc32Hasher::new();
+    hasher.update(&header[..12]);
     hasher.update(&payload);
     let actual_crc = hasher.finalize();
 
@@ -569,8 +668,8 @@ mod tests {
         let path = wal_path("roundtrip");
         let wal = WriteAheadLog::open(&path).await.unwrap();
 
-        let id1 = wal.append(b"first").await.unwrap();
-        let id2 = wal.append(b"second").await.unwrap();
+        let id1 = wal.append(Bytes::from_static(b"first")).await.unwrap();
+        let id2 = wal.append(Bytes::from_static(b"second")).await.unwrap();
         wal.flush().await.unwrap();
 
         let records = wal.iterate_from(id1).await.unwrap();
@@ -586,8 +685,8 @@ mod tests {
         let path = wal_path("corruption");
         {
             let wal = WriteAheadLog::open(&path).await.unwrap();
-            let _ = wal.append(b"good").await.unwrap();
-            let _ = wal.append(b"also good").await.unwrap();
+            let _ = wal.append(Bytes::from_static(b"good")).await.unwrap();
+            let _ = wal.append(Bytes::from_static(b"also good")).await.unwrap();
             wal.flush().await.unwrap();
         }
 
@@ -615,15 +714,79 @@ mod tests {
         }
     }
 
+    /// v2 CRC covers (id, len, payload). A bit flip in the `id` bytes used
+    /// to go undetected (v1 CRC was payload-only). Reopen must fail with
+    /// Corruption.
+    #[tokio::test]
+    async fn header_corruption_caught_by_crc_v2() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = wal_path("header_corruption");
+        {
+            let wal = WriteAheadLog::open(&path).await.unwrap();
+            let _ = wal.append(Bytes::from_static(b"first")).await.unwrap();
+            let _ = wal.append(Bytes::from_static(b"second")).await.unwrap();
+            wal.flush().await.unwrap();
+        }
+
+        // Flip the lowest bit of the *id* field of the first record. With v1
+        // CRC this would have been silently accepted; with v2 it must fail.
+        let id_offset = HEADER_LEN; // first record's id starts immediately after WAL header
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        file.seek(SeekFrom::Start(id_offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x01;
+        file.seek(SeekFrom::Start(id_offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+
+        let err = WriteAheadLog::open(&path).await.unwrap_err();
+        assert!(
+            matches!(err, WalError::Corruption(_)),
+            "expected Corruption, got {err:?}",
+        );
+    }
+
+    /// Group-commit fsync ACK: append_durable must NOT return until the
+    /// record is on disk. Verified by checking the file length after the
+    /// call returns (without an explicit `flush` first).
+    #[tokio::test]
+    async fn append_durable_blocks_until_on_disk() {
+        let path = wal_path("durable_blocks");
+        let wal = WriteAheadLog::open(&path).await.unwrap();
+
+        let len_before = std::fs::metadata(&path).unwrap().len();
+        let _ = wal
+            .append_durable(Bytes::from_static(b"durable"))
+            .await
+            .unwrap();
+        let len_after = std::fs::metadata(&path).unwrap().len();
+
+        // The record (header + payload) is at least HEADER_LEN larger than
+        // before; if append_durable returned before fsync, the file might
+        // still be empty/short.
+        assert!(
+            len_after > len_before,
+            "file did not grow after append_durable: before={len_before} after={len_after}",
+        );
+        assert!(len_after >= len_before + RECORD_HEADER_LEN as u64);
+    }
+
     #[tokio::test]
     async fn index_is_rebuilt_on_open() {
         let path = wal_path("index_rebuild");
         let id2;
         {
             let wal = WriteAheadLog::open(&path).await.unwrap();
-            let _id1 = wal.append(b"first").await.unwrap();
-            id2 = wal.append(b"second").await.unwrap();
-            let _id3 = wal.append(b"third").await.unwrap();
+            let _id1 = wal.append(Bytes::from_static(b"first")).await.unwrap();
+            id2 = wal.append(Bytes::from_static(b"second")).await.unwrap();
+            let _id3 = wal.append(Bytes::from_static(b"third")).await.unwrap();
             wal.flush().await.unwrap();
         }
 

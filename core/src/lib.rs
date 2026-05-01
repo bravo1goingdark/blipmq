@@ -346,7 +346,7 @@ struct WalMessageRecord {
 }
 
 impl WalMessageRecord {
-    fn encode(&self) -> Result<Vec<u8>, LogError> {
+    fn encode(&self) -> Result<Bytes, LogError> {
         let mut buf = BytesMut::new();
 
         let qos_byte = match self.qos {
@@ -364,7 +364,7 @@ impl WalMessageRecord {
 
         buf.put_slice(&self.payload);
 
-        Ok(buf.to_vec())
+        Ok(buf.freeze())
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, LogError> {
@@ -935,7 +935,9 @@ impl Broker {
         };
 
         let encoded = record.encode()?;
-        let wal_id = wal.append(&encoded).await?;
+        // append_durable returns only after fsync covers this record. This
+        // is what makes "publish_durable returned Ok" mean "on disk".
+        let wal_id = wal.append_durable(encoded).await?;
 
         self.publish_with_wal_id(topic, payload, qos, Some(wal_id));
 
@@ -1215,7 +1217,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "publish_durable returns before WAL fsync; fixed by Phase 3 group-commit ACK"]
     async fn durable_messages_survive_crash_and_recovery() {
         let mut path = std::env::temp_dir();
         path.push("core_durable_test.log");
