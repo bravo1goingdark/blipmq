@@ -10,6 +10,9 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use tokio::sync::Notify;
 use wal::{WalError as LogError, WalRecord, WriteAheadLog};
+// Re-export so the network layer can pattern-match on WAL error variants
+// (e.g. backpressure -> NACK 503) without taking a direct wal dependency.
+pub use wal::WalError;
 
 /// Push channel type used to forward `DeliveryHandle`s from the broker hot
 /// path to a connection's writer task. Used for the **legacy push path**
@@ -80,6 +83,23 @@ pub enum QoSLevel {
     AtLeastOnce,
 }
 
+/// What the broker does when a push subscriber's outbound buffer is over
+/// the slow-consumer threshold (or — for the legacy flume push path — when
+/// `try_send` returns `Full`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowConsumerPolicy {
+    /// Drop the new delivery on the floor and increment the
+    /// `push_dropped_total` counter. The subscription stays alive; if
+    /// the consumer catches up, deliveries resume. This is the historical
+    /// default and the lowest-friction option.
+    DropNewest,
+    /// Drop the new delivery AND remove the subscription from the broker
+    /// so further publishes don't pile up against the same slow consumer.
+    /// The TCP connection itself is not closed; the client can reissue
+    /// `SUBSCRIBE` if it wants to resume.
+    DropSubscription,
+}
+
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub default_qos: QoSLevel,
@@ -90,6 +110,27 @@ pub struct BrokerConfig {
     pub max_retries: u32,
     /// Base delay used for exponential backoff between retry attempts.
     pub retry_base_delay: Duration,
+    /// What to do when a push subscriber falls behind faster than the
+    /// outbound buffer can drain. See [`SlowConsumerPolicy`].
+    pub slow_consumer_policy: SlowConsumerPolicy,
+    /// Soft byte cap on a per-conn push slot's outbound buffer. When the
+    /// buffer is at or above this size, the broker applies
+    /// `slow_consumer_policy` to incoming deliveries. Default 16 MiB.
+    pub slow_consumer_buffer_bytes: usize,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            default_qos: QoSLevel::AtMostOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 1024,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+        }
+    }
 }
 
 /// Interned topic name. Cloning a `TopicName` is a refcount bump, not a heap
@@ -1034,6 +1075,32 @@ impl Broker {
         self.push_dropped_total.load(Ordering::Relaxed)
     }
 
+    /// Unsubscribe a single subscription. Used by the slow-consumer
+    /// `DropSubscription` policy. Removes the sub from the global shard
+    /// AND from the topic's subscriber list AND from any tracking
+    /// `connection_subs` entry. Returns true if the sub existed.
+    fn unsubscribe_one(&self, sub_id: SubscriptionId) -> bool {
+        let removed = {
+            let mut shard = self.subscriptions.shard_for(sub_id).write();
+            shard.remove(&sub_id)
+        };
+        let Some(sub_ref) = removed else {
+            return false;
+        };
+        if let Some(topic) = self.topics.get(&sub_ref.topic) {
+            let mut topic_subs = topic.subscribers.write();
+            topic_subs.remove(&sub_id);
+        }
+        // Remove from the connection_subs reverse-map too. We don't know
+        // which conn this sub belonged to; walk the (small) map.
+        let mut conn_map = self.connection_subs.write();
+        for (_conn, subs) in conn_map.iter_mut() {
+            subs.retain(|s| *s != sub_id);
+        }
+        conn_map.retain(|_, subs| !subs.is_empty());
+        true
+    }
+
     /// Mark the broker as ready to accept traffic. Called by the daemon
     /// after WAL replay completes.
     pub fn mark_ready(&self) {
@@ -1100,6 +1167,7 @@ impl Broker {
             subscribers.iter().map(|(id, sub)| (*id, sub.clone())).collect()
         };
 
+        let mut subs_to_drop: SmallVec<[SubscriptionId; 4]> = SmallVec::new();
         for (sub_id, subscriber) in snapshot.iter() {
             if let Some((slot, encoder)) = &subscriber.push_slot {
                 // Shared-buffer push (v2 fast path): encode the DELIVER
@@ -1116,15 +1184,32 @@ impl Broker {
                     );
                 }
                 let wire_tag = if qos == QoSLevel::AtLeastOnce { tag } else { 0 };
+                let mut over_threshold = false;
                 {
                     let mut buf = slot.buf.lock();
-                    encoder(&mut buf, qos, wire_tag, topic_name.as_str(), &payload);
+                    if buf.len() >= self.config.slow_consumer_buffer_bytes {
+                        over_threshold = true;
+                    } else {
+                        encoder(&mut buf, qos, wire_tag, topic_name.as_str(), &payload);
+                    }
                 }
-                slot.notify.notify_one();
-                topic.delivered_total.fetch_add(1, Ordering::Relaxed);
-                self.messages_delivered_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = sub_id; // unused on this path
+                if over_threshold {
+                    self.push_dropped_total.fetch_add(1, Ordering::Relaxed);
+                    if qos == QoSLevel::AtLeastOnce {
+                        subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
+                    }
+                    if matches!(
+                        self.config.slow_consumer_policy,
+                        SlowConsumerPolicy::DropSubscription,
+                    ) {
+                        subs_to_drop.push(*sub_id);
+                    }
+                } else {
+                    slot.notify.notify_one();
+                    topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                    self.messages_delivered_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             } else if let Some(sender) = &subscriber.push_sender {
                 // Legacy channel-based push.
                 let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
@@ -1151,6 +1236,12 @@ impl Broker {
                     if qos == QoSLevel::AtLeastOnce {
                         subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
                     }
+                    if matches!(
+                        self.config.slow_consumer_policy,
+                        SlowConsumerPolicy::DropSubscription,
+                    ) {
+                        subs_to_drop.push(*sub_id);
+                    }
                 } else {
                     topic.delivered_total.fetch_add(1, Ordering::Relaxed);
                     self.messages_delivered_total
@@ -1165,6 +1256,14 @@ impl Broker {
                 self.messages_delivered_total
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+
+        // Apply the DropSubscription slow-consumer policy after the fanout
+        // loop so we don't hold any per-topic locks across the unsubscribe
+        // path. `unsubscribe_one` takes write locks on the subscriptions
+        // shard and on the topic's subscribers map.
+        for sid in subs_to_drop {
+            self.unsubscribe_one(sid);
         }
     }
 
@@ -1430,6 +1529,8 @@ mod tests {
             per_subscriber_queue_capacity: 16,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
         })
     }
 
@@ -1516,6 +1617,8 @@ mod tests {
             per_subscriber_queue_capacity: 16,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(10),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
         });
 
         let topic = TopicName::new("ttl-test");
@@ -1548,6 +1651,8 @@ mod tests {
             per_subscriber_queue_capacity: 16,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(20),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
         });
 
         let topic = TopicName::new("retry-test");
@@ -1605,6 +1710,8 @@ mod tests {
             per_subscriber_queue_capacity: 16,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
         };
 
         let broker1 = Broker::new_with_wal(config.clone(), wal.clone());
@@ -1781,6 +1888,8 @@ mod tests {
             per_subscriber_queue_capacity: 32,
             max_retries: 3,
             retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
         };
 
         let topic = TopicName::new("ack-journal-topic");
@@ -1834,5 +1943,57 @@ mod tests {
         );
 
         let _ = acked_tags; // silence unused
+    }
+
+    /// SlowConsumerPolicy::DropSubscription: when a push subscriber's
+    /// outbound buffer is at/over the threshold, the broker should drop
+    /// the offending subscription wholesale so further publishes don't
+    /// pile up.
+    #[tokio::test]
+    async fn slow_consumer_drop_subscription_unsubscribes() {
+        let broker = Broker::new(BrokerConfig {
+            default_qos: QoSLevel::AtMostOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropSubscription,
+            // Very low threshold so a single delivery trips it on the
+            // *second* publish (first publish encodes into the buf,
+            // second sees buf already past the cap and triggers the
+            // policy).
+            slow_consumer_buffer_bytes: 1,
+        });
+        let topic = TopicName::new("slow-consumer");
+        let slot = std::sync::Arc::new(PushSlot::new(64));
+        let encoder: DeliveryEncoder = std::sync::Arc::new(|buf, _qos, _tag, _topic, payload| {
+            buf.extend_from_slice(payload);
+        });
+
+        broker.subscribe_with_slot(
+            ClientId::new("c"),
+            topic.clone(),
+            QoSLevel::AtMostOnce,
+            1,
+            slot.clone(),
+            encoder,
+        );
+        assert_eq!(broker.subscriber_count(), 1);
+
+        // First publish: buf is empty (< threshold), encoded successfully.
+        broker.publish(&topic, Bytes::from_static(b"x"), QoSLevel::AtMostOnce);
+        // Second publish: buf is now 1 byte (>= threshold), policy fires.
+        broker.publish(&topic, Bytes::from_static(b"y"), QoSLevel::AtMostOnce);
+
+        assert!(
+            broker.push_dropped_total() >= 1,
+            "expected at least one drop, got {}",
+            broker.push_dropped_total(),
+        );
+        assert_eq!(
+            broker.subscriber_count(),
+            0,
+            "DropSubscription should have unsubscribed the slow consumer",
+        );
     }
 }

@@ -178,6 +178,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     per_subscriber_queue_capacity: 1024,
                     max_retries: config.max_retries,
                     retry_base_delay: std::time::Duration::from_millis(config.retry_backoff_ms),
+                    ..Default::default()
                 },
                 wal.clone(),
             ));

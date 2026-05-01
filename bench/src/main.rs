@@ -406,6 +406,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         per_subscriber_queue_capacity: 4096,
         max_retries: 3,
         retry_base_delay: Duration::from_millis(50),
+        ..Default::default()
     };
 
     let broker = if let Some(wal) = wal.clone() {

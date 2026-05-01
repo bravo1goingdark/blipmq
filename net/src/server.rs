@@ -6,7 +6,7 @@ use auth::ApiKeyValidator;
 use bytes::Bytes;
 use corelib::{
     Broker, ClientId, DeliveryEncoder, DeliveryTag, PushSender, PushSlot, QoSLevel, SubscriptionId,
-    TopicName,
+    TopicName, WalError,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -228,6 +228,25 @@ impl BrokerHandler {
         }
     }
 
+    /// Validate a topic name string. Returns `Some(reason)` if invalid;
+    /// `None` if acceptable. Rules:
+    /// - Non-empty.
+    /// - Length must fit in the wire format's u16 (max 65535 bytes).
+    /// - No NUL bytes (would confuse log lines, debug tooling, and some
+    ///   clients).
+    fn validate_topic(topic: &str) -> Option<&'static str> {
+        if topic.is_empty() {
+            return Some("empty topic");
+        }
+        if topic.len() > u16::MAX as usize {
+            return Some("topic too long");
+        }
+        if topic.as_bytes().contains(&0) {
+            return Some("topic contains NUL byte");
+        }
+        None
+    }
+
     fn make_nack(&self, correlation_id: u64, code: u16, message: &str) -> Result<Frame, Error> {
         let payload = NackPayload {
             code,
@@ -286,8 +305,8 @@ impl MessageHandler for BrokerHandler {
             }
         };
 
-        if payload.topic.is_empty() {
-            let nack = self.make_nack(frame.correlation_id, 400, "empty topic")?;
+        if let Some(reason) = Self::validate_topic(&payload.topic) {
+            let nack = self.make_nack(frame.correlation_id, 400, reason)?;
             return Ok(FrameResponse::Frame(nack));
         }
 
@@ -336,11 +355,11 @@ impl MessageHandler for BrokerHandler {
             }
         };
 
-        if payload.topic.is_empty() {
+        if let Some(reason) = Self::validate_topic(&payload.topic) {
             return Ok(FrameResponse::Frame(self.make_nack(
                 frame.correlation_id,
                 400,
-                "empty topic",
+                reason,
             )?));
         }
 
@@ -401,8 +420,8 @@ impl MessageHandler for BrokerHandler {
             }
         };
 
-        if payload.topic.is_empty() {
-            return Ok(Some(self.make_nack(frame.correlation_id, 400, "empty topic")?));
+        if let Some(reason) = Self::validate_topic(payload.topic_str()) {
+            return Ok(Some(self.make_nack(frame.correlation_id, 400, reason)?));
         }
 
         let qos = match self.qos_from_u8(payload.qos) {
@@ -443,8 +462,8 @@ impl BrokerHandler {
             }
         };
 
-        if payload.topic.is_empty() {
-            let nack = self.make_nack(frame.correlation_id, 400, "empty topic")?;
+        if let Some(reason) = Self::validate_topic(payload.topic_str()) {
+            let nack = self.make_nack(frame.correlation_id, 400, reason)?;
             return Ok(FrameResponse::Frame(nack));
         }
 
@@ -464,10 +483,19 @@ impl BrokerHandler {
                 .publish_durable(&topic, payload.message, qos)
                 .await
             {
+                // Distinguish transient overload (WAL channel full / writer
+                // stopped) from real broker errors so clients can retry
+                // with backoff on the former without confusing it with
+                // a bug.
+                let (code, label) = match &e {
+                    WalError::Backpressure(_) => (503, "wal_busy"),
+                    WalError::WriterStopped => (503, "wal_writer_stopped"),
+                    _ => (500, "durable_publish_failed"),
+                };
                 let nack = self.make_nack(
                     frame.correlation_id,
-                    500,
-                    &format!("durable publish failed: {e}"),
+                    code,
+                    &format!("{label}: {e}"),
                 )?;
                 return Ok(FrameResponse::Frame(nack));
             }
@@ -489,8 +517,8 @@ impl BrokerHandler {
             }
         };
 
-        if payload.topic.is_empty() {
-            let nack = self.make_nack(frame.correlation_id, 400, "empty topic")?;
+        if let Some(reason) = Self::validate_topic(&payload.topic) {
+            let nack = self.make_nack(frame.correlation_id, 400, reason)?;
             return Ok(FrameResponse::Frame(nack));
         }
 

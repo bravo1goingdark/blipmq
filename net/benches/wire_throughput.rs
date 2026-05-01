@@ -32,6 +32,7 @@ async fn start_server() -> (SocketAddr, watch::Sender<bool>, Arc<Broker>) {
         per_subscriber_queue_capacity: 65_536,
         max_retries: 3,
         retry_base_delay: Duration::from_millis(50),
+        ..Default::default()
     }));
 
     let handler = BrokerHandler::new(broker.clone());

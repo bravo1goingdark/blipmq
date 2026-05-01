@@ -19,6 +19,8 @@ fn make_broker() -> Broker {
         per_subscriber_queue_capacity: 16_384,
         max_retries: 3,
         retry_base_delay: Duration::from_millis(50),
+        slow_consumer_policy: corelib::SlowConsumerPolicy::DropNewest,
+        slow_consumer_buffer_bytes: 16 * 1024 * 1024,
     })
 }
 
