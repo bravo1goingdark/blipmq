@@ -4,9 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use auth::ApiKeyValidator;
 use bytes::Bytes;
-use corelib::{Broker, ClientId, DeliveryHandle, DeliveryTag, QoSLevel, SubscriptionId, TopicName};
+use corelib::{Broker, ClientId, DeliveryTag, PushSender, QoSLevel, SubscriptionId, TopicName};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{debug, error, info};
 
 use crate::connection::Connection;
@@ -38,7 +38,7 @@ pub trait MessageHandler: Send + Sync + 'static {
         &self,
         conn_id: u64,
         frame: Frame,
-        _push_tx: mpsc::Sender<DeliveryHandle>,
+        _push_tx: PushSender,
     ) -> Result<FrameResponse, Error> {
         self.handle_frame(conn_id, frame).await
     }
@@ -200,7 +200,7 @@ impl MessageHandler for BrokerHandler {
         &self,
         conn_id: u64,
         frame: Frame,
-        push_tx: mpsc::Sender<DeliveryHandle>,
+        push_tx: PushSender,
     ) -> Result<FrameResponse, Error> {
         let decoded = SubscribePayload::decode(&frame.payload);
         let payload = match decoded {

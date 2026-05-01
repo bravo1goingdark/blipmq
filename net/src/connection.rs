@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use corelib::DeliveryHandle;
+use corelib::{DeliveryHandle, PushReceiver, PushSender};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -82,11 +82,16 @@ where
 
         // Push channel: broker -> writer task. Sender is cloned into every
         // SUBSCRIBE for this connection; receiver lives in the writer task.
-        let (push_tx, push_rx) = mpsc::channel::<DeliveryHandle>(PUSH_CHANNEL_CAPACITY);
+        // We use `flume` here (not `tokio::sync::mpsc`) because per-op
+        // overhead measurably matters at multi-million msg/s; recv_async
+        // integrates cleanly with tokio's runtime.
+        let (push_tx, push_rx) = flume::bounded::<DeliveryHandle>(PUSH_CHANNEL_CAPACITY);
 
         // In-band channel: reader -> writer for handler-synthesized frames
         // (ACK/NACK/PONG/Subscribe-ACK/etc). Decouples reader from blocking
-        // on the wire.
+        // on the wire. Stays on tokio::sync::mpsc because (a) it's not on
+        // the hot path and (b) we already use tokio::select! over both
+        // channels together.
         let (inband_tx, inband_rx) = mpsc::channel::<Frame>(INBAND_CHANNEL_CAPACITY);
 
         let writer_shutdown = self.shutdown.clone();
@@ -132,20 +137,21 @@ where
 async fn writer_task(
     conn_id: u64,
     mut write_half: OwnedWriteHalf,
-    mut push_rx: mpsc::Receiver<DeliveryHandle>,
+    push_rx: PushReceiver,
     mut inband_rx: mpsc::Receiver<Frame>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut buf = BytesMut::with_capacity(INITIAL_BUFFER_SIZE);
 
     loop {
-        // Block until we have something to write, or shutdown.
+        // Block until we have something to write, or shutdown. flume's
+        // recv_async returns Err once the last Sender is dropped.
         let first = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
-            d = push_rx.recv() => match d {
-                Some(d) => WriterItem::Deliver(d),
-                None => {
+            d = push_rx.recv_async() => match d {
+                Ok(d) => WriterItem::Deliver(d),
+                Err(_) => {
                     // No more push senders; only inband can fire from now on.
                     match inband_rx.recv().await {
                         Some(f) => WriterItem::Frame(f),
@@ -156,9 +162,9 @@ async fn writer_task(
             f = inband_rx.recv() => match f {
                 Some(f) => WriterItem::Frame(f),
                 None => {
-                    match push_rx.recv().await {
-                        Some(d) => WriterItem::Deliver(d),
-                        None => break,
+                    match push_rx.recv_async().await {
+                        Ok(d) => WriterItem::Deliver(d),
+                        Err(_) => break,
                     }
                 }
             },
@@ -181,8 +187,8 @@ async fn writer_task(
                     }
                     frames_in_batch += 1;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(flume::TryRecvError::Empty) => break,
+                Err(flume::TryRecvError::Disconnected) => break,
             }
         }
         // Drain any inband responses (ACK/NACK/PONG) that piled up.
@@ -243,7 +249,7 @@ where
     handler: H,
     auth_validator: Arc<dyn ApiKeyValidator>,
     shutdown: watch::Receiver<bool>,
-    push_tx: mpsc::Sender<DeliveryHandle>,
+    push_tx: PushSender,
     inband_tx: mpsc::Sender<Frame>,
     read_buf: BytesMut,
     hello_performed: bool,
@@ -260,7 +266,7 @@ where
         handler: H,
         auth_validator: Arc<dyn ApiKeyValidator>,
         shutdown: watch::Receiver<bool>,
-        push_tx: mpsc::Sender<DeliveryHandle>,
+        push_tx: PushSender,
         inband_tx: mpsc::Sender<Frame>,
     ) -> Self {
         Self {

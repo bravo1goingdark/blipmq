@@ -17,9 +17,11 @@ wal = { path = "../wal" }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 ahash = "0.8"
+smallvec = "1"
+flume = { version = "0.11", default-features = false, features = ["async"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

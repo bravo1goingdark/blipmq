@@ -14,6 +14,7 @@ corelib = { path = "../core", package = "core" }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 auth = { path = "../auth" }
+flume = { version = "0.11", default-features = false, features = ["async"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util"] }
@@ -21,5 +22,9 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
 name = "wire_throughput"
+harness = false
+
+[[bench]]
+name = "wire_fanout"
 harness = false
 
