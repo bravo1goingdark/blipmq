@@ -179,6 +179,9 @@ pub struct Broker {
     next_subscription_id: AtomicU64,
     wal: Option<Arc<WriteAheadLog>>,
     shutting_down: std::sync::atomic::AtomicBool,
+    /// `true` once the daemon has called `mark_ready()` (typically after WAL
+    /// replay finishes). The `/readyz` probe consults this.
+    ready: std::sync::atomic::AtomicBool,
     messages_published_total: std::sync::atomic::AtomicU64,
     messages_delivered_total: std::sync::atomic::AtomicU64,
     /// Total messages dropped due to a slow push consumer (mpsc Sender::try_send
@@ -189,9 +192,23 @@ pub struct Broker {
 
 #[derive(Debug)]
 struct Topic {
-    #[allow(dead_code)]
     name: TopicName,
     subscribers: RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>,
+    /// Number of `publish` calls that landed on this topic (one per
+    /// publisher message, regardless of fanout).
+    published_total: AtomicU64,
+    /// Number of `DeliveryHandle`s emitted from fanout for this topic
+    /// (i.e. published × matched-subscribers).
+    delivered_total: AtomicU64,
+}
+
+/// Per-topic metrics snapshot, returned by `Broker::topic_metrics`.
+#[derive(Debug, Clone)]
+pub struct TopicMetrics {
+    pub topic: TopicName,
+    pub published_total: u64,
+    pub delivered_total: u64,
+    pub subscriber_count: usize,
 }
 
 #[derive(Debug)]
@@ -808,6 +825,8 @@ impl Topic {
         Self {
             name,
             subscribers: RwLock::new(HashMap::new()),
+            published_total: AtomicU64::new(0),
+            delivered_total: AtomicU64::new(0),
         }
     }
 }
@@ -823,6 +842,7 @@ impl Broker {
             config,
             wal: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            ready: std::sync::atomic::AtomicBool::new(false),
             messages_published_total: std::sync::atomic::AtomicU64::new(0),
             messages_delivered_total: std::sync::atomic::AtomicU64::new(0),
             push_dropped_total: std::sync::atomic::AtomicU64::new(0),
@@ -841,6 +861,7 @@ impl Broker {
             config,
             wal: Some(wal),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            ready: std::sync::atomic::AtomicBool::new(false),
             messages_published_total: AtomicU64::new(0),
             messages_delivered_total: AtomicU64::new(0),
             push_dropped_total: AtomicU64::new(0),
@@ -1013,6 +1034,37 @@ impl Broker {
         self.push_dropped_total.load(Ordering::Relaxed)
     }
 
+    /// Mark the broker as ready to accept traffic. Called by the daemon
+    /// after WAL replay completes.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    /// True iff the broker has finished startup (WAL replay) and is not
+    /// shutting down. Used by the readiness probe.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && !self.is_shutting_down()
+    }
+
+    /// Snapshot of per-topic counters. The topic registry is sharded; this
+    /// walks all shards under read locks. Cost is O(num_topics); fine for
+    /// Prometheus's typical 15-second scrape interval.
+    pub fn topic_metrics(&self) -> Vec<TopicMetrics> {
+        let mut out = Vec::new();
+        for shard in &self.topics.shards {
+            let guard = shard.read();
+            for topic in guard.values() {
+                out.push(TopicMetrics {
+                    topic: topic.name.clone(),
+                    published_total: topic.published_total.load(Ordering::Relaxed),
+                    delivered_total: topic.delivered_total.load(Ordering::Relaxed),
+                    subscriber_count: topic.subscribers.read().len(),
+                });
+            }
+        }
+        out
+    }
+
     #[inline(always)]
     pub fn publish(&self, topic: &TopicName, payload: Bytes, qos: QoSLevel) {
         self.publish_with_wal_id(topic, payload, qos, None);
@@ -1035,6 +1087,9 @@ impl Broker {
             Some(t) => t,
             None => return,
         };
+        topic.published_total.fetch_add(1, Ordering::Relaxed);
+        self.messages_published_total
+            .fetch_add(1, Ordering::Relaxed);
 
         // Snapshot the subscriber list under a brief read lock. With many
         // subscribers, holding the lock across the whole fanout would
@@ -1066,6 +1121,9 @@ impl Broker {
                     encoder(&mut buf, qos, wire_tag, topic_name.as_str(), &payload);
                 }
                 slot.notify.notify_one();
+                topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                self.messages_delivered_total
+                    .fetch_add(1, Ordering::Relaxed);
                 let _ = sub_id; // unused on this path
             } else if let Some(sender) = &subscriber.push_sender {
                 // Legacy channel-based push.
@@ -1093,12 +1151,19 @@ impl Broker {
                     if qos == QoSLevel::AtLeastOnce {
                         subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
                     }
+                } else {
+                    topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                    self.messages_delivered_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             } else {
                 // Poll path (v1): unchanged.
                 subscriber
                     .queue
                     .enqueue(payload.clone(), qos, wal_id, Some(self.config.message_ttl));
+                topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                self.messages_delivered_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }

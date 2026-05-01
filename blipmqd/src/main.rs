@@ -182,8 +182,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 wal.clone(),
             ));
 
-            // Replay WAL at startup to restore durable state.
+            // Replay WAL at startup to restore durable state. Only after
+            // replay completes do we mark the broker ready, so the
+            // /readyz probe correctly returns 503 during startup.
             broker.replay_from_wal().await?;
+            broker.mark_ready();
 
             let auth_validator =
                 Arc::new(StaticApiKeyValidator::from_keys(&config.allowed_api_keys));
