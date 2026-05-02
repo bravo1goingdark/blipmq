@@ -9,4 +9,6 @@ pub use crate::frame::{
     Frame, FrameDecodeError, FrameEncodeError, FrameType, HelloPayload, NackPayload, PingPayload,
     PollPayload, PongPayload, PublishPayload, SubscribePayload, PROTOCOL_VERSION,
 };
-pub use crate::server::{BrokerHandler, FrameResponse, MessageHandler, NetworkConfig, Server};
+pub use crate::server::{
+    BrokerHandler, FrameResponse, MessageHandler, NetworkConfig, Server, TlsConfig,
+};

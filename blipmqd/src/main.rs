@@ -212,7 +212,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let server = Server::new(
                 NetworkConfig {
                     bind_addr: SocketAddr::new(config.bind_addr.parse().unwrap(), config.port),
-                    tls: None,
+                    tls: match (&config.tls_cert_path, &config.tls_key_path) {
+                        (Some(cert), Some(key)) => Some(net::TlsConfig {
+                            cert_chain: cert.into(),
+                            private_key: key.into(),
+                        }),
+                        _ => None,
+                    },
                 },
                 handler.clone(),
                 auth_validator,
@@ -314,10 +320,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             broker.begin_shutdown();
             let _ = shutdown_tx.send(true);
 
+            // Notify-based drain. Wakes the instant the last QoS1 inflight
+            // is acked or expired -- no fixed 50ms polling slack.
             let drain_timeout = Duration::from_secs(2);
-            let start = std::time::Instant::now();
-            while broker.inflight_message_count() > 0 && start.elapsed() < drain_timeout {
-                time::sleep(Duration::from_millis(50)).await;
+            let drained = broker.wait_for_drain(drain_timeout).await;
+            if !drained {
+                error!(
+                    "drain timeout after {:?} with {} inflight messages still pending; flushing WAL anyway",
+                    drain_timeout,
+                    broker.inflight_message_count(),
+                );
             }
 
             broker.flush_wal().await?;

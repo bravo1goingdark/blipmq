@@ -372,6 +372,12 @@ pub struct Broker {
     /// subscriptions stay on the `TopicShards` fast path and don't appear
     /// here.
     wildcard_subs: RwLock<Vec<(SubjectPattern, SubscriptionId)>>,
+    /// Fires whenever the broker's inflight QoS1 count could have
+    /// decreased (an ack or a maintenance-tick expiry/retry-drop).
+    /// `wait_for_drain` awaits this so graceful shutdown completes the
+    /// instant the last in-flight clears, instead of paying a 50 ms
+    /// polling slack.
+    drain_notify: Notify,
 }
 
 /// A latency snapshot captured for the metrics endpoint. Times are in
@@ -1175,6 +1181,7 @@ impl Broker {
                     .expect("histogram bounds valid"),
             ),
             wildcard_subs: RwLock::new(Vec::new()),
+            drain_notify: Notify::new(),
         }
     }
 
@@ -1201,6 +1208,7 @@ impl Broker {
                     .expect("histogram bounds valid"),
             ),
             wildcard_subs: RwLock::new(Vec::new()),
+            drain_notify: Notify::new(),
         }
     }
 
@@ -1921,6 +1929,10 @@ impl Broker {
             }
         }
 
+        // Inflight count just dropped (we removed an entry). Wake any
+        // graceful-shutdown waiter that's blocked on a drain.
+        self.drain_notify.notify_waiters();
+
         // Journal the ack if (a) the message was WAL-backed and (b) the
         // broker is configured with a WAL. Channel-gated (no fsync wait):
         // ack records are idempotent, so losing the trailing ack on a
@@ -2039,6 +2051,38 @@ impl Broker {
                     self.config.max_retries,
                     self.config.retry_base_delay,
                 );
+            }
+        }
+        // Maintenance may have expired or dropped inflight entries; wake
+        // any graceful-shutdown waiter so it re-checks immediately.
+        self.drain_notify.notify_waiters();
+    }
+
+    /// Wait for `inflight_message_count()` to reach zero, or for `timeout`
+    /// to elapse. Returns true if the queue drained within the budget,
+    /// false on timeout. Used by graceful shutdown to avoid a fixed-cost
+    /// polling loop: the broker fires `drain_notify` on every ack and
+    /// every maintenance tick, so the wait wakes immediately when the
+    /// last in-flight clears.
+    pub async fn wait_for_drain(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.inflight_message_count() == 0 {
+                return true;
+            }
+            // Subscribe to notifications BEFORE checking remaining-time so
+            // a notification that fires between the inflight read and the
+            // sleep is not lost (Notify holds a permit if a waiter races).
+            let notified = self.drain_notify.notified();
+            let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => return self.inflight_message_count() == 0,
+            };
+            tokio::select! {
+                _ = notified => continue,
+                _ = tokio::time::sleep(remaining) => {
+                    return self.inflight_message_count() == 0;
+                }
             }
         }
     }

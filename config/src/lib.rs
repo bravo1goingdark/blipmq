@@ -17,6 +17,11 @@ pub struct Config {
     pub retry_backoff_ms: u64,
     pub allowed_api_keys: Vec<String>,
     pub enable_tokio_console: bool,
+    /// Optional TLS cert chain (PEM). If `Some`, [`tls_key_path`] must
+    /// also be set; the daemon then accepts only TLS connections.
+    pub tls_cert_path: Option<String>,
+    /// Optional TLS private key (PEM, PKCS#8 or PKCS#1 RSA).
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -31,6 +36,8 @@ struct FileConfig {
     pub retry_backoff_ms: Option<u64>,
     pub allowed_api_keys: Option<Vec<String>>,
     pub enable_tokio_console: Option<bool>,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -94,6 +101,8 @@ impl Config {
         let mut retry_backoff_ms = file_cfg.retry_backoff_ms.unwrap_or(100);
         let mut allowed_api_keys = file_cfg.allowed_api_keys.unwrap_or_else(Vec::new);
         let mut enable_tokio_console = file_cfg.enable_tokio_console.unwrap_or(false);
+        let mut tls_cert_path = file_cfg.tls_cert_path;
+        let mut tls_key_path = file_cfg.tls_key_path;
 
         // Env overrides.
         if let Ok(v) = env::var("BLIPMQ_BIND_ADDR") {
@@ -149,6 +158,19 @@ impl Config {
             enable_tokio_console =
                 matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
+        if let Ok(v) = env::var("BLIPMQ_TLS_CERT_PATH") {
+            tls_cert_path = Some(v);
+        }
+        if let Ok(v) = env::var("BLIPMQ_TLS_KEY_PATH") {
+            tls_key_path = Some(v);
+        }
+
+        // Both cert and key must be set together; otherwise treat as no TLS.
+        if tls_cert_path.is_some() != tls_key_path.is_some() {
+            return Err(ConfigError::Parse(
+                "tls_cert_path and tls_key_path must be set together".to_string(),
+            ));
+        }
 
         Ok(Config {
             bind_addr,
@@ -161,6 +183,8 @@ impl Config {
             retry_backoff_ms,
             allowed_api_keys,
             enable_tokio_console,
+            tls_cert_path,
+            tls_key_path,
         })
     }
 }

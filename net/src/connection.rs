@@ -257,11 +257,21 @@ where
     read_buf: BytesMut,
     hello_performed: bool,
     authenticated: bool,
+    /// Number of failed AUTH attempts on this connection. Each failure
+    /// triggers an exponential backoff before the NACK goes out, and the
+    /// connection is closed once the count reaches `MAX_AUTH_FAILURES`.
+    /// Resets to 0 on a successful AUTH.
+    auth_failures: u32,
     /// Single-slot cache of the most-recently resolved publish topic.
     /// Common publisher pattern is "publish 1M to one topic" — this turns
     /// per-frame `Arc<str>` allocation into a refcount bump.
     topic_cache: PublishTopicCache,
 }
+
+/// Hard cap on consecutive failed AUTH attempts on one connection. After
+/// this many failures the conn is closed; legitimate clients with a bad
+/// key well below this limit hit only the exponential backoff.
+const MAX_AUTH_FAILURES: u32 = 5;
 
 impl<H> ReaderState<H>
 where
@@ -288,6 +298,7 @@ where
             read_buf: BytesMut::with_capacity(INITIAL_BUFFER_SIZE),
             hello_performed: false,
             authenticated: false,
+            auth_failures: 0,
             topic_cache: PublishTopicCache::default(),
         }
     }
@@ -413,10 +424,37 @@ where
         let api_key = ApiKey::new(payload.api_key);
         if self.auth_validator.validate(&api_key) {
             self.authenticated = true;
+            self.auth_failures = 0;
             self.send_ack(frame.correlation_id).await
         } else {
+            self.auth_failures = self.auth_failures.saturating_add(1);
+
+            // Exponential backoff before the NACK goes out: 50ms, 100ms,
+            // 200ms, 400ms, 800ms (capped at 1s). Discourages brute-force
+            // key guessing without making a single typo painful for
+            // legitimate clients.
+            let base_ms = 50u64;
+            let backoff_ms =
+                base_ms.saturating_mul(1u64 << (self.auth_failures.min(5) - 1).min(4)).min(1000);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+
             self.send_nack(frame.correlation_id, 401, "invalid API key")
-                .await
+                .await?;
+
+            // Hard cap. Beyond this, close the connection so a brute-
+            // forcer has to re-establish TCP (and re-pay TLS handshake
+            // cost when TLS is on) for every additional batch of attempts.
+            if self.auth_failures >= MAX_AUTH_FAILURES {
+                debug!(
+                    "conn {} closing after {} failed AUTH attempts",
+                    self.id, self.auth_failures,
+                );
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "too many failed AUTH attempts",
+                )));
+            }
+            Ok(())
         }
     }
 
