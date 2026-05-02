@@ -1683,8 +1683,13 @@ impl Broker {
         self.publish_with_wal_id(topic, payload, qos, None, ttl);
     }
 
+    // No `#[tracing::instrument]` on this — the macro still creates,
+    // enters, and exits a span per call even when the level is filtered
+    // out by the default subscriber, which costs us measurable time at
+    // multi-M ops/sec. If a future debugging session needs trace-level
+    // visibility into publish, add it back behind a `cfg(debug_assertions)`
+    // gate or an explicit feature flag.
     #[inline(always)]
-    #[tracing::instrument(skip(self, payload))]
     fn publish_with_wal_id(
         &self,
         topic_name: &TopicName,

@@ -291,7 +291,6 @@ impl WriteAheadLog {
     /// writer task. The record is *not* guaranteed to be on disk when this
     /// returns. Use [`Self::append_durable`] for fsync-gated semantics.
     #[inline(always)]
-    #[tracing::instrument(skip(self, data))]
     pub async fn append(&self, data: Bytes) -> Result<u64, WalError> {
         let (id, request) = self.build_request(data, None)?;
         self.send_request(request)?;
@@ -301,7 +300,6 @@ impl WriteAheadLog {
     /// Append a record and wait for the next fsync that covers it. When this
     /// returns `Ok`, the record is durable on disk.
     #[inline]
-    #[tracing::instrument(skip(self, data))]
     pub async fn append_durable(&self, data: Bytes) -> Result<u64, WalError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         let (id, request) = self.build_request(data, Some(ack_tx))?;

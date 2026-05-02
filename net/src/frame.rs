@@ -457,7 +457,6 @@ pub struct PongPayload;
 
 /// Encode a frame into the provided buffer.
 #[inline(always)]
-#[tracing::instrument(skip(frame, dst))]
 pub fn encode_frame(frame: &Frame, dst: &mut BytesMut) -> Result<(), FrameEncodeError> {
     let payload_len = frame.payload.len();
     let total_len = 1usize
@@ -532,7 +531,6 @@ pub fn encode_deliver_frame(
 ///
 /// Returns `Ok(None)` if there is not yet enough data to decode a full frame.
 #[inline(always)]
-#[tracing::instrument(skip(src))]
 pub fn try_decode_frame(src: &mut BytesMut) -> Result<Option<Frame>, FrameDecodeError> {
     if src.len() < LENGTH_FIELD_LEN {
         return Ok(None);
