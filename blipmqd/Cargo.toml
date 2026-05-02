@@ -6,6 +6,15 @@ authors.workspace = true
 description = "BlipMQ broker daemon"
 license.workspace = true
 
+[features]
+# `mimalloc` is on by default for the daemon binary because it gives a
+# measurable lift on the broker's hot path (lots of small Bytes /
+# BytesMut allocations + Arc refcounts). Disable with
+# `--no-default-features` if you need the system allocator (e.g. for
+# tooling that relies on glibc malloc hooks).
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -19,4 +28,5 @@ auth = { path = "../auth" }
 metrics = { path = "../metrics" }
 config = { path = "../config" }
 clap = { workspace = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 

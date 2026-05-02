@@ -13,6 +13,9 @@
 //! is at the edge of userspace TCP on one core) or, more realistically,
 //! N parallel pipes aggregating to >= 5 M.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

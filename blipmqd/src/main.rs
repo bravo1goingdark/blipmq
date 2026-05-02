@@ -2,6 +2,16 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+// Use mimalloc as the global allocator for the daemon. Broker hot paths
+// allocate heavily (BytesMut growth, Arc refcounts, hashmap rehashes); on
+// allocation-heavy workloads mimalloc typically delivers 10-30% over the
+// system allocator with no source changes downstream. Gated on the
+// `mimalloc` feature (on by default) so users can fall back to the
+// platform allocator if they need glibc malloc hooks.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use tokio::signal;
 use tokio::sync::watch;

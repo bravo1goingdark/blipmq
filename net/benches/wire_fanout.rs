@@ -6,6 +6,9 @@
 //! reported is `(M × N) / wall_time` — what NATS quotes as its pub-sub
 //! headline.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

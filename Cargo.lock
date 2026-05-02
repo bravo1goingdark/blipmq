@@ -318,6 +318,7 @@ dependencies = [
  "console-subscriber",
  "core",
  "metrics",
+ "mimalloc",
  "net",
  "tokio",
  "tracing",
@@ -1402,6 +1403,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1458,6 +1468,15 @@ dependencies = [
  "tokio",
  "tracing",
  "wal",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -1539,6 +1558,7 @@ dependencies = [
  "core",
  "criterion",
  "flume",
+ "mimalloc",
  "rcgen",
  "rustls-pemfile 2.2.0",
  "tempfile",

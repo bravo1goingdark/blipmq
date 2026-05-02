@@ -10,6 +10,13 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
 use hdrhistogram::Histogram;
 use parking_lot::{Mutex, RwLock};
+
+/// Take a latency sample 1 publish in N. Power of two so the test is
+/// `count & MASK == 0`. 64 keeps p99 estimates accurate to within
+/// ~hundreds of microseconds at 1 M+ publishes/sec, while removing
+/// the histogram lock from 63/64 of publishes.
+const PUBLISH_LATENCY_SAMPLE_INTERVAL: u64 = 64;
+const PUBLISH_LATENCY_SAMPLE_MASK: u64 = PUBLISH_LATENCY_SAMPLE_INTERVAL - 1;
 use smallvec::SmallVec;
 use tokio::sync::Notify;
 use wal::{WalError as LogError, WalRecord, WriteAheadLog};
@@ -370,9 +377,13 @@ pub struct Broker {
     /// captured wholesale by `current_snapshot`.
     ack_cursors: RwLock<HashMap<(String, String), u64>>,
     /// Latency histogram for the `publish_with_wal_id` fanout path,
-    /// recording total publish-to-encode time in nanoseconds. Sampled by
-    /// the metrics endpoint.
+    /// recording total publish-to-encode time in nanoseconds. The hot
+    /// path samples 1-in-`PUBLISH_LATENCY_SAMPLE_INTERVAL` publishes
+    /// (atomic counter + bitmask) so the typical publish never even
+    /// attempts the lock. The metrics endpoint reads the same Mutex.
     publish_fanout_ns: Mutex<Histogram<u64>>,
+    /// Monotonic publish counter for sample-based histogram recording.
+    publish_count: AtomicU64,
     /// Subscriptions whose pattern contains at least one wildcard. Lookup
     /// on publish is a linear scan — fine for hundreds of patterns; a
     /// later phase could replace this with a subject trie. Exact-match
@@ -1213,6 +1224,7 @@ impl Broker {
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
+            publish_count: AtomicU64::new(0),
             wildcard_subs: RwLock::new(Vec::new()),
             wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
@@ -1241,6 +1253,7 @@ impl Broker {
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
+            publish_count: AtomicU64::new(0),
             wildcard_subs: RwLock::new(Vec::new()),
             wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
@@ -1614,7 +1627,19 @@ impl Broker {
             return;
         }
 
-        let start = std::time::Instant::now();
+        // Decide up-front whether this publish gets a latency sample.
+        // The non-sampled path skips both `Instant::now()` and the
+        // histogram lock, leaving only one Relaxed atomic add on the
+        // hot path. Sample interval is 1-in-64.
+        let n = self
+            .publish_count
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let sample_start: Option<std::time::Instant> = if n & PUBLISH_LATENCY_SAMPLE_MASK == 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Resolve the effective TTL for this publish: per-message override
         // when set, otherwise the broker default. The Option-Some wrapping
@@ -1794,18 +1819,15 @@ impl Broker {
             self.unsubscribe_one(sid);
         }
 
-        // Record fanout latency, but never block the hot path on the
-        // histogram lock: under multi-publisher contention an N-way
-        // serialize on a single mutex would dominate the budget. We
-        // `try_lock` instead — if another thread is currently recording,
-        // this publish skips the sample. The histogram still gets a
-        // representative distribution (samples are uniformly random with
-        // respect to publish-rate variation per pipe), and the metrics
-        // endpoint reads correct quantiles. Saturating record so the
-        // histogram's 60s upper bound never causes a real error.
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
-        if let Some(mut h) = self.publish_fanout_ns.try_lock() {
-            let _ = h.saturating_record(elapsed_ns);
+        // Record latency only on sampled publishes. Non-sampled
+        // publishes skipped the `Instant::now()` capture too, so the
+        // hot path's only cost was one Relaxed atomic add at function
+        // entry.
+        if let Some(start) = sample_start {
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            if let Some(mut h) = self.publish_fanout_ns.try_lock() {
+                let _ = h.saturating_record(elapsed_ns);
+            }
         }
     }
 

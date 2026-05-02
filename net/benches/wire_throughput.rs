@@ -5,6 +5,9 @@
 //! the broker can absorb from one publisher while one subscriber is
 //! draining DELIVER frames. This is the M1 milestone shape.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
