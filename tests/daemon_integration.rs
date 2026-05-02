@@ -149,6 +149,7 @@ async fn publish_receive_ack_qos1() {
         topic: "integration".to_string(),
         qos: 1,
         group: None,
+        from_offset: None,
     }
     .encode()
     .expect("encode subscribe");
@@ -228,6 +229,7 @@ async fn multiple_subscribers_receive_same_message() {
         topic: "fanout".to_string(),
         qos: 1,
         group: None,
+        from_offset: None,
     }
     .encode()
     .expect("encode subscribe1");
@@ -246,6 +248,7 @@ async fn multiple_subscribers_receive_same_message() {
         topic: "fanout".to_string(),
         qos: 1,
         group: None,
+        from_offset: None,
     }
     .encode()
     .expect("encode subscribe2");
@@ -322,6 +325,7 @@ async fn invalid_topic_and_ack_produce_nack() {
         topic: "".to_string(),
         qos: 1,
         group: None,
+        from_offset: None,
     }
     .encode()
     .expect("encode bad subscribe");

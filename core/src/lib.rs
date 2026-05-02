@@ -2220,6 +2220,136 @@ impl Broker {
         self.replay_from_wal_with_checkpoint(None).await
     }
 
+    /// Replay WAL records from `from_offset` onwards into a single
+    /// already-subscribed subscriber. Used to back the SUBSCRIBE
+    /// `from_offset` (offset replay) feature: after the live
+    /// subscription is registered, the broker walks the WAL from
+    /// `from_offset` and pushes every Message record matching this
+    /// subscriber's topic onto its push slot or push channel. Ack
+    /// records and records on other topics are skipped. QoS1 records
+    /// are re-enqueued as inflight so subsequent ACKs still journal
+    /// correctly.
+    ///
+    /// **Duplicates with live publishes:** because we don't pause
+    /// publishes during replay, records published between subscribe
+    /// time and replay completion may be delivered twice — once via
+    /// the live fanout and once via this method. Clients should
+    /// dedupe on the message body / their own publisher-side id when
+    /// using offset replay. A future commit may add atomic
+    /// subscribe-with-replay to close this window.
+    ///
+    /// Returns `Ok(0)` when no WAL is configured or the subscription
+    /// no longer exists; returns the number of records re-delivered
+    /// otherwise.
+    pub async fn replay_to_subscriber(
+        &self,
+        sub_id: SubscriptionId,
+        from_offset: u64,
+    ) -> Result<u64, LogError> {
+        let wal = match &self.wal {
+            Some(w) => w.clone(),
+            None => return Ok(0),
+        };
+
+        // Resolve the subscriber via the sharded subscriptions map.
+        // Drop the read guard before walking the WAL so subscribe /
+        // unsubscribe writers aren't blocked.
+        let (subscriber, topic_str) = {
+            let shard = self.subscriptions.shard_for(sub_id).read();
+            match shard.get(&sub_id) {
+                Some(sub_ref) => (
+                    sub_ref.subscriber.clone(),
+                    sub_ref.topic.as_str().to_string(),
+                ),
+                None => return Ok(0),
+            }
+        };
+
+        // `from_offset = 0` is the conventional "earliest" alias.
+        // The WAL starts at id 1, so iterate_from(1) yields everything.
+        let start_id = if from_offset == 0 { 1 } else { from_offset };
+        let records: Vec<WalRecord> = wal.iterate_from(start_id).await?;
+
+        let effective_ttl = Some(self.config.message_ttl);
+        let mut delivered: u64 = 0;
+        for record in records {
+            let entry = match WalEntry::decode(&record.payload) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let msg = match entry {
+                WalEntry::Message(m) => m,
+                WalEntry::Ack(_) => continue,
+            };
+            // Filter by topic. The replay is per-subscription, so
+            // only records that would have matched this sub's
+            // (exact-match) topic get re-delivered. Wildcard subs
+            // are not supported on the replay path in this MVP.
+            if msg.topic != topic_str {
+                continue;
+            }
+
+            let payload = msg.payload.clone();
+            let qos = msg.qos;
+
+            if let Some((slot, encoder)) = &subscriber.push_slot {
+                let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
+                if qos == QoSLevel::AtLeastOnce {
+                    subscriber.queue.register_push_inflight(
+                        DeliveryTag(tag),
+                        payload.clone(),
+                        Some(record.id),
+                        effective_ttl,
+                    );
+                }
+                let wire_tag = if qos == QoSLevel::AtLeastOnce { tag } else { 0 };
+                {
+                    let mut buf = slot.buf.lock();
+                    if buf.len() >= self.config.slow_consumer_buffer_bytes {
+                        // Slow consumer mid-replay — drop the rest of
+                        // this record but keep going. The replay
+                        // doesn't run the broker's slow-consumer
+                        // policy (it would be surprising to
+                        // unsubscribe a brand-new subscriber).
+                        if qos == QoSLevel::AtLeastOnce {
+                            subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
+                        }
+                        continue;
+                    }
+                    encoder(&mut buf, qos, wire_tag, &topic_str, &payload);
+                }
+                slot.notify.notify_one();
+                delivered = delivered.saturating_add(1);
+            } else if let Some(sender) = &subscriber.push_sender {
+                let tag = subscriber.push_next_tag.fetch_add(1, Ordering::Relaxed);
+                if qos == QoSLevel::AtLeastOnce {
+                    subscriber.queue.register_push_inflight(
+                        DeliveryTag(tag),
+                        payload.clone(),
+                        Some(record.id),
+                        effective_ttl,
+                    );
+                }
+                let handle = DeliveryHandle {
+                    subscription_id: sub_id,
+                    payload,
+                    qos,
+                    delivery_tag: if qos == QoSLevel::AtLeastOnce { tag } else { 0 },
+                    topic: TopicName::from_str(&topic_str),
+                };
+                if sender.try_send(handle).is_err() {
+                    if qos == QoSLevel::AtLeastOnce {
+                        subscriber.queue.cancel_push_inflight(DeliveryTag(tag));
+                    }
+                    continue;
+                }
+                delivered = delivered.saturating_add(1);
+            }
+        }
+
+        Ok(delivered)
+    }
+
     /// Like `replay_from_wal`, but seeded with a previously-saved
     /// [`CheckpointSnapshot`]. Replay still walks the WAL (so any Ack or
     /// Message records past `snapshot_id` are honored), but Message
@@ -3475,5 +3605,146 @@ mod tests {
             N,
             "group-b should have N total"
         );
+    }
+
+    /// Offset replay MVP: publish 5 durable messages on a topic, then
+    /// subscribe with `from_offset = 3` and ask the broker to replay.
+    /// The new subscriber should receive exactly the records with WAL
+    /// ids >= 3 (i.e. 3 records).
+    #[tokio::test]
+    async fn offset_replay_delivers_records_from_given_offset() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WriteAheadLog::open(dir.path()).await.expect("open WAL"));
+
+        let cfg = BrokerConfig {
+            default_qos: QoSLevel::AtLeastOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: None,
+        };
+
+        let broker = Broker::new_with_wal(cfg, wal.clone());
+        let topic = TopicName::new("events");
+
+        // Publish 5 durable messages with no subscriber. WAL records
+        // are written and assigned sequential ids 1..=5.
+        for i in 0..5 {
+            broker
+                .publish_durable(&topic, Bytes::from(format!("m{i}")), QoSLevel::AtLeastOnce)
+                .await
+                .expect("publish_durable");
+        }
+
+        // Subscribe AFTER the publishes so live fanout doesn't deliver
+        // any of them. The replay should be the only source.
+        let count = Arc::new(AtomicU64::new(0));
+        let counter = count.clone();
+        let slot = Arc::new(PushSlot::new(4096));
+        let encoder: DeliveryEncoder = Arc::new(move |_buf, _qos, _tag, _topic, _payload| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let sub_id = broker.subscribe_with_slot(
+            ClientId::new("replay-c"),
+            topic.clone(),
+            QoSLevel::AtLeastOnce,
+            1,
+            slot,
+            encoder,
+        );
+
+        // Replay from offset 3 → records with id 3, 4, 5 → 3 deliveries.
+        let delivered = broker
+            .replay_to_subscriber(sub_id, 3)
+            .await
+            .expect("replay");
+        assert_eq!(delivered, 3);
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+
+        // Replay from offset 0 (= earliest) should deliver all 5.
+        let count2 = count.clone();
+        let prev = count2.load(Ordering::Relaxed);
+        let delivered_all = broker
+            .replay_to_subscriber(sub_id, 0)
+            .await
+            .expect("replay all");
+        assert_eq!(delivered_all, 5);
+        assert_eq!(count.load(Ordering::Relaxed) - prev, 5);
+
+        // Replay from offset past the WAL's high-water mark should
+        // deliver nothing.
+        let prev2 = count.load(Ordering::Relaxed);
+        let delivered_none = broker
+            .replay_to_subscriber(sub_id, 100)
+            .await
+            .expect("replay none");
+        assert_eq!(delivered_none, 0);
+        assert_eq!(count.load(Ordering::Relaxed), prev2);
+    }
+
+    /// Offset replay must filter by topic: a subscriber on `topic-a`
+    /// asking for replay should not see records published to
+    /// `topic-b`, even if both share the same WAL.
+    #[tokio::test]
+    async fn offset_replay_filters_by_topic() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WriteAheadLog::open(dir.path()).await.expect("open WAL"));
+        let cfg = BrokerConfig {
+            default_qos: QoSLevel::AtLeastOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: None,
+        };
+        let broker = Broker::new_with_wal(cfg, wal.clone());
+
+        let topic_a = TopicName::new("topic-a");
+        let topic_b = TopicName::new("topic-b");
+
+        // Interleave: a, b, a, b, a — three on topic-a, two on topic-b.
+        for (i, t) in [&topic_a, &topic_b, &topic_a, &topic_b, &topic_a]
+            .iter()
+            .enumerate()
+        {
+            broker
+                .publish_durable(t, Bytes::from(format!("m{i}")), QoSLevel::AtLeastOnce)
+                .await
+                .expect("publish_durable");
+        }
+
+        let count = Arc::new(AtomicU64::new(0));
+        let counter = count.clone();
+        let slot = Arc::new(PushSlot::new(4096));
+        let encoder: DeliveryEncoder = Arc::new(move |_buf, _qos, _tag, _topic, _payload| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let sub_id = broker.subscribe_with_slot(
+            ClientId::new("topic-a-sub"),
+            topic_a,
+            QoSLevel::AtLeastOnce,
+            1,
+            slot,
+            encoder,
+        );
+
+        let delivered = broker
+            .replay_to_subscriber(sub_id, 0)
+            .await
+            .expect("replay");
+        assert_eq!(
+            delivered, 3,
+            "topic-a sub should only see topic-a's 3 records"
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 }

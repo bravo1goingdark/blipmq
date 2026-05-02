@@ -380,13 +380,15 @@ impl DeliverPayload {
 }
 
 /// SUBSCRIBE payload: `[u16 topic_len][topic_bytes][u8 qos]` plus
-/// optional `[u16 group_len][group_bytes]` when bit 7 of `qos` is set
-/// (`SUBSCRIBE_FLAG_HAS_GROUP`).
+/// optional trailing fields gated on flag bits in the qos byte:
+/// - bit 7 (`SUBSCRIBE_FLAG_HAS_GROUP`): followed by `[u16 group_len][group_bytes]`
+/// - bit 6 (`SUBSCRIBE_FLAG_HAS_OFFSET`): followed by `[u64 from_offset]`
+///
+/// When both bits are set, the order is group then offset.
 ///
 /// Wire-compatible with the original v2 SUBSCRIBE: clients that don't
-/// need a consumer group leave bit 7 clear and the payload looks
-/// identical to before. Clients opting into a queue-group / consumer-
-/// group set the bit and append the group name.
+/// use either feature leave both flag bits clear and the payload
+/// looks identical to before.
 ///
 /// `qos` low 2 bits = QoS level (0 = at-most-once, 1 = at-least-once).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,13 +399,22 @@ pub struct SubscribePayload {
     /// publishes are load-balanced across the group's members. `None`
     /// is the original broadcast subscribe.
     pub group: Option<String>,
+    /// `Some(N)` requests offset replay: after the live subscribe
+    /// completes, the broker walks the WAL from id `N` onward and
+    /// pushes every Message record matching this subscription's
+    /// topic to the new subscriber. Special value `0` means
+    /// "earliest" (replay from the start of the WAL); `None` means
+    /// "no replay, latest only" (the default).
+    pub from_offset: Option<u64>,
 }
 
 const SUBSCRIBE_FLAG_HAS_GROUP: u8 = 0x80;
+const SUBSCRIBE_FLAG_HAS_OFFSET: u8 = 0x40;
 const SUBSCRIBE_QOS_MASK: u8 = 0x03;
 
 impl SubscribePayload {
-    /// Wire-format QoS byte: low 2 bits = QoS, bit 7 = has_group.
+    /// Wire-format QoS byte: low 2 bits = QoS, bit 7 = has_group,
+    /// bit 6 = has_offset.
     #[inline]
     pub fn qos_level(&self) -> u8 {
         self.qos & SUBSCRIBE_QOS_MASK
@@ -422,19 +433,32 @@ impl SubscribePayload {
             None
         };
 
-        let mut buf = BytesMut::with_capacity(2 + topic_len + 1 + 2 + group_len);
-        buf.put_u16(topic_len_u16);
-        buf.put_slice(topic_bytes);
-        let qos_byte = (self.qos & SUBSCRIBE_QOS_MASK)
-            | if self.group.is_some() {
-                SUBSCRIBE_FLAG_HAS_GROUP
+        let cap = 2
+            + topic_len
+            + 1
+            + if self.group.is_some() {
+                2 + group_len
             } else {
                 0
-            };
+            }
+            + if self.from_offset.is_some() { 8 } else { 0 };
+        let mut buf = BytesMut::with_capacity(cap);
+        buf.put_u16(topic_len_u16);
+        buf.put_slice(topic_bytes);
+        let mut qos_byte = self.qos & SUBSCRIBE_QOS_MASK;
+        if self.group.is_some() {
+            qos_byte |= SUBSCRIBE_FLAG_HAS_GROUP;
+        }
+        if self.from_offset.is_some() {
+            qos_byte |= SUBSCRIBE_FLAG_HAS_OFFSET;
+        }
         buf.put_u8(qos_byte);
         if let (Some(group), Some(glen)) = (&self.group, group_len_u16) {
             buf.put_u16(glen);
             buf.put_slice(group.as_bytes());
+        }
+        if let Some(offset) = self.from_offset {
+            buf.put_u64(offset);
         }
         Ok(buf.freeze())
     }
@@ -457,6 +481,7 @@ impl SubscribePayload {
 
         let qos_raw = slice.get_u8();
         let has_group = (qos_raw & SUBSCRIBE_FLAG_HAS_GROUP) != 0;
+        let has_offset = (qos_raw & SUBSCRIBE_FLAG_HAS_OFFSET) != 0;
         let qos = qos_raw & SUBSCRIBE_QOS_MASK;
 
         let group = if has_group {
@@ -475,7 +500,21 @@ impl SubscribePayload {
             None
         };
 
-        Ok(Self { topic, qos, group })
+        let from_offset = if has_offset {
+            if slice.remaining() < 8 {
+                return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+            }
+            Some(slice.get_u64())
+        } else {
+            None
+        };
+
+        Ok(Self {
+            topic,
+            qos,
+            group,
+            from_offset,
+        })
     }
 }
 
@@ -760,6 +799,7 @@ mod tests {
             topic: "orders.us.created".to_string(),
             qos: 1,
             group: None,
+            from_offset: None,
         };
         let encoded = original.encode().expect("encode");
         // Bit 7 of the qos byte must be clear in the no-group case so
@@ -780,6 +820,7 @@ mod tests {
             topic: "orders.us.created".to_string(),
             qos: 1,
             group: Some("workers".to_string()),
+            from_offset: None,
         };
         let encoded = original.encode().expect("encode");
         let qos_byte_pos = 2 + original.topic.len();
@@ -788,6 +829,45 @@ mod tests {
             0x80,
             "has_group flag must be set"
         );
+        let decoded = SubscribePayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn subscribe_payload_with_offset_roundtrip() {
+        let original = SubscribePayload {
+            topic: "orders".to_string(),
+            qos: 1,
+            group: None,
+            from_offset: Some(0xDEAD_BEEF),
+        };
+        let encoded = original.encode().expect("encode");
+        let qos_byte_pos = 2 + original.topic.len();
+        assert_eq!(
+            encoded[qos_byte_pos] & 0x40,
+            0x40,
+            "has_offset flag must be set"
+        );
+        assert_eq!(
+            encoded[qos_byte_pos] & 0x80,
+            0,
+            "has_group flag must be clear"
+        );
+        let decoded = SubscribePayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn subscribe_payload_with_group_and_offset_roundtrip() {
+        let original = SubscribePayload {
+            topic: "orders".to_string(),
+            qos: 1,
+            group: Some("workers".to_string()),
+            from_offset: Some(42),
+        };
+        let encoded = original.encode().expect("encode");
+        let qos_byte_pos = 2 + original.topic.len();
+        assert_eq!(encoded[qos_byte_pos] & 0xC0, 0xC0, "both flags must be set");
         let decoded = SubscribePayload::decode(&encoded).expect("decode");
         assert_eq!(decoded, original);
     }

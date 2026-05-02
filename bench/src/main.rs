@@ -298,6 +298,7 @@ impl BenchClient {
             topic: topic.to_string(),
             qos: qos_byte,
             group: None,
+            from_offset: None,
         }
         .encode()?;
         let frame = Frame {

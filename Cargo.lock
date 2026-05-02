@@ -555,6 +555,7 @@ dependencies = [
  "hdrhistogram",
  "parking_lot",
  "smallvec",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

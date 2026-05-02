@@ -498,6 +498,7 @@ impl MessageHandler for BrokerHandler {
 
         let client_id = ClientId::new(format!("conn-{conn_id}"));
         let topic = TopicName::new(payload.topic);
+        let from_offset = payload.from_offset;
 
         let sub_id = if let Some(group) = payload.group {
             // NACK empty group strings — they'd otherwise create a
@@ -515,6 +516,25 @@ impl MessageHandler for BrokerHandler {
             self.broker
                 .subscribe_with_slot(client_id, topic, qos, conn_id, slot, encoder)
         };
+
+        // Offset replay: after the live subscribe is registered (so
+        // any new publishes flow through), walk the WAL from
+        // `from_offset` and push matching records to this single
+        // subscriber. This may produce duplicates with live publishes
+        // landing during replay; clients should dedupe.
+        if let Some(offset) = from_offset {
+            // Replay is a no-op when no WAL is configured. Errors are
+            // logged but don't fail the SUBSCRIBE — the live
+            // subscription is already established.
+            if let Err(e) = self.broker.replay_to_subscriber(sub_id, offset).await {
+                error!(
+                    "offset replay for sub {} from {} failed: {}",
+                    sub_id.value(),
+                    offset,
+                    e
+                );
+            }
+        }
 
         let ack_payload = AckPayload {
             subscription_id: sub_id.value(),

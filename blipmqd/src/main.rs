@@ -54,6 +54,7 @@ async fn run_integration_flow(
         topic: "test".to_string(),
         qos: 1,
         group: None,
+        from_offset: None,
     }
     .encode()?;
 

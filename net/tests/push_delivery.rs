@@ -150,6 +150,7 @@ impl Client {
                 topic: topic.to_string(),
                 qos,
                 group: None,
+                from_offset: None,
             }
             .encode()
             .unwrap(),
