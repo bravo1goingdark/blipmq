@@ -215,12 +215,25 @@ impl NackPayload {
 /// as `Bytes` rather than `String` avoids a per-PUBLISH heap allocation on
 /// the broker ingress hot path; UTF-8 is validated in `decode` without
 /// copying.
+///
+/// **Wire format flag bits:** the low 2 bits of `qos` carry the QoS
+/// level (0 = at-most-once, 1 = at-least-once). Bit 7 (`0x80`) is the
+/// `has_ttl` flag: when set, a `u32 ttl_ms` field follows the qos byte
+/// before the topic length. Old clients leave bit 7 clear and rely on
+/// the broker's default `message_ttl`; new clients can override
+/// per-message. This is wire-compatible with the original v2 format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishPayload {
     pub topic: Bytes,
     pub qos: u8,
     pub message: Bytes,
+    /// Optional per-message TTL in milliseconds. When `Some`, overrides
+    /// the broker's `BrokerConfig::message_ttl` for this single message.
+    pub ttl_ms: Option<u32>,
 }
+
+const PUBLISH_FLAG_HAS_TTL: u8 = 0x80;
+const PUBLISH_QOS_MASK: u8 = 0x03;
 
 impl PublishPayload {
     pub fn encode(&self) -> Result<Bytes, FrameEncodeError> {
@@ -229,8 +242,19 @@ impl PublishPayload {
             u16::try_from(topic_len).map_err(|_| FrameEncodeError::PayloadTooLarge(topic_len))?;
 
         let message_len = self.message.len();
-        let mut buf = BytesMut::with_capacity(1 + 2 + topic_len + message_len);
-        buf.put_u8(self.qos);
+        let qos_byte = if self.ttl_ms.is_some() {
+            (self.qos & PUBLISH_QOS_MASK) | PUBLISH_FLAG_HAS_TTL
+        } else {
+            self.qos & PUBLISH_QOS_MASK
+        };
+        let extra = if self.ttl_ms.is_some() { 4 } else { 0 };
+
+        let mut buf =
+            BytesMut::with_capacity(1 + extra + 2 + topic_len + message_len);
+        buf.put_u8(qos_byte);
+        if let Some(ttl) = self.ttl_ms {
+            buf.put_u32(ttl);
+        }
         buf.put_u16(topic_len_u16);
         buf.put_slice(&self.topic);
         buf.put_slice(&self.message);
@@ -243,15 +267,33 @@ impl PublishPayload {
         }
 
         let mut slice = &payload[..];
-        let qos = slice.get_u8();
+        let qos_byte = slice.get_u8();
+        let qos = qos_byte & PUBLISH_QOS_MASK;
+        let has_ttl = qos_byte & PUBLISH_FLAG_HAS_TTL != 0;
+
+        let mut header_len = 1usize;
+        let ttl_ms = if has_ttl {
+            if slice.remaining() < 4 {
+                return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+            }
+            let ttl = slice.get_u32();
+            header_len += 4;
+            Some(ttl)
+        } else {
+            None
+        };
+
+        if slice.remaining() < 2 {
+            return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+        }
         let topic_len = slice.get_u16() as usize;
+        header_len += 2;
 
         if slice.remaining() < topic_len {
             return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
         }
 
         // Slice topic out of the parent buffer (refcount bump, no copy).
-        let header_len = 1 + 2;
         let topic = payload.slice(header_len..header_len + topic_len);
         // Validate UTF-8 in place; if invalid, refuse the frame.
         if std::str::from_utf8(&topic).is_err() {
@@ -263,6 +305,7 @@ impl PublishPayload {
             topic,
             qos,
             message,
+            ttl_ms,
         })
     }
 
@@ -599,6 +642,37 @@ mod tests {
         // Take only part of the encoded frame.
         let mut partial = full.split_to(3);
         assert!(try_decode_frame(&mut partial).unwrap().is_none());
+    }
+
+    #[test]
+    fn publish_payload_with_ttl_roundtrip() {
+        let original = PublishPayload {
+            topic: Bytes::from_static(b"orders.us.created"),
+            qos: 1,
+            message: Bytes::from_static(b"hello"),
+            ttl_ms: Some(5_000),
+        };
+        let encoded = original.encode().expect("encode");
+        let decoded = PublishPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn publish_payload_without_ttl_roundtrip() {
+        // No TTL: wire format should be byte-compatible with the
+        // pre-TTL v2 layout.
+        let original = PublishPayload {
+            topic: Bytes::from_static(b"a.b.c"),
+            qos: 0,
+            message: Bytes::from_static(b"x"),
+            ttl_ms: None,
+        };
+        let encoded = original.encode().expect("encode");
+        // Layout: [qos:1][topic_len:2][topic][message]
+        assert_eq!(encoded.len(), 1 + 2 + 5 + 1);
+        assert_eq!(encoded[0] & 0x80, 0, "has_ttl flag must be clear");
+        let decoded = PublishPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
     }
 
     #[test]

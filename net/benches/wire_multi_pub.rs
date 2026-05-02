@@ -177,6 +177,7 @@ async fn run_pipe(addr: SocketAddr, topic: String, n_msgs: u64, payload_len: usi
         topic: Bytes::copy_from_slice(topic.as_bytes()),
         qos: 0,
         message: payload,
+            ttl_ms: None,
     }
     .encode()
     .unwrap();

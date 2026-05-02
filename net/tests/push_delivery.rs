@@ -165,6 +165,7 @@ impl Client {
                 topic: Bytes::copy_from_slice(topic.as_bytes()),
                 qos,
                 message,
+                ttl_ms: None,
             }
             .encode()
             .unwrap(),

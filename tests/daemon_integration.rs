@@ -168,6 +168,7 @@ async fn publish_receive_ack_qos1() {
         topic: "integration".to_string(),
         qos: 1,
         message: Bytes::from_static(b"hello"),
+            ttl_ms: None,
     }
     .encode()
     .expect("encode publish");
@@ -260,6 +261,7 @@ async fn multiple_subscribers_receive_same_message() {
         topic: "fanout".to_string(),
         qos: 1,
         message: Bytes::from_static(b"fanout-msg"),
+            ttl_ms: None,
     }
     .encode()
     .expect("encode publish");

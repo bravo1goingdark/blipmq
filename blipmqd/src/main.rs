@@ -66,6 +66,7 @@ async fn run_integration_flow(
         topic: Bytes::from_static(b"test"),
         qos: 1,
         message: Bytes::from_static(b"hello"),
+            ttl_ms: None,
     }
     .encode()?;
 

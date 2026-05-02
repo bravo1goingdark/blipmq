@@ -507,7 +507,15 @@ impl MessageHandler for BrokerHandler {
         }
 
         let topic = topic_cache.get(&payload.topic);
-        self.broker.publish(&topic, payload.message, qos);
+        let ttl_override = payload
+            .ttl_ms
+            .map(|ms| std::time::Duration::from_millis(ms as u64));
+        if ttl_override.is_some() {
+            self.broker
+                .publish_with_ttl(&topic, payload.message, qos, ttl_override);
+        } else {
+            self.broker.publish(&topic, payload.message, qos);
+        }
         Ok(None)
     }
 }
@@ -537,8 +545,16 @@ impl BrokerHandler {
         };
 
         let topic = TopicName::from_str(payload.topic_str());
+        let ttl_override = payload
+            .ttl_ms
+            .map(|ms| std::time::Duration::from_millis(ms as u64));
         if qos == QoSLevel::AtLeastOnce && self.broker.has_wal() {
             // Use the WAL-backed path when configured for QoS1 messages.
+            // (Per-message TTL is honored only on the non-durable path
+            // for now; durable publishes use BrokerConfig::message_ttl.
+            // A follow-up can encode ttl_ms into the WAL message record
+            // so durable replays preserve it.)
+            let _ = ttl_override;
             if let Err(e) = self
                 .broker
                 .publish_durable(&topic, payload.message, qos)
@@ -560,6 +576,9 @@ impl BrokerHandler {
                 )?;
                 return Ok(FrameResponse::Frame(nack));
             }
+        } else if ttl_override.is_some() {
+            self.broker
+                .publish_with_ttl(&topic, payload.message, qos, ttl_override);
         } else {
             self.broker.publish(&topic, payload.message, qos);
         }
@@ -678,6 +697,7 @@ impl BrokerHandler {
             topic: Bytes::copy_from_slice(polled.topic.as_str().as_bytes()),
             qos: qos_byte,
             message: polled.payload,
+            ttl_ms: None,
         }
         .encode()?;
 

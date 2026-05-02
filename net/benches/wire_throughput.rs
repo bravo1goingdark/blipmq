@@ -195,6 +195,7 @@ async fn run_ingress(addr: SocketAddr, n: u64, payload_len: usize) -> IngressRes
         topic: Bytes::copy_from_slice(TOPIC.as_bytes()),
         qos: 0,
         message: payload.clone(),
+            ttl_ms: None,
     }
     .encode()
     .unwrap();

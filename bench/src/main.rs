@@ -327,6 +327,7 @@ impl BenchClient {
             topic: Bytes::copy_from_slice(topic.as_bytes()),
             qos: qos_byte,
             message,
+            ttl_ms: None,
         }
         .encode()?;
         let frame = Frame {

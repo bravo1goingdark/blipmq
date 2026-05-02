@@ -191,6 +191,7 @@ async fn run_fanout(
         topic: Bytes::copy_from_slice(TOPIC.as_bytes()),
         qos: 0,
         message: payload,
+            ttl_ms: None,
     }
     .encode()
     .unwrap();

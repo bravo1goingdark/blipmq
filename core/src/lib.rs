@@ -1564,7 +1564,20 @@ impl Broker {
 
     #[inline(always)]
     pub fn publish(&self, topic: &TopicName, payload: Bytes, qos: QoSLevel) {
-        self.publish_with_wal_id(topic, payload, qos, None);
+        self.publish_with_wal_id(topic, payload, qos, None, None);
+    }
+
+    /// Publish with a per-message TTL override that applies only to this
+    /// message's enqueue. `None` falls back to `BrokerConfig::message_ttl`.
+    #[inline]
+    pub fn publish_with_ttl(
+        &self,
+        topic: &TopicName,
+        payload: Bytes,
+        qos: QoSLevel,
+        ttl: Option<Duration>,
+    ) {
+        self.publish_with_wal_id(topic, payload, qos, None, ttl);
     }
 
     #[inline(always)]
@@ -1575,12 +1588,20 @@ impl Broker {
         payload: Bytes,
         qos: QoSLevel,
         wal_id: Option<u64>,
+        ttl_override: Option<Duration>,
     ) {
         if self.is_shutting_down() {
             return;
         }
 
         let start = std::time::Instant::now();
+
+        // Resolve the effective TTL for this publish: per-message override
+        // when set, otherwise the broker default. The Option-Some wrapping
+        // is preserved so SubscriberQueue::enqueue can still distinguish
+        // "no TTL at all" from "explicit TTL of 0", though we don't expose
+        // the latter to clients yet.
+        let effective_ttl = ttl_override.or(Some(self.config.message_ttl));
 
         // Track the highest WAL id we've seen so a future
         // `current_snapshot()` reflects it. Cheap: relaxed atomic
@@ -1657,7 +1678,7 @@ impl Broker {
                         DeliveryTag(tag),
                         payload.clone(),
                         wal_id,
-                        Some(self.config.message_ttl),
+                        effective_ttl,
                     );
                 }
                 let wire_tag = if qos == QoSLevel::AtLeastOnce { tag } else { 0 };
@@ -1698,7 +1719,7 @@ impl Broker {
                         DeliveryTag(tag),
                         payload.clone(),
                         wal_id,
-                        Some(self.config.message_ttl),
+                        effective_ttl,
                     );
                 }
 
@@ -1732,7 +1753,7 @@ impl Broker {
                 // Poll path (v1): unchanged.
                 subscriber
                     .queue
-                    .enqueue(payload.clone(), qos, wal_id, Some(self.config.message_ttl));
+                    .enqueue(payload.clone(), qos, wal_id, effective_ttl);
                 if let Some(t) = topic_for_metrics {
                     t.delivered_total.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1792,7 +1813,7 @@ impl Broker {
         // is what makes "publish_durable returned Ok" mean "on disk".
         let wal_id = wal.append_durable(encoded).await?;
 
-        self.publish_with_wal_id(topic, payload, qos, Some(wal_id));
+        self.publish_with_wal_id(topic, payload, qos, Some(wal_id), None);
 
         Ok(wal_id)
     }
