@@ -486,11 +486,14 @@ struct Topic {
     name: TopicName,
     subscribers: RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>,
     /// Number of `publish` calls that landed on this topic (one per
-    /// publisher message, regardless of fanout).
-    published_total: AtomicU64,
+    /// publisher message, regardless of fanout). Sharded by publisher
+    /// thread so concurrent publishes to the same topic don't ping
+    /// the same cache line.
+    published_total: ShardedCounter,
     /// Number of `DeliveryHandle`s emitted from fanout for this topic
-    /// (i.e. published × matched-subscribers).
-    delivered_total: AtomicU64,
+    /// (i.e. published × matched-subscribers). Sharded for the same
+    /// reason; the publish path flushes a batched sum once per fanout.
+    delivered_total: ShardedCounter,
 }
 
 /// Per-topic metrics snapshot, returned by `Broker::topic_metrics`.
@@ -1264,8 +1267,8 @@ impl Topic {
         Self {
             name,
             subscribers: RwLock::new(HashMap::new()),
-            published_total: AtomicU64::new(0),
-            delivered_total: AtomicU64::new(0),
+            published_total: ShardedCounter::new(),
+            delivered_total: ShardedCounter::new(),
         }
     }
 }
@@ -1653,8 +1656,8 @@ impl Broker {
             for topic in guard.values() {
                 out.push(TopicMetrics {
                     topic: topic.name.clone(),
-                    published_total: topic.published_total.load(Ordering::Relaxed),
-                    delivered_total: topic.delivered_total.load(Ordering::Relaxed),
+                    published_total: topic.published_total.load(),
+                    delivered_total: topic.delivered_total.load(),
                     subscriber_count: topic.subscribers.read().len(),
                 });
             }
@@ -1744,7 +1747,7 @@ impl Broker {
         let topic_opt = self.topics.get(topic_name);
         let mut snapshot: SubscriberSnapshot<'_> = SmallVec::new();
         if let Some(topic) = &topic_opt {
-            topic.published_total.fetch_add(1, Ordering::Relaxed);
+            topic.published_total.add(1);
             let subscribers = topic.subscribers.read();
             for (id, sub) in subscribers.iter() {
                 snapshot.push((*id, sub.clone()));
@@ -1870,7 +1873,7 @@ impl Broker {
         // before). Skipped entirely when nothing was delivered.
         if delivered > 0 {
             if let Some(t) = topic_for_metrics {
-                t.delivered_total.fetch_add(delivered, Ordering::Relaxed);
+                t.delivered_total.add(delivered);
             }
             self.messages_delivered_total.add(delivered);
         }
