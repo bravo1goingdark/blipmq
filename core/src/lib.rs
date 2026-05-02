@@ -1515,6 +1515,20 @@ impl Broker {
         )
     }
 
+    /// Poll-mode equivalent of [`Self::subscribe_with_slot_in_group`].
+    /// The subscriber queues messages until [`Self::poll`] pulls them
+    /// out, but routing semantics are the same as for slot-mode
+    /// grouped subscribers (one delivery per group per publish).
+    pub fn subscribe_in_group(
+        &self,
+        client_id: ClientId,
+        topic: TopicName,
+        qos: QoSLevel,
+        group: String,
+    ) -> SubscriptionId {
+        self.subscribe_inner_grouped(client_id, topic, qos, None, None, None, Some(group))
+    }
+
     /// Subscribe with a NATS-style subject pattern (may contain `*` and
     /// `>` wildcards). Exact patterns route through the fast `TopicShards`
     /// path; wildcard patterns are added to a parallel list scanned on
@@ -2524,6 +2538,21 @@ impl Broker {
             }
         }
 
+        // Persist the rebuilt cursors back into the in-memory map so
+        // subsequent `current_snapshot()` / `group_committed_offset()`
+        // calls reflect the recovered state. Without this, replay
+        // correctly re-enqueued unacked messages but the broker
+        // appeared to "forget" who had acked what at the API surface.
+        {
+            let mut live = self.ack_cursors.write();
+            for (key, wal_id) in ack_cursors {
+                let entry = live.entry(key).or_insert(0);
+                if wal_id > *entry {
+                    *entry = wal_id;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2546,9 +2575,17 @@ impl Broker {
     }
 
     pub fn ack(&self, sub_id: SubscriptionId, tag: DeliveryTag) -> bool {
-        // Look up the inflight entry; capture client_id/topic/wal_id so we
+        // Look up the inflight entry; capture cursor_id/topic/wal_id so we
         // can journal the ack after dropping the shard read lock.
-        let (client_id, topic, wal_id_opt) = {
+        //
+        // `cursor_id` is the key used in both the in-memory `ack_cursors`
+        // map and the on-disk ack journal. For grouped subscriptions
+        // we use `group:{name}` so that acks from any member of the
+        // group advance one shared cursor — that's what makes consumer
+        // group state survive a broker restart, since replay rebuilds
+        // the same cursor from the ack journal regardless of which
+        // member sent the ack.
+        let (cursor_id, topic, wal_id_opt) = {
             let shard = self.subscriptions.shard_for(sub_id).read();
             let sub_ref = match shard.get(&sub_id) {
                 Some(r) => r,
@@ -2558,11 +2595,11 @@ impl Broker {
                 Some(wid) => wid,
                 None => return false,
             };
-            (
-                sub_ref.subscriber.client_id.as_str().to_string(),
-                sub_ref.topic.as_str().to_string(),
-                wal_id_opt,
-            )
+            let cursor_id = match &sub_ref.group {
+                Some(g) => format!("group:{g}"),
+                None => sub_ref.subscriber.client_id.as_str().to_string(),
+            };
+            (cursor_id, sub_ref.topic.as_str().to_string(), wal_id_opt)
         };
 
         // Update the in-memory cursor so a subsequent `current_snapshot()`
@@ -2570,7 +2607,7 @@ impl Broker {
         // cheap: one write-locked HashMap upsert.
         if let Some(wal_id) = wal_id_opt {
             let mut cursors = self.ack_cursors.write();
-            let key = (client_id.clone(), topic.clone());
+            let key = (cursor_id.clone(), topic.clone());
             let entry = cursors.entry(key).or_insert(0);
             if wal_id > *entry {
                 *entry = wal_id;
@@ -2588,7 +2625,7 @@ impl Broker {
         // is already prepared to handle.
         if let (Some(wal_id), Some(wal)) = (wal_id_opt, &self.wal) {
             let entry = WalEntry::Ack(WalAckRecord {
-                client_id,
+                client_id: cursor_id,
                 topic,
                 acked_wal_id: wal_id,
             });
@@ -2618,6 +2655,22 @@ impl Broker {
             snapshot_id,
             cursors,
         }
+    }
+
+    /// The highest WAL id ACKed by *any* member of `group` on `topic`,
+    /// or `None` if no member has acked yet (fresh group, or all
+    /// publishes were QoS0). Acks from grouped subscriptions are
+    /// journaled under a shared `group:{name}` cursor key (rather
+    /// than the per-connection client id), so a broker restart
+    /// followed by ack-journal replay reconstructs the same value.
+    ///
+    /// Callers commonly use this to drive consumer-group resume:
+    /// when a new member joins a group, pass `last_committed + 1`
+    /// as the `from_offset` to [`Self::replay_to_subscriber`].
+    pub fn group_committed_offset(&self, group: &str, topic: &str) -> Option<u64> {
+        let cursor_key = (format!("group:{group}"), topic.to_string());
+        let cursors = self.ack_cursors.read();
+        cursors.get(&cursor_key).copied()
     }
 
     /// Atomically write the current checkpoint snapshot to `path`. Writes
@@ -3763,6 +3816,107 @@ mod tests {
             .expect("replay none");
         assert_eq!(delivered_none, 0);
         assert_eq!(count.load(Ordering::Relaxed), prev2);
+    }
+
+    /// Group-state persistence: when a grouped subscription acks, the
+    /// ack journal records it under `client_id = "group:{name}"`
+    /// (rather than the per-connection id), so all members of the
+    /// group share one cursor and the group's progress survives a
+    /// broker restart that replays the WAL.
+    #[tokio::test]
+    async fn grouped_acks_persist_under_shared_group_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WriteAheadLog::open(dir.path()).await.expect("open WAL"));
+        let cfg = BrokerConfig {
+            default_qos: QoSLevel::AtLeastOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: None,
+        };
+
+        let topic = TopicName::new("orders");
+
+        // Session 1: a single member of "workers" group consumes &
+        // acks two messages. Cursor should advance to the higher
+        // wal_id.
+        let acked_wal_id;
+        let second_wal_id;
+        {
+            let broker = Broker::new_with_wal(cfg.clone(), wal.clone());
+            let sub_id = broker.subscribe_in_group(
+                ClientId::new("worker-A"),
+                topic.clone(),
+                QoSLevel::AtLeastOnce,
+                "workers".to_string(),
+            );
+
+            // Two durable publishes; the group's only member receives
+            // both (round-robin against a 1-member group degenerates
+            // to "always this member").
+            broker
+                .publish_durable(&topic, Bytes::from_static(b"m1"), QoSLevel::AtLeastOnce)
+                .await
+                .unwrap();
+            broker
+                .publish_durable(&topic, Bytes::from_static(b"m2"), QoSLevel::AtLeastOnce)
+                .await
+                .unwrap();
+
+            let msg1 = broker.poll(sub_id).expect("first delivery");
+            let tag1 = msg1.delivery_tag.expect("qos1 tag");
+            let msg2 = broker.poll(sub_id).expect("second delivery");
+            let tag2 = msg2.delivery_tag.expect("qos1 tag");
+            assert!(broker.ack(sub_id, tag1));
+            assert!(broker.ack(sub_id, tag2));
+
+            // Both are journaled under group:workers; the higher wal_id
+            // is the final cursor.
+            let offset = broker
+                .group_committed_offset("workers", "orders")
+                .expect("cursor present");
+            // No per-(client_id, topic) cursor for the per-conn id —
+            // all acks landed on the group cursor instead.
+            assert_eq!(
+                broker
+                    .ack_cursors
+                    .read()
+                    .iter()
+                    .filter(|((c, _), _)| !c.starts_with("group:"))
+                    .count(),
+                0,
+                "no non-group cursors should exist; acks must be journaled under group:workers",
+            );
+            acked_wal_id = offset;
+            second_wal_id = offset;
+            assert!(acked_wal_id >= 1);
+            // Allow `wal` to be the only Arc holder so a fresh
+            // broker can take ownership of WAL-side state on
+            // restart.
+            drop(broker);
+        }
+
+        // Wait for the spawned ack-journal writes to complete. Acks
+        // are best-effort fire-and-forget so we sleep briefly to let
+        // them flush. (A more robust test could open a fresh WAL and
+        // poll for the expected ack record count.)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Session 2: simulate a broker restart. Replay the WAL.
+        // The group cursor must come back exactly as before.
+        let broker2 = Broker::new_with_wal(cfg, wal.clone());
+        broker2.replay_from_wal().await.expect("replay");
+
+        let recovered = broker2
+            .group_committed_offset("workers", "orders")
+            .expect("cursor recovered post-restart");
+        assert_eq!(
+            recovered, second_wal_id,
+            "post-restart group cursor must match pre-crash value",
+        );
     }
 
     /// Sticky-by-key partitioning: every publish carrying the same
