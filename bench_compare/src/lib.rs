@@ -205,15 +205,32 @@ pub struct BmqClient {
     stream: TcpStream,
     buf: BytesMut,
     next_cid: u64,
+    /// Outbound write buffer for batched `publish_batched` calls.
+    /// Frames accumulate here until `flush_publishes` is called or
+    /// the buffer exceeds `BATCH_FLUSH_BYTES`. NATS-style pipelining:
+    /// many PUBLISH frames per TCP `write`, amortizing the syscall.
+    out: BytesMut,
 }
+
+/// Threshold at which `publish_batched` triggers an automatic flush.
+/// 64 KiB is a common TCP write granule on Linux loopback (one
+/// `tcp_sendmsg` page) and roughly tracks the kernel's default
+/// `tcp_wmem` low-water mark, so we keep latency bounded while still
+/// amortizing the syscall over many small frames.
+pub const BATCH_FLUSH_BYTES: usize = 64 * 1024;
 
 impl BmqClient {
     pub async fn connect(addr: SocketAddr, api_key: &str) -> Result<Self, BenchError> {
         let stream = TcpStream::connect(addr).await?;
+        // Disable Nagle so the writer-side batching is what controls
+        // write granularity; otherwise we'd pay both Nagle's delay
+        // AND batch latency.
+        let _ = stream.set_nodelay(true);
         let mut client = Self {
             stream,
             buf: BytesMut::with_capacity(4096),
             next_cid: 1,
+            out: BytesMut::with_capacity(BATCH_FLUSH_BYTES * 2),
         };
         client.handshake(api_key).await?;
         Ok(client)
@@ -326,6 +343,55 @@ impl BmqClient {
         self.send_frame(&frame).await
     }
 
+    /// Batched publish: encodes the PUBLISH frame into the per-client
+    /// `out` buffer and only issues a TCP `write_all` once the buffer
+    /// reaches `BATCH_FLUSH_BYTES`. Cuts syscalls per second by 1-2
+    /// orders of magnitude on loopback small-payload publish loops,
+    /// matching NATS's standard PUB-line pipelining.
+    ///
+    /// The caller MUST call [`Self::flush_publishes`] before any
+    /// non-publish operation (subscribe, ack, drop) and at the end
+    /// of a publish run, otherwise trailing frames stay buffered.
+    pub async fn publish_batched(
+        &mut self,
+        topic: &str,
+        qos: u8,
+        message: Bytes,
+    ) -> Result<(), BenchError> {
+        let payload = PublishPayload {
+            topic: Bytes::copy_from_slice(topic.as_bytes()),
+            qos,
+            message,
+            ttl_ms: None,
+            partition_key: None,
+        }
+        .encode()?;
+        let frame = Frame {
+            msg_type: FrameType::Publish,
+            correlation_id: self.next_correlation_id(),
+            payload,
+        };
+        // Encode directly into the per-client out buffer; no
+        // intermediate BytesMut allocation per frame.
+        encode_frame(&frame, &mut self.out)?;
+        if self.out.len() >= BATCH_FLUSH_BYTES {
+            self.flush_publishes().await?;
+        }
+        Ok(())
+    }
+
+    /// Flush any buffered batched publishes. Must be called before
+    /// any operation that needs an immediate response (subscribe,
+    /// ack, etc.) or before the connection is dropped.
+    pub async fn flush_publishes(&mut self) -> Result<(), BenchError> {
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(&self.out).await?;
+        self.out.clear();
+        Ok(())
+    }
+
     /// Wait for the next server-initiated `DELIVER` frame, decode it,
     /// and return the parsed payload. Returns `None` on timeout or
     /// stream EOF. The broker side of v2 always pushes via
@@ -337,7 +403,10 @@ impl BmqClient {
         timeout_dur: Duration,
     ) -> Option<(Frame, DeliverPayload)> {
         loop {
-            let resp = timeout(timeout_dur, self.recv_frame()).await.ok().flatten()?;
+            let resp = timeout(timeout_dur, self.recv_frame())
+                .await
+                .ok()
+                .flatten()?;
             match resp.msg_type {
                 FrameType::Deliver => {
                     let payload = DeliverPayload::decode(&resp.payload).ok()?;

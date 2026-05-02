@@ -73,9 +73,16 @@ async fn main() -> Result<(), BenchError> {
                 }
                 let payload = build_payload(message_size);
                 let t0 = Instant::now();
-                client.publish(&subject, qos, payload).await?;
+                // Batched publish: many PUBLISH frames per TCP write.
+                // Auto-flushes at BATCH_FLUSH_BYTES = 64 KiB. Per-call
+                // latency here measures the encode-into-buffer cost,
+                // not the syscall — the syscall happens once per
+                // batch.
+                client.publish_batched(&subject, qos, payload).await?;
                 stats.record_ns(t0.elapsed().as_nanos() as u64);
             }
+            // Drain any trailing buffered frames before the task ends.
+            client.flush_publishes().await?;
             Ok::<LatencyStats, BenchError>(stats)
         });
 

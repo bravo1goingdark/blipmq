@@ -30,13 +30,15 @@ runtime, no socket boundary on the publish side) and produce
 
 | shape | NATS sub/s | BlipMQ deliv/s | Δ vs NATS |
 |---|---:|---:|---:|
-| 64B   | **1.19 M** | 0.86 M | NATS +39% |
-| 1 KiB | **0.61 M** | 0.49 M | NATS +25% |
+| 64B   | 1.19 M | **1.79 M** | BlipMQ +50% |
+| 1 KiB | 0.61 M | **0.84 M** | BlipMQ +37% |
 
-NATS wins single-pipe. This is one TCP socket, one publisher worker,
-one subscriber worker — exactly the shape NATS is most optimized for.
-BlipMQ's per-frame overhead at this shape (length-prefix + flag bits +
-per-conn cache lookup) costs measurably vs NATS's tighter inner loop.
+BlipMQ now wins single-pipe too, after `pub_bmq` was switched to
+batched publishing (`publish_batched` + `flush_publishes` in
+`BmqClient`). The earlier no-batching number — 0.86 M @ 64B and
+0.49 M @ 1 KiB — was bound on per-frame `write_all` syscalls, not
+broker capacity; NATS's PUB-line pipelining was doing the same
+amortization implicitly.
 
 ## Fanout (1 pub × N subs, 64 B payload)
 
@@ -101,8 +103,9 @@ but the qualitative scaling — peak ≈ 4× the single-pipe rate at
 
 ## Headline
 
-- **Single connection: NATS wins.** Tuned for one-pipe latency-sensitive
-  loops; BlipMQ pays a ~25–40 % tax at this shape.
+- **Single connection: BlipMQ wins.** With pub-side write batching
+  matching NATS's PUB-line pipelining, BlipMQ runs ~50% faster at
+  64 B and ~37% faster at 1 KiB.
 - **Fan-out: BlipMQ wins decisively.** Per-subscriber writer tasks let
   the broker scale linearly with N; NATS bottlenecks on the publisher
   at ~1.6 M aggregate regardless of N.
@@ -112,9 +115,9 @@ but the qualitative scaling — peak ≈ 4× the single-pipe rate at
   group-commit batches multiple publishers' fsyncs, so 8 parallel pubs
   hit 96 K msg/s vs JS's 60 K serial.
 
-If your workload is latency-bound single-publisher request/response,
-NATS is the better fit. If it's pub/sub with non-trivial fan-out
-or many concurrent producers, BlipMQ pulls ahead.
+BlipMQ ahead in three of four categories; the remaining gap is
+serial-publisher durability, where there's a real semantic difference
+(strict fsync-per-publish vs lazy append).
 
 ## Caveats
 
