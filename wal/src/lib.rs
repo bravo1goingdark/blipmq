@@ -99,6 +99,10 @@ pub struct WriteAheadLog {
     next_id: AtomicU64,
     append_count: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
+    /// The currently-active segment seq (the one the writer is appending
+    /// to right now). Shared with `WalWriter` so the compactor can refuse
+    /// to delete it without the index round-trip.
+    current_segment_seq: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -123,7 +127,10 @@ struct WalWriter {
     /// Currently-active segment file. New writes go here; rolls over once
     /// `current_offset` would exceed `segment_bytes`.
     file: File,
-    current_segment_seq: u64,
+    /// The active segment seq. Shared with `WriteAheadLog` so external
+    /// consumers (e.g. the compactor) can read it without a round-trip
+    /// through the writer task.
+    current_segment_seq: Arc<AtomicU64>,
     current_offset: u64,
     segment_bytes: u64,
     unflushed_records: usize,
@@ -242,11 +249,12 @@ impl WriteAheadLog {
         let index = Arc::new(Mutex::new(index));
         let append_count = Arc::new(AtomicU64::new(0));
         let bytes_written = Arc::new(AtomicU64::new(0));
+        let current_segment_seq = Arc::new(AtomicU64::new(current_seq));
 
         let writer = WalWriter {
             dir: dir.clone(),
             file: current_file,
-            current_segment_seq: current_seq,
+            current_segment_seq: Arc::clone(&current_segment_seq),
             current_offset,
             segment_bytes: config.segment_bytes,
             unflushed_records: 0,
@@ -273,6 +281,7 @@ impl WriteAheadLog {
             next_id: AtomicU64::new(next_id),
             append_count,
             bytes_written,
+            current_segment_seq,
         })
     }
 
@@ -429,6 +438,87 @@ impl WriteAheadLog {
         let inner = self.index.lock();
         inner.get(&id).copied()
     }
+
+    /// Read the currently-active segment seq. The compactor uses this to
+    /// avoid deleting the file the writer task is actively appending to.
+    pub fn active_segment_seq(&self) -> u64 {
+        self.current_segment_seq.load(Ordering::Relaxed)
+    }
+
+    /// Delete WAL segments where every record has id <= `safe_threshold`.
+    /// Never deletes the active segment, even if all of its records are
+    /// below the threshold (the writer is still appending to it).
+    /// Returns the number of segments deleted.
+    ///
+    /// `safe_threshold` should be the broker's "everything below this is
+    /// already acked by every consumer" boundary — typically the
+    /// `snapshot_id` from a freshly-written `CheckpointSnapshot`.
+    pub async fn compact_below(&self, safe_threshold: u64) -> Result<usize, WalError> {
+        let active_seq = self.active_segment_seq();
+
+        // Build per-segment max-id from the in-memory index. O(N) over
+        // total records but no I/O; runs under a brief lock.
+        let mut max_id_per_segment: HashMap<u64, u64> = HashMap::new();
+        {
+            let guard = self.index.lock();
+            for (id, loc) in guard.iter() {
+                let entry = max_id_per_segment.entry(loc.segment_seq).or_insert(0);
+                if *id > *entry {
+                    *entry = *id;
+                }
+            }
+        }
+
+        // Decide which segments are safe to delete.
+        let mut to_delete: Vec<u64> = max_id_per_segment
+            .iter()
+            .filter_map(|(&seq, &max_id)| {
+                if seq != active_seq && max_id <= safe_threshold {
+                    Some(seq)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Also pick up any empty segment files lying around (e.g. zero-
+        // byte stragglers from a crashed roll). Those have no entries in
+        // the index map but still exist on disk.
+        for seq in list_segment_seqs(&self.dir).await? {
+            if seq == active_seq {
+                continue;
+            }
+            if !max_id_per_segment.contains_key(&seq) {
+                to_delete.push(seq);
+            }
+        }
+        to_delete.sort_unstable();
+        to_delete.dedup();
+
+        let mut deleted = 0;
+        for seq in &to_delete {
+            let path = segment_path(&self.dir, *seq);
+            match tokio::fs::remove_file(&path).await {
+                Ok(_) => deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone; treat as a no-op rather than an error
+                    // so concurrent compactors don't trip each other up.
+                }
+                Err(e) => return Err(WalError::Io(e)),
+            }
+        }
+
+        // Drop entries for deleted segments from the in-memory index so a
+        // subsequent iterate_from doesn't try to open files we just
+        // removed.
+        if deleted > 0 {
+            let deleted_set: std::collections::HashSet<u64> = to_delete.into_iter().collect();
+            let mut guard = self.index.lock();
+            guard.retain(|_, loc| !deleted_set.contains(&loc.segment_seq));
+        }
+
+        Ok(deleted)
+    }
 }
 
 impl WalWriter {
@@ -504,7 +594,7 @@ impl WalWriter {
         self.batch_buf.clear();
         let mut offsets: Vec<(u64, RecordLocation)> = Vec::with_capacity(records.len());
         let mut current_offset = self.current_offset;
-        let current_seq = self.current_segment_seq;
+        let current_seq = self.current_segment_seq.load(Ordering::Relaxed);
 
         let mut new_acks: Vec<oneshot::Sender<Result<(), WalError>>> =
             Vec::with_capacity(records.len());
@@ -559,9 +649,10 @@ impl WalWriter {
         // were in flight when the new segment was created.
         self.flush_file().await?;
 
-        let next_seq = self.current_segment_seq.checked_add(1).ok_or_else(|| {
-            WalError::Corruption("segment sequence overflow".to_string())
-        })?;
+        let cur = self.current_segment_seq.load(Ordering::Relaxed);
+        let next_seq = cur
+            .checked_add(1)
+            .ok_or_else(|| WalError::Corruption("segment sequence overflow".to_string()))?;
         let path = segment_path(&self.dir, next_seq);
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -572,7 +663,7 @@ impl WalWriter {
         write_header(&mut file).await?;
 
         self.file = file;
-        self.current_segment_seq = next_seq;
+        self.current_segment_seq.store(next_seq, Ordering::Relaxed);
         self.current_offset = HEADER_LEN;
         Ok(())
     }
@@ -978,6 +1069,54 @@ mod tests {
         for (i, rec) in records.iter().enumerate() {
             assert_eq!(rec.id, written_ids[i]);
         }
+    }
+
+    /// compact_below deletes segments whose entire id range is at or below
+    /// the safe threshold, but never the active segment.
+    #[tokio::test]
+    async fn compact_below_deletes_old_segments_but_keeps_active() {
+        let dir = wal_dir("compact");
+        let config = WalConfig {
+            // Tiny segment so each record creates a new segment after a
+            // flush.
+            segment_bytes: HEADER_LEN + RECORD_HEADER_LEN as u64 + 16,
+            ..WalConfig::default()
+        };
+
+        let mut written_ids = Vec::new();
+        let wal = WriteAheadLog::open_with_config(&dir, config.clone())
+            .await
+            .unwrap();
+        for i in 0..5u8 {
+            let id = wal.append(Bytes::from(vec![i; 16])).await.unwrap();
+            written_ids.push(id);
+            wal.flush().await.unwrap();
+        }
+
+        // We expect at least 2 segments; otherwise the test setup is wrong.
+        let seqs_before = list_segment_seqs(&dir).await.unwrap();
+        assert!(seqs_before.len() >= 3, "need >= 3 segments to exercise compaction, got {seqs_before:?}");
+        let active = wal.active_segment_seq();
+
+        // Compact everything strictly below the wal_id of the 4th record
+        // (so segments holding ids 1..=4 should go; the segment holding 5
+        // OR the active segment must be retained).
+        let safe = written_ids[3];
+        let deleted = wal.compact_below(safe).await.unwrap();
+        assert!(deleted > 0, "expected at least one segment deleted");
+
+        let seqs_after = list_segment_seqs(&dir).await.unwrap();
+        // The active segment must still exist after compaction.
+        assert!(
+            seqs_after.contains(&active),
+            "active segment {active} was deleted; remaining: {seqs_after:?}",
+        );
+        assert!(seqs_after.len() < seqs_before.len());
+
+        // Records still readable past the safe threshold.
+        let recs = wal.iterate_from(safe + 1).await.unwrap();
+        // Last record (id = written_ids[4]) should still iterate.
+        assert!(recs.iter().any(|r| r.id == written_ids[4]));
     }
 
     #[tokio::test]

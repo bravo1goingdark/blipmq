@@ -183,10 +183,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 wal.clone(),
             ));
 
-            // Replay WAL at startup to restore durable state. Only after
-            // replay completes do we mark the broker ready, so the
-            // /readyz probe correctly returns 503 during startup.
-            broker.replay_from_wal().await?;
+            // Replay WAL at startup to restore durable state. If a previous
+            // run wrote a checkpoint, load it first so replay only walks
+            // the unacked tail rather than the entire log.
+            let checkpoint_path =
+                std::path::PathBuf::from(&config.wal_path).join("checkpoint.snap");
+            let loaded = match Broker::load_checkpoint_from(&checkpoint_path).await {
+                Ok(snap) => snap,
+                Err(e) => {
+                    error!(
+                        "checkpoint at {} is corrupt ({e}); falling back to full replay",
+                        checkpoint_path.display()
+                    );
+                    None
+                }
+            };
+            broker.replay_from_wal_with_checkpoint(loaded).await?;
             broker.mark_ready();
 
             let auth_validator =
@@ -221,6 +233,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             if changed.is_err() {
                                 // Sender dropped; nothing more to do.
                             }
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Background checkpoint + WAL compaction. Every 10 seconds:
+            //   1. capture the broker's current ack cursors,
+            //   2. atomically write them to <wal_dir>/checkpoint.snap,
+            //   3. delete WAL segments fully covered by the checkpoint.
+            // Runs at a slow cadence so it never competes with the publish
+            // hot path. On shutdown the loop exits before the broker drains;
+            // a final checkpoint is written from the shutdown sequence below.
+            let ckpt_broker = broker.clone();
+            let ckpt_wal = wal.clone();
+            let ckpt_path = std::path::PathBuf::from(&config.wal_path).join("checkpoint.snap");
+            let mut ckpt_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(10));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if let Err(e) = ckpt_broker.write_checkpoint_to(&ckpt_path).await {
+                                error!("checkpoint write failed: {e}");
+                                continue;
+                            }
+                            let safe = ckpt_broker.current_snapshot().snapshot_id;
+                            if safe > 0 {
+                                match ckpt_wal.compact_below(safe).await {
+                                    Ok(n) if n > 0 => {
+                                        info!("wal compactor reclaimed {n} segment(s) below id {safe}");
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => error!("wal compaction failed: {e}"),
+                                }
+                            }
+                        }
+                        changed = ckpt_shutdown.changed() => {
+                            if changed.is_err() {}
                             break;
                         }
                     }
