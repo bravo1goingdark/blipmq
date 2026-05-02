@@ -1715,6 +1715,10 @@ impl Broker {
         let topic_for_metrics = topic_opt.as_ref();
 
         let mut subs_to_drop: SmallVec<[SubscriptionId; 4]> = SmallVec::new();
+        // Accumulate successful-delivery counts locally so we issue one
+        // fetch_add per counter at the end of the fanout instead of N.
+        // For a 64-sub fanout this drops 128 atomic ops to 2.
+        let mut delivered: u64 = 0;
         for (sub_id, subscriber) in snapshot.iter() {
             if let Some((slot, encoder)) = &subscriber.push_slot {
                 // Shared-buffer push (v2 fast path): encode the DELIVER
@@ -1753,11 +1757,7 @@ impl Broker {
                     }
                 } else {
                     slot.notify.notify_one();
-                    if let Some(t) = topic_for_metrics {
-                        t.delivered_total.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.messages_delivered_total
-                        .fetch_add(1, Ordering::Relaxed);
+                    delivered = delivered.saturating_add(1);
                 }
             } else if let Some(sender) = &subscriber.push_sender {
                 // Legacy channel-based push.
@@ -1792,23 +1792,25 @@ impl Broker {
                         subs_to_drop.push(*sub_id);
                     }
                 } else {
-                    if let Some(t) = topic_for_metrics {
-                        t.delivered_total.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.messages_delivered_total
-                        .fetch_add(1, Ordering::Relaxed);
+                    delivered = delivered.saturating_add(1);
                 }
             } else {
                 // Poll path (v1): unchanged.
                 subscriber
                     .queue
                     .enqueue(payload.clone(), qos, wal_id, effective_ttl);
-                if let Some(t) = topic_for_metrics {
-                    t.delivered_total.fetch_add(1, Ordering::Relaxed);
-                }
-                self.messages_delivered_total
-                    .fetch_add(1, Ordering::Relaxed);
+                delivered = delivered.saturating_add(1);
             }
+        }
+
+        // Single batched atomic add per counter (vs one-per-delivery
+        // before). Skipped entirely when nothing was delivered.
+        if delivered > 0 {
+            if let Some(t) = topic_for_metrics {
+                t.delivered_total.fetch_add(delivered, Ordering::Relaxed);
+            }
+            self.messages_delivered_total
+                .fetch_add(delivered, Ordering::Relaxed);
         }
 
         // Apply the DropSubscription slow-consumer policy after the fanout
