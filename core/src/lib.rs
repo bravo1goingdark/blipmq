@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
+use hdrhistogram::Histogram;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use tokio::sync::Notify;
@@ -239,6 +240,22 @@ pub struct Broker {
     /// on every `Broker::ack` for QoS1 deliveries that had a WAL id, and
     /// captured wholesale by `current_snapshot`.
     ack_cursors: RwLock<HashMap<(String, String), u64>>,
+    /// Latency histogram for the `publish_with_wal_id` fanout path,
+    /// recording total publish-to-encode time in nanoseconds. Sampled by
+    /// the metrics endpoint.
+    publish_fanout_ns: Mutex<Histogram<u64>>,
+}
+
+/// A latency snapshot captured for the metrics endpoint. Times are in
+/// nanoseconds; the metrics layer converts to seconds for Prometheus.
+#[derive(Debug, Clone)]
+pub struct LatencyStats {
+    pub count: u64,
+    pub sum_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub max_ns: u64,
 }
 
 #[derive(Debug)]
@@ -1025,6 +1042,10 @@ impl Broker {
             push_dropped_total: std::sync::atomic::AtomicU64::new(0),
             max_wal_id_observed: AtomicU64::new(0),
             ack_cursors: RwLock::new(HashMap::new()),
+            publish_fanout_ns: Mutex::new(
+                Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
+                    .expect("histogram bounds valid"),
+            ),
         }
     }
 
@@ -1046,6 +1067,10 @@ impl Broker {
             push_dropped_total: AtomicU64::new(0),
             max_wal_id_observed: AtomicU64::new(0),
             ack_cursors: RwLock::new(HashMap::new()),
+            publish_fanout_ns: Mutex::new(
+                Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
+                    .expect("histogram bounds valid"),
+            ),
         }
     }
 
@@ -1215,6 +1240,21 @@ impl Broker {
         self.push_dropped_total.load(Ordering::Relaxed)
     }
 
+    /// Snapshot the publish-fanout latency histogram. Cheap: locks the
+    /// histogram briefly, computes percentiles. Intended for periodic
+    /// scraping by the metrics endpoint, not the hot path.
+    pub fn publish_fanout_latency(&self) -> LatencyStats {
+        let h = self.publish_fanout_ns.lock();
+        LatencyStats {
+            count: h.len(),
+            sum_ns: h.iter_recorded().map(|v| v.value_iterated_to() * v.count_at_value()).sum(),
+            p50_ns: h.value_at_quantile(0.50),
+            p95_ns: h.value_at_quantile(0.95),
+            p99_ns: h.value_at_quantile(0.99),
+            max_ns: h.max(),
+        }
+    }
+
     /// Unsubscribe a single subscription. Used by the slow-consumer
     /// `DropSubscription` policy. Removes the sub from the global shard
     /// AND from the topic's subscriber list AND from any tracking
@@ -1289,6 +1329,8 @@ impl Broker {
         if self.is_shutting_down() {
             return;
         }
+
+        let start = std::time::Instant::now();
 
         // Track the highest WAL id we've seen so a future
         // `current_snapshot()` reflects it. Cheap: relaxed atomic
@@ -1423,6 +1465,15 @@ impl Broker {
         for sid in subs_to_drop {
             self.unsubscribe_one(sid);
         }
+
+        // Record fanout latency. The histogram lock is parking_lot and
+        // uncontended in steady state (only the metrics endpoint reads
+        // it). Recording errors (saturating high values) are silently
+        // ignored: the histogram caps at 60s, and any publish that
+        // somehow took longer than that is already an outlier we don't
+        // need fine-grained visibility on.
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let _ = self.publish_fanout_ns.lock().saturating_record(elapsed_ns);
     }
 
     /// Publish a message durably by first appending it to the write-ahead log

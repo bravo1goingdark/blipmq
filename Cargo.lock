@@ -511,6 +511,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "flume",
+ "hdrhistogram",
  "parking_lot",
  "smallvec",
  "thiserror",

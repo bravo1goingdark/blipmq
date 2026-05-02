@@ -141,6 +141,42 @@ async fn metrics_response(broker: &Broker, wal: &WriteAheadLog) -> Response<Body
         wal_bytes_total,
     );
 
+    // Publish-fanout latency as a Prometheus summary. Quantiles only
+    // (we use hdrhistogram internally, but a Prometheus *histogram*
+    // would require pre-declared bucket boundaries; summary with
+    // {quantile="..."} keeps the wire format self-describing).
+    let lat = broker.publish_fanout_latency();
+    let _ = writeln!(
+        out,
+        "# HELP blipmq_publish_fanout_seconds Time spent fanning out one publish across all subscribers."
+    );
+    let _ = writeln!(out, "# TYPE blipmq_publish_fanout_seconds summary");
+    let _ = writeln!(
+        out,
+        "blipmq_publish_fanout_seconds{{quantile=\"0.5\"}} {:.9}",
+        lat.p50_ns as f64 / 1e9,
+    );
+    let _ = writeln!(
+        out,
+        "blipmq_publish_fanout_seconds{{quantile=\"0.95\"}} {:.9}",
+        lat.p95_ns as f64 / 1e9,
+    );
+    let _ = writeln!(
+        out,
+        "blipmq_publish_fanout_seconds{{quantile=\"0.99\"}} {:.9}",
+        lat.p99_ns as f64 / 1e9,
+    );
+    let _ = writeln!(
+        out,
+        "blipmq_publish_fanout_seconds_count {}",
+        lat.count,
+    );
+    let _ = writeln!(
+        out,
+        "blipmq_publish_fanout_seconds_sum {:.9}",
+        lat.sum_ns as f64 / 1e9,
+    );
+
     // Per-topic counters as labelled metrics. One scrape walks every
     // topic shard under read locks; cost is O(num_topics).
     let topic_metrics = broker.topic_metrics();
