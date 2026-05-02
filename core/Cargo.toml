@@ -21,6 +21,7 @@ smallvec = "1"
 flume = { version = "0.11", default-features = false, features = ["async"] }
 crc32fast = { workspace = true }
 hdrhistogram = { version = "7", default-features = false }
+crossbeam-utils = { version = "0.8", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

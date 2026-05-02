@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
+use crossbeam_utils::CachePadded;
 use hdrhistogram::Histogram;
 use parking_lot::{Mutex, RwLock};
 
@@ -362,16 +363,19 @@ pub struct Broker {
     /// `true` once the daemon has called `mark_ready()` (typically after WAL
     /// replay finishes). The `/readyz` probe consults this.
     ready: std::sync::atomic::AtomicBool,
-    messages_published_total: std::sync::atomic::AtomicU64,
-    messages_delivered_total: std::sync::atomic::AtomicU64,
+    // Hot counters live in their own cache lines (CachePadded) so multi-
+    // publisher fetch_adds don't ping-pong the same line across cores.
+    // Each pad is typically 128 bytes on x86_64.
+    messages_published_total: CachePadded<std::sync::atomic::AtomicU64>,
+    messages_delivered_total: CachePadded<std::sync::atomic::AtomicU64>,
     /// Total messages dropped due to a slow push consumer (mpsc Sender::try_send
     /// returned Full). Surfaced to metrics; in Phase 6 this drives the
     /// slow-consumer policy.
-    push_dropped_total: std::sync::atomic::AtomicU64,
+    push_dropped_total: CachePadded<std::sync::atomic::AtomicU64>,
     /// Highest WAL id this broker has observed (via either an inbound
     /// durable publish or a replayed record). Used as the `snapshot_id`
     /// when capturing a checkpoint.
-    max_wal_id_observed: AtomicU64,
+    max_wal_id_observed: CachePadded<AtomicU64>,
     /// Live `(client_id, topic) -> highest acked WAL id` cursors. Updated
     /// on every `Broker::ack` for QoS1 deliveries that had a WAL id, and
     /// captured wholesale by `current_snapshot`.
@@ -383,7 +387,7 @@ pub struct Broker {
     /// attempts the lock. The metrics endpoint reads the same Mutex.
     publish_fanout_ns: Mutex<Histogram<u64>>,
     /// Monotonic publish counter for sample-based histogram recording.
-    publish_count: AtomicU64,
+    publish_count: CachePadded<AtomicU64>,
     /// Subscriptions whose pattern contains at least one wildcard. Lookup
     /// on publish is a linear scan — fine for hundreds of patterns; a
     /// later phase could replace this with a subject trie. Exact-match
@@ -1215,16 +1219,16 @@ impl Broker {
             wal: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             ready: std::sync::atomic::AtomicBool::new(false),
-            messages_published_total: std::sync::atomic::AtomicU64::new(0),
-            messages_delivered_total: std::sync::atomic::AtomicU64::new(0),
-            push_dropped_total: std::sync::atomic::AtomicU64::new(0),
-            max_wal_id_observed: AtomicU64::new(0),
+            messages_published_total: CachePadded::new(std::sync::atomic::AtomicU64::new(0)),
+            messages_delivered_total: CachePadded::new(std::sync::atomic::AtomicU64::new(0)),
+            push_dropped_total: CachePadded::new(std::sync::atomic::AtomicU64::new(0)),
+            max_wal_id_observed: CachePadded::new(AtomicU64::new(0)),
             ack_cursors: RwLock::new(HashMap::new()),
             publish_fanout_ns: Mutex::new(
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
-            publish_count: AtomicU64::new(0),
+            publish_count: CachePadded::new(AtomicU64::new(0)),
             wildcard_subs: RwLock::new(Vec::new()),
             wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
@@ -1244,16 +1248,16 @@ impl Broker {
             wal: Some(wal),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             ready: std::sync::atomic::AtomicBool::new(false),
-            messages_published_total: AtomicU64::new(0),
-            messages_delivered_total: AtomicU64::new(0),
-            push_dropped_total: AtomicU64::new(0),
-            max_wal_id_observed: AtomicU64::new(0),
+            messages_published_total: CachePadded::new(AtomicU64::new(0)),
+            messages_delivered_total: CachePadded::new(AtomicU64::new(0)),
+            push_dropped_total: CachePadded::new(AtomicU64::new(0)),
+            max_wal_id_observed: CachePadded::new(AtomicU64::new(0)),
             ack_cursors: RwLock::new(HashMap::new()),
             publish_fanout_ns: Mutex::new(
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
-            publish_count: AtomicU64::new(0),
+            publish_count: CachePadded::new(AtomicU64::new(0)),
             wildcard_subs: RwLock::new(Vec::new()),
             wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),

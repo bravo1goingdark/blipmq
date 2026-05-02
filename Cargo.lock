@@ -550,6 +550,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "criterion",
+ "crossbeam-utils",
  "flume",
  "hdrhistogram",
  "parking_lot",
