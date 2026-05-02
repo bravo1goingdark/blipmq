@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,69 @@ use parking_lot::{Mutex, RwLock};
 /// the histogram lock from 63/64 of publishes.
 const PUBLISH_LATENCY_SAMPLE_INTERVAL: u64 = 64;
 const PUBLISH_LATENCY_SAMPLE_MASK: u64 = PUBLISH_LATENCY_SAMPLE_INTERVAL - 1;
+
+/// Number of shards in `ShardedCounter`. Power of two; 16 covers the
+/// publisher-thread fanout we see in benches (1..16 pipes) without
+/// blowing memory. Each shard sits on its own cache line so concurrent
+/// `add` calls from different threads don't ping the same line.
+const COUNTER_SHARDS: usize = 16;
+const COUNTER_SHARD_MASK: usize = COUNTER_SHARDS - 1;
+
+/// Per-thread shard index. First touch on a thread reserves a slot via
+/// the static `NEXT_SHARD` counter; subsequent reads are a single TLS
+/// load. Threads above `COUNTER_SHARDS` wrap, which only adds light
+/// contention rather than a hard cap on concurrency.
+fn thread_shard_idx() -> usize {
+    thread_local! {
+        static SHARD_IDX: usize = {
+            static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+            NEXT_SHARD.fetch_add(1, Ordering::Relaxed) & COUNTER_SHARD_MASK
+        };
+    }
+    SHARD_IDX.with(|i| *i)
+}
+
+/// Counter sharded across `COUNTER_SHARDS` cache-line-padded atomics so
+/// concurrent publishers from different threads do not contend on the
+/// same line. Reads sum across all shards (only metrics scrape paths
+/// hit this, so the linear scan is not on the hot path).
+#[derive(Debug, Default)]
+pub struct ShardedCounter {
+    shards: [CachePadded<AtomicU64>; COUNTER_SHARDS],
+}
+
+impl ShardedCounter {
+    pub const fn new() -> Self {
+        // `CachePadded::new` is const, but array-init via const requires
+        // a more verbose path. Use a const helper.
+        const fn z() -> CachePadded<AtomicU64> {
+            CachePadded::new(AtomicU64::new(0))
+        }
+        Self {
+            shards: [
+                z(), z(), z(), z(), z(), z(), z(), z(),
+                z(), z(), z(), z(), z(), z(), z(), z(),
+            ],
+        }
+    }
+
+    #[inline]
+    pub fn add(&self, n: u64) -> u64 {
+        let idx = thread_shard_idx();
+        // Returns the per-shard previous value, plus n is the new local
+        // count — sufficient for sample-mod-N gating since each thread
+        // has its own monotonic stream.
+        self.shards[idx].fetch_add(n, Ordering::Relaxed)
+    }
+
+    pub fn load(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
 use smallvec::SmallVec;
 use tokio::sync::Notify;
 use wal::{WalError as LogError, WalRecord, WriteAheadLog};
@@ -366,8 +429,8 @@ pub struct Broker {
     // Hot counters live in their own cache lines (CachePadded) so multi-
     // publisher fetch_adds don't ping-pong the same line across cores.
     // Each pad is typically 128 bytes on x86_64.
-    messages_published_total: CachePadded<std::sync::atomic::AtomicU64>,
-    messages_delivered_total: CachePadded<std::sync::atomic::AtomicU64>,
+    messages_published_total: ShardedCounter,
+    messages_delivered_total: ShardedCounter,
     /// Total messages dropped due to a slow push consumer (mpsc Sender::try_send
     /// returned Full). Surfaced to metrics; in Phase 6 this drives the
     /// slow-consumer policy.
@@ -387,7 +450,7 @@ pub struct Broker {
     /// attempts the lock. The metrics endpoint reads the same Mutex.
     publish_fanout_ns: Mutex<Histogram<u64>>,
     /// Monotonic publish counter for sample-based histogram recording.
-    publish_count: CachePadded<AtomicU64>,
+    publish_count: ShardedCounter,
     /// Subscriptions whose pattern contains at least one wildcard. Lookup
     /// on publish is a linear scan — fine for hundreds of patterns; a
     /// later phase could replace this with a subject trie. Exact-match
@@ -1219,8 +1282,8 @@ impl Broker {
             wal: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             ready: std::sync::atomic::AtomicBool::new(false),
-            messages_published_total: CachePadded::new(std::sync::atomic::AtomicU64::new(0)),
-            messages_delivered_total: CachePadded::new(std::sync::atomic::AtomicU64::new(0)),
+            messages_published_total: ShardedCounter::new(),
+            messages_delivered_total: ShardedCounter::new(),
             push_dropped_total: CachePadded::new(std::sync::atomic::AtomicU64::new(0)),
             max_wal_id_observed: CachePadded::new(AtomicU64::new(0)),
             ack_cursors: RwLock::new(HashMap::new()),
@@ -1228,7 +1291,7 @@ impl Broker {
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
-            publish_count: CachePadded::new(AtomicU64::new(0)),
+            publish_count: ShardedCounter::new(),
             wildcard_subs: RwLock::new(Vec::new()),
             wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
@@ -1248,8 +1311,8 @@ impl Broker {
             wal: Some(wal),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             ready: std::sync::atomic::AtomicBool::new(false),
-            messages_published_total: CachePadded::new(AtomicU64::new(0)),
-            messages_delivered_total: CachePadded::new(AtomicU64::new(0)),
+            messages_published_total: ShardedCounter::new(),
+            messages_delivered_total: ShardedCounter::new(),
             push_dropped_total: CachePadded::new(AtomicU64::new(0)),
             max_wal_id_observed: CachePadded::new(AtomicU64::new(0)),
             ack_cursors: RwLock::new(HashMap::new()),
@@ -1257,7 +1320,7 @@ impl Broker {
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
-            publish_count: CachePadded::new(AtomicU64::new(0)),
+            publish_count: ShardedCounter::new(),
             wildcard_subs: RwLock::new(Vec::new()),
             wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
@@ -1289,11 +1352,11 @@ impl Broker {
     }
 
     pub fn messages_published_total(&self) -> u64 {
-        self.messages_published_total.load(Ordering::Relaxed)
+        self.messages_published_total.load()
     }
 
     pub fn messages_delivered_total(&self) -> u64 {
-        self.messages_delivered_total.load(Ordering::Relaxed)
+        self.messages_delivered_total.load()
     }
 
     /// Subscribe in poll mode (v1). The subscriber's messages accumulate in
@@ -1635,10 +1698,7 @@ impl Broker {
         // The non-sampled path skips both `Instant::now()` and the
         // histogram lock, leaving only one Relaxed atomic add on the
         // hot path. Sample interval is 1-in-64.
-        let n = self
-            .publish_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        let n = self.publish_count.add(1).wrapping_add(1);
         let sample_start: Option<std::time::Instant> = if n & PUBLISH_LATENCY_SAMPLE_MASK == 0 {
             Some(std::time::Instant::now())
         } else {
@@ -1673,8 +1733,7 @@ impl Broker {
         // We always count the publish (even if no subscribers match),
         // since publishers shouldn't have to know which topics have
         // active subscriptions.
-        self.messages_published_total
-            .fetch_add(1, Ordering::Relaxed);
+        self.messages_published_total.add(1);
 
         // Two-source fanout snapshot:
         //  (a) per-topic exact-match subscribers from `TopicShards`.
@@ -1813,8 +1872,7 @@ impl Broker {
             if let Some(t) = topic_for_metrics {
                 t.delivered_total.fetch_add(delivered, Ordering::Relaxed);
             }
-            self.messages_delivered_total
-                .fetch_add(delivered, Ordering::Relaxed);
+            self.messages_delivered_total.add(delivered);
         }
 
         // Apply the DropSubscription slow-consumer policy after the fanout
