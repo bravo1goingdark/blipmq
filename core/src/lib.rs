@@ -1,11 +1,13 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crc32fast::Hasher as Crc32Hasher;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use tokio::sync::Notify;
@@ -229,6 +231,14 @@ pub struct Broker {
     /// returned Full). Surfaced to metrics; in Phase 6 this drives the
     /// slow-consumer policy.
     push_dropped_total: std::sync::atomic::AtomicU64,
+    /// Highest WAL id this broker has observed (via either an inbound
+    /// durable publish or a replayed record). Used as the `snapshot_id`
+    /// when capturing a checkpoint.
+    max_wal_id_observed: AtomicU64,
+    /// Live `(client_id, topic) -> highest acked WAL id` cursors. Updated
+    /// on every `Broker::ack` for QoS1 deliveries that had a WAL id, and
+    /// captured wholesale by `current_snapshot`.
+    ack_cursors: RwLock<HashMap<(String, String), u64>>,
 }
 
 #[derive(Debug)]
@@ -454,6 +464,132 @@ impl PartialOrd for RetryEntry {
 /// records from acknowledgement records.
 const WAL_KIND_MESSAGE: u8 = 1;
 const WAL_KIND_ACK: u8 = 2;
+
+const CHECKPOINT_MAGIC: &[u8; 8] = b"BLIPCKPT";
+const CHECKPOINT_VERSION: u32 = 1;
+
+/// A point-in-time snapshot of broker recovery state, written by the
+/// daemon periodically and consumed at startup. Holds, for each
+/// `(client_id, topic)` consumer, the highest acked WAL id; on restart,
+/// `replay_from_wal_with_checkpoint` uses these as initial cursors so it
+/// only needs to walk the WAL from `snapshot_id + 1` instead of the
+/// whole log. Drops O(WAL size) restart time to O(unacked tail).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointSnapshot {
+    /// Largest WAL id reflected in this snapshot. Replay can skip
+    /// Message records with id <= this; Ack records up to this are
+    /// already aggregated into `cursors`.
+    pub snapshot_id: u64,
+    /// `(client_id, topic) -> highest_acked_wal_id`.
+    pub cursors: HashMap<(String, String), u64>,
+}
+
+impl CheckpointSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            snapshot_id: 0,
+            cursors: HashMap::new(),
+        }
+    }
+
+    /// Encode to a self-describing on-disk format with a CRC32 trailer.
+    pub fn encode(&self) -> Result<Bytes, LogError> {
+        let mut buf = BytesMut::with_capacity(64 + self.cursors.len() * 64);
+        buf.put_slice(CHECKPOINT_MAGIC);
+        buf.put_u32(CHECKPOINT_VERSION);
+        buf.put_u64(self.snapshot_id);
+        let n = u32::try_from(self.cursors.len()).map_err(|_| {
+            LogError::Corruption("too many checkpoint entries".to_string())
+        })?;
+        buf.put_u32(n);
+        for ((cid, topic), wal_id) in &self.cursors {
+            let cid_bytes = cid.as_bytes();
+            let topic_bytes = topic.as_bytes();
+            let cid_len = u16::try_from(cid_bytes.len()).map_err(|_| {
+                LogError::Corruption("client_id too long".to_string())
+            })?;
+            let topic_len = u16::try_from(topic_bytes.len()).map_err(|_| {
+                LogError::Corruption("topic too long".to_string())
+            })?;
+            buf.put_u16(cid_len);
+            buf.put_slice(cid_bytes);
+            buf.put_u16(topic_len);
+            buf.put_slice(topic_bytes);
+            buf.put_u64(*wal_id);
+        }
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&buf);
+        let crc = hasher.finalize();
+        buf.put_u32(crc);
+        Ok(buf.freeze())
+    }
+
+    /// Decode and CRC-validate. Returns `Corruption` on any structural or
+    /// CRC issue so the daemon can fall back to a full replay rather than
+    /// silently use a corrupt snapshot.
+    pub fn decode(bytes: &[u8]) -> Result<Self, LogError> {
+        // Layout: magic(8) + version(4) + snapshot_id(8) + n(4) + entries + crc(4).
+        if bytes.len() < 8 + 4 + 8 + 4 + 4 {
+            return Err(LogError::Corruption(
+                "checkpoint file too short".to_string(),
+            ));
+        }
+        let crc_offset = bytes.len() - 4;
+        let body = &bytes[..crc_offset];
+        let mut crc_slice = &bytes[crc_offset..];
+        let stored_crc = crc_slice.get_u32();
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(body);
+        if hasher.finalize() != stored_crc {
+            return Err(LogError::Corruption(
+                "checkpoint CRC mismatch".to_string(),
+            ));
+        }
+
+        let mut slice = body;
+        let mut magic = [0u8; 8];
+        slice.copy_to_slice(&mut magic);
+        if &magic != CHECKPOINT_MAGIC {
+            return Err(LogError::Corruption(
+                "checkpoint magic mismatch".to_string(),
+            ));
+        }
+        let version = slice.get_u32();
+        if version != CHECKPOINT_VERSION {
+            return Err(LogError::Corruption(format!(
+                "unsupported checkpoint version: {version}"
+            )));
+        }
+        let snapshot_id = slice.get_u64();
+        let n = slice.get_u32() as usize;
+        let mut cursors = HashMap::with_capacity(n);
+        for _ in 0..n {
+            if slice.remaining() < 2 {
+                return Err(LogError::Corruption("checkpoint truncated".to_string()));
+            }
+            let cid_len = slice.get_u16() as usize;
+            if slice.remaining() < cid_len + 2 {
+                return Err(LogError::Corruption("checkpoint truncated".to_string()));
+            }
+            let cid_bytes = slice.copy_to_bytes(cid_len);
+            let cid = String::from_utf8(cid_bytes.to_vec())
+                .map_err(|_| LogError::Corruption("cid not utf8".to_string()))?;
+            let topic_len = slice.get_u16() as usize;
+            if slice.remaining() < topic_len + 8 {
+                return Err(LogError::Corruption("checkpoint truncated".to_string()));
+            }
+            let topic_bytes = slice.copy_to_bytes(topic_len);
+            let topic = String::from_utf8(topic_bytes.to_vec())
+                .map_err(|_| LogError::Corruption("topic not utf8".to_string()))?;
+            let wal_id = slice.get_u64();
+            cursors.insert((cid, topic), wal_id);
+        }
+        Ok(Self {
+            snapshot_id,
+            cursors,
+        })
+    }
+}
 
 /// Broker-level entry stored in the WAL. Messages are durable
 /// publications; Acks record that a particular (client, topic) consumer
@@ -887,6 +1023,8 @@ impl Broker {
             messages_published_total: std::sync::atomic::AtomicU64::new(0),
             messages_delivered_total: std::sync::atomic::AtomicU64::new(0),
             push_dropped_total: std::sync::atomic::AtomicU64::new(0),
+            max_wal_id_observed: AtomicU64::new(0),
+            ack_cursors: RwLock::new(HashMap::new()),
         }
     }
 
@@ -906,6 +1044,8 @@ impl Broker {
             messages_published_total: AtomicU64::new(0),
             messages_delivered_total: AtomicU64::new(0),
             push_dropped_total: AtomicU64::new(0),
+            max_wal_id_observed: AtomicU64::new(0),
+            ack_cursors: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1150,6 +1290,24 @@ impl Broker {
             return;
         }
 
+        // Track the highest WAL id we've seen so a future
+        // `current_snapshot()` reflects it. Cheap: relaxed atomic
+        // compare-and-swap loop, only entered for WAL-backed publishes.
+        if let Some(id) = wal_id {
+            let mut cur = self.max_wal_id_observed.load(Ordering::Relaxed);
+            while id > cur {
+                match self.max_wal_id_observed.compare_exchange_weak(
+                    cur,
+                    id,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
+        }
+
         let topic = match self.topics.get(topic_name) {
             Some(t) => t,
             None => return,
@@ -1312,17 +1470,35 @@ impl Broker {
     /// previously-known consumers (by `client_id`) and recover only the
     /// undelivered tail of the log instead of replaying everything.
     pub async fn replay_from_wal(&self) -> Result<(), LogError> {
+        self.replay_from_wal_with_checkpoint(None).await
+    }
+
+    /// Like `replay_from_wal`, but seeded with a previously-saved
+    /// [`CheckpointSnapshot`]. Replay still walks the WAL (so any Ack or
+    /// Message records past `snapshot_id` are honored), but Message
+    /// records with id <= `snapshot_id` are skipped wholesale because
+    /// they're already represented by the checkpoint's cursors.
+    pub async fn replay_from_wal_with_checkpoint(
+        &self,
+        checkpoint: Option<CheckpointSnapshot>,
+    ) -> Result<(), LogError> {
         let wal = match &self.wal {
             Some(w) => w.clone(),
             None => return Ok(()),
         };
 
-        let records: Vec<WalRecord> = wal.iterate_from(1).await?;
+        // Start from the checkpoint's snapshot_id + 1 if we have one;
+        // otherwise from 1. Any earlier records were already accounted
+        // for in the snapshot's cursors.
+        let (mut ack_cursors, start_from) = match checkpoint {
+            Some(cp) => (cp.cursors, cp.snapshot_id.saturating_add(1)),
+            None => (HashMap::<(String, String), u64>::new(), 1),
+        };
 
-        // Pass 1: build per-(client_id, topic) cursor of "highest acked
-        // wal_id". Any message with wal_id <= cursor for that consumer was
-        // delivered before the crash and should not be re-enqueued.
-        let mut ack_cursors: HashMap<(String, String), u64> = HashMap::new();
+        let records: Vec<WalRecord> = wal.iterate_from(start_from).await?;
+
+        // Pass 1: refine per-(client_id, topic) cursors using any Ack
+        // records past the checkpoint.
         for record in &records {
             if let Ok(WalEntry::Ack(ack)) = WalEntry::decode(&record.payload) {
                 let key = (ack.client_id, ack.topic);
@@ -1436,6 +1612,18 @@ impl Broker {
             )
         };
 
+        // Update the in-memory cursor so a subsequent `current_snapshot()`
+        // call reflects this ack without needing to walk the WAL. This is
+        // cheap: one write-locked HashMap upsert.
+        if let Some(wal_id) = wal_id_opt {
+            let mut cursors = self.ack_cursors.write();
+            let key = (client_id.clone(), topic.clone());
+            let entry = cursors.entry(key).or_insert(0);
+            if wal_id > *entry {
+                *entry = wal_id;
+            }
+        }
+
         // Journal the ack if (a) the message was WAL-backed and (b) the
         // broker is configured with a WAL. Channel-gated (no fsync wait):
         // ack records are idempotent, so losing the trailing ack on a
@@ -1458,6 +1646,57 @@ impl Broker {
             }
         }
         true
+    }
+
+    /// Capture a [`CheckpointSnapshot`] of the broker's current recovery
+    /// state. `snapshot_id` is the **smallest** acked-wal-id across all
+    /// known consumers (or 0 if no consumer has acked anything yet) — i.e.
+    /// "everything strictly below this is fully delivered". On replay,
+    /// records with id <= `snapshot_id` are already fully accounted for
+    /// in `cursors` and can be skipped; records past it are walked.
+    pub fn current_snapshot(&self) -> CheckpointSnapshot {
+        let cursors = self.ack_cursors.read().clone();
+        let snapshot_id = cursors.values().copied().min().unwrap_or(0);
+        CheckpointSnapshot {
+            snapshot_id,
+            cursors,
+        }
+    }
+
+    /// Atomically write the current checkpoint snapshot to `path`. Writes
+    /// to `path.tmp` then renames; partial writes can never overwrite a
+    /// good checkpoint. The caller chooses where the file lives (typically
+    /// inside the WAL directory).
+    pub async fn write_checkpoint_to(&self, path: &Path) -> Result<(), LogError> {
+        let snap = self.current_snapshot();
+        let bytes = snap.encode()?;
+        let tmp = path.with_extension("snap.tmp");
+        // Make sure the parent directory exists.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.map_err(LogError::Io)?;
+            }
+        }
+        tokio::fs::write(&tmp, &bytes[..])
+            .await
+            .map_err(LogError::Io)?;
+        // tokio::fs::rename is atomic on the same filesystem.
+        tokio::fs::rename(&tmp, path).await.map_err(LogError::Io)?;
+        Ok(())
+    }
+
+    /// Try to load a [`CheckpointSnapshot`] from `path`. Returns `Ok(None)`
+    /// if the file doesn't exist (fresh deployment); `Err(_)` only if it
+    /// exists but is structurally bad (caller should fall back to a full
+    /// replay).
+    pub async fn load_checkpoint_from(
+        path: &Path,
+    ) -> Result<Option<CheckpointSnapshot>, LogError> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => Ok(Some(CheckpointSnapshot::decode(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LogError::Io(e)),
+        }
     }
 
     /// Total number of QoS1 messages currently tracked as in-flight across
@@ -1943,6 +2182,141 @@ mod tests {
         );
 
         let _ = acked_tags; // silence unused
+    }
+
+    #[test]
+    fn checkpoint_snapshot_encode_decode_roundtrip() {
+        let mut snap = CheckpointSnapshot::empty();
+        snap.snapshot_id = 12345;
+        snap.cursors
+            .insert(("client-A".to_string(), "orders".to_string()), 10);
+        snap.cursors
+            .insert(("client-B".to_string(), "logs".to_string()), 42);
+
+        let bytes = snap.encode().expect("encode");
+        let decoded = CheckpointSnapshot::decode(&bytes).expect("decode");
+        assert_eq!(decoded.snapshot_id, 12345);
+        assert_eq!(decoded.cursors.len(), 2);
+        assert_eq!(
+            decoded.cursors.get(&("client-A".to_string(), "orders".to_string())),
+            Some(&10),
+        );
+    }
+
+    #[test]
+    fn checkpoint_corruption_caught_by_crc() {
+        let mut snap = CheckpointSnapshot::empty();
+        snap.snapshot_id = 1;
+        snap.cursors
+            .insert(("c".to_string(), "t".to_string()), 7);
+        let mut bytes = snap.encode().expect("encode").to_vec();
+        // Flip a byte in the body.
+        bytes[10] ^= 0xFF;
+        let err = CheckpointSnapshot::decode(&bytes).unwrap_err();
+        assert!(matches!(err, LogError::Corruption(_)));
+    }
+
+    /// Round-trip: write a checkpoint after acking some QoS1 messages,
+    /// drop the broker, restart with the loaded checkpoint, and verify
+    /// only unacked messages are re-delivered. Also verifies that the
+    /// in-memory ack_cursors map is updated by Broker::ack so the
+    /// snapshot doesn't need to re-walk the WAL.
+    #[tokio::test]
+    async fn replay_with_checkpoint_skips_acked_tail() {
+        let mut wal_path = std::env::temp_dir();
+        wal_path.push("core_replay_with_ckpt_wal");
+        let _ = std::fs::remove_dir_all(&wal_path);
+
+        let mut ckpt_path = std::env::temp_dir();
+        ckpt_path.push("core_replay_with_ckpt.snap");
+        let _ = std::fs::remove_file(&ckpt_path);
+
+        let wal = Arc::new(WriteAheadLog::open(&wal_path).await.unwrap());
+
+        let config = BrokerConfig {
+            default_qos: QoSLevel::AtLeastOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 32,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            ..Default::default()
+        };
+
+        let topic = TopicName::new("ckpt-topic");
+        let client_id = ClientId::new("client-A");
+
+        // Pre-crash session: publish 5, ack 4, write checkpoint.
+        {
+            let broker = Broker::new_with_wal(config.clone(), wal.clone());
+            let sub_id = broker.subscribe(
+                client_id.clone(),
+                topic.clone(),
+                QoSLevel::AtLeastOnce,
+            );
+            for i in 0..5u8 {
+                broker
+                    .publish_durable(&topic, Bytes::from(vec![i; 4]), QoSLevel::AtLeastOnce)
+                    .await
+                    .unwrap();
+                let polled = broker.poll(sub_id).expect("delivery");
+                let tag = polled.delivery_tag.unwrap();
+                if i < 4 {
+                    assert!(broker.ack(sub_id, tag));
+                }
+            }
+            // Allow spawned ack-journal writes to flush.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            wal.flush().await.unwrap();
+
+            // Write a checkpoint that captures cursors AT this point.
+            broker
+                .write_checkpoint_to(&ckpt_path)
+                .await
+                .expect("write checkpoint");
+
+            let snap = broker.current_snapshot();
+            // snapshot_id == min of cursors. With one consumer that has
+            // acked the first 4 of 5 publishes, the cursor (and snapshot_id)
+            // should be the wal_id of the 4th published message, i.e. 4.
+            assert!(
+                snap.snapshot_id >= 4,
+                "snapshot_id should reflect 4 acked records, got {}",
+                snap.snapshot_id,
+            );
+            let cursor = snap
+                .cursors
+                .get(&(client_id.as_str().to_string(), topic.as_str().to_string()))
+                .copied()
+                .unwrap_or(0);
+            assert!(
+                cursor >= 4,
+                "cursor should reflect 4 acked messages, got {cursor}",
+            );
+        }
+
+        // Post-crash session: load checkpoint, replay; only unacked
+        // (=1) message should be re-delivered.
+        let loaded = Broker::load_checkpoint_from(&ckpt_path)
+            .await
+            .expect("load")
+            .expect("file present");
+        assert!(loaded.snapshot_id >= 4);
+
+        let broker2 = Broker::new_with_wal(config, wal.clone());
+        let sub2 = broker2.subscribe(client_id, topic, QoSLevel::AtLeastOnce);
+        broker2
+            .replay_from_wal_with_checkpoint(Some(loaded))
+            .await
+            .unwrap();
+
+        let mut redelivered = 0;
+        while broker2.poll(sub2).is_some() {
+            redelivered += 1;
+        }
+        assert_eq!(
+            redelivered, 1,
+            "with the checkpoint skipping the acked tail, only the unacked msg should re-deliver",
+        );
     }
 
     /// SlowConsumerPolicy::DropSubscription: when a push subscriber's

@@ -508,6 +508,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
+ "crc32fast",
  "criterion",
  "flume",
  "parking_lot",

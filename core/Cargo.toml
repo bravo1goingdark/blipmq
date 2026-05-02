@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["sync"] }
 ahash = "0.8"
 smallvec = "1"
 flume = { version = "0.11", default-features = false, features = ["async"] }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
