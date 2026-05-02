@@ -501,10 +501,43 @@ pub struct LatencyStats {
     pub max_ns: u64,
 }
 
+/// Round-robin consumer group on a single topic. Members are competing
+/// consumers — each `publish` to the topic fans out to non-grouped
+/// subscribers as broadcast and *additionally* picks one member from
+/// each registered consumer group, so a publish goes to exactly one
+/// member of each group (and to all non-grouped subs).
+#[derive(Debug)]
+struct ConsumerGroup {
+    /// Members of this group on the parent topic. Stored as a Vec so
+    /// round-robin indexing is O(1). Subscribe/unsubscribe rebuild the
+    /// Vec under the writer mutex; the publish path takes a brief
+    /// read lock and a snapshot.
+    members: RwLock<Vec<(SubscriptionId, Arc<Subscriber>)>>,
+    /// Round-robin counter; bumped per publish to balance deliveries
+    /// across members. `Relaxed` ordering is fine — ordering across
+    /// publishers isn't promised, just that each publisher's
+    /// successive publishes hit different members.
+    next_idx: AtomicUsize,
+}
+
+impl ConsumerGroup {
+    fn new() -> Self {
+        Self {
+            members: RwLock::new(Vec::new()),
+            next_idx: AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Topic {
     name: TopicName,
     subscribers: RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>,
+    /// Named consumer groups registered on this topic. Keyed by group
+    /// name. Each map entry is shared via `Arc` so the publish path
+    /// can snapshot the current set under a brief read lock without
+    /// holding the topic-level lock during fanout.
+    consumer_groups: RwLock<HashMap<String, Arc<ConsumerGroup>>>,
     /// Number of `publish` calls that landed on this topic (one per
     /// publisher message, regardless of fanout). Sharded by publisher
     /// thread so concurrent publishes to the same topic don't ping
@@ -664,6 +697,11 @@ impl std::fmt::Debug for Subscriber {
 struct SubscriptionRef {
     topic: TopicName,
     subscriber: Arc<Subscriber>,
+    /// `Some(group)` when this subscription joined a named consumer
+    /// group on `topic`. The group key is what unsubscribe paths look
+    /// up in `Topic.consumer_groups`. Non-grouped subscriptions land
+    /// in `Topic.subscribers` (broadcast fanout) and store `None`.
+    group: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1296,6 +1334,7 @@ impl Topic {
         Self {
             name,
             subscribers: RwLock::new(HashMap::new()),
+            consumer_groups: RwLock::new(HashMap::new()),
             published_total: ShardedCounter::new(),
             delivered_total: ShardedCounter::new(),
         }
@@ -1449,6 +1488,33 @@ impl Broker {
         )
     }
 
+    /// Subscribe to `topic` as a member of a named consumer group. Each
+    /// publish to the topic is delivered to exactly one member of the
+    /// group (round-robin), in addition to all non-grouped subscribers.
+    /// Use this for queue-group / competing-consumers semantics
+    /// (Kafka's consumer groups, NATS's queue groups).
+    #[allow(clippy::too_many_arguments)]
+    pub fn subscribe_with_slot_in_group(
+        &self,
+        client_id: ClientId,
+        topic: TopicName,
+        qos: QoSLevel,
+        conn_id: u64,
+        slot: Arc<PushSlot>,
+        encoder: DeliveryEncoder,
+        group: String,
+    ) -> SubscriptionId {
+        self.subscribe_inner_grouped(
+            client_id,
+            topic,
+            qos,
+            Some(conn_id),
+            None,
+            Some((slot, encoder)),
+            Some(group),
+        )
+    }
+
     /// Subscribe with a NATS-style subject pattern (may contain `*` and
     /// `>` wildcards). Exact patterns route through the fast `TopicShards`
     /// path; wildcard patterns are added to a parallel list scanned on
@@ -1538,6 +1604,26 @@ impl Broker {
         push_sender: Option<PushSender>,
         push_slot: Option<(Arc<PushSlot>, DeliveryEncoder)>,
     ) -> SubscriptionId {
+        self.subscribe_inner_grouped(client_id, topic, qos, conn_id, push_sender, push_slot, None)
+    }
+
+    /// Internal subscribe path that accepts an optional consumer group.
+    /// `group = None` is the original broadcast behavior (subscriber
+    /// lands in `Topic.subscribers`). `group = Some(g)` routes the
+    /// subscriber into `Topic.consumer_groups[g].members` instead, so
+    /// the publish path will pick exactly one member per group per
+    /// publish (round-robin).
+    #[allow(clippy::too_many_arguments)]
+    fn subscribe_inner_grouped(
+        &self,
+        client_id: ClientId,
+        topic: TopicName,
+        qos: QoSLevel,
+        conn_id: Option<u64>,
+        push_sender: Option<PushSender>,
+        push_slot: Option<(Arc<PushSlot>, DeliveryEncoder)>,
+        group: Option<String>,
+    ) -> SubscriptionId {
         let queue = SubscriberQueue::new(qos, self.config.per_subscriber_queue_capacity);
         let subscriber = Arc::new(Subscriber {
             client_id,
@@ -1551,14 +1637,37 @@ impl Broker {
 
         let sub_id = SubscriptionId(self.next_subscription_id.fetch_add(1, Ordering::Relaxed));
 
-        {
-            let mut subs = topic_arc.subscribers.write();
-            subs.insert(sub_id, subscriber.clone());
+        match &group {
+            None => {
+                let mut subs = topic_arc.subscribers.write();
+                subs.insert(sub_id, subscriber.clone());
+            }
+            Some(g) => {
+                // Group subscribers do NOT land in `Topic.subscribers`
+                // — they only receive load-balanced deliveries via the
+                // consumer-group path. Get-or-create the group entry.
+                let cg = {
+                    let mut groups = topic_arc.consumer_groups.write();
+                    groups
+                        .entry(g.clone())
+                        .or_insert_with(|| Arc::new(ConsumerGroup::new()))
+                        .clone()
+                };
+                let mut members = cg.members.write();
+                members.push((sub_id, subscriber.clone()));
+            }
         }
 
         {
             let mut shard = self.subscriptions.shard_for(sub_id).write();
-            shard.insert(sub_id, SubscriptionRef { topic, subscriber });
+            shard.insert(
+                sub_id,
+                SubscriptionRef {
+                    topic,
+                    subscriber,
+                    group,
+                },
+            );
         }
 
         if let Some(c) = conn_id {
@@ -1594,11 +1703,24 @@ impl Broker {
             }
         }
 
-        // Then remove from each per-topic subscriber map.
+        // Then remove from either the topic's broadcast subscriber
+        // map (non-grouped) or the matching consumer-group member
+        // list (grouped).
         for (sid, sub_ref) in &removed {
             if let Some(topic) = self.topics.get(&sub_ref.topic) {
-                let mut topic_subs = topic.subscribers.write();
-                topic_subs.remove(sid);
+                match &sub_ref.group {
+                    None => {
+                        let mut topic_subs = topic.subscribers.write();
+                        topic_subs.remove(sid);
+                    }
+                    Some(g) => {
+                        let groups = topic.consumer_groups.read();
+                        if let Some(cg) = groups.get(g) {
+                            let mut members = cg.members.write();
+                            members.retain(|(s, _)| s != sid);
+                        }
+                    }
+                }
             }
         }
         // Drop any wildcard entries belonging to these subs.
@@ -1652,8 +1774,19 @@ impl Broker {
             return false;
         };
         if let Some(topic) = self.topics.get(&sub_ref.topic) {
-            let mut topic_subs = topic.subscribers.write();
-            topic_subs.remove(&sub_id);
+            match &sub_ref.group {
+                None => {
+                    let mut topic_subs = topic.subscribers.write();
+                    topic_subs.remove(&sub_id);
+                }
+                Some(g) => {
+                    let groups = topic.consumer_groups.read();
+                    if let Some(cg) = groups.get(g) {
+                        let mut members = cg.members.write();
+                        members.retain(|(s, _)| *s != sub_id);
+                    }
+                }
+            }
         }
         // Remove from the connection_subs reverse-map too. We don't know
         // which conn this sub belonged to; walk the (small) map.
@@ -1737,14 +1870,7 @@ impl Broker {
         payload: Bytes,
         qos: QoSLevel,
     ) {
-        self.publish_inner(
-            name,
-            Some(resolved.inner.clone()),
-            payload,
-            qos,
-            None,
-            None,
-        );
+        self.publish_inner(name, Some(resolved.inner.clone()), payload, qos, None, None);
     }
 
     /// Publish with a pre-resolved topic handle and a per-message TTL
@@ -1759,14 +1885,7 @@ impl Broker {
         qos: QoSLevel,
         ttl: Option<Duration>,
     ) {
-        self.publish_inner(
-            name,
-            Some(resolved.inner.clone()),
-            payload,
-            qos,
-            None,
-            ttl,
-        );
+        self.publish_inner(name, Some(resolved.inner.clone()), payload, qos, None, ttl);
     }
 
     /// Publish with a per-message TTL override that applies only to this
@@ -1875,6 +1994,37 @@ impl Broker {
             let subscribers = topic.subscribers.read();
             for (id, sub) in subscribers.iter() {
                 snapshot.push((*id, sub.clone()));
+            }
+            drop(subscribers);
+
+            // Consumer-group fanout: for each registered group on this
+            // topic, pick exactly one member round-robin and add it to
+            // the snapshot. This is what gives us NATS-queue-group /
+            // Kafka-consumer-group semantics: the *group* sees one
+            // delivery per publish, regardless of how many members it
+            // has. Non-grouped subscribers above still see every
+            // publish.
+            //
+            // Snapshot the groups first (clone the Arc<ConsumerGroup>
+            // pointers), then drop the topic-level lock before walking
+            // — keeps the topic's lock window tight even when many
+            // groups are registered.
+            let groups_snapshot: SmallVec<[Arc<ConsumerGroup>; 4]> = {
+                let groups = topic.consumer_groups.read();
+                if groups.is_empty() {
+                    SmallVec::new()
+                } else {
+                    groups.values().cloned().collect()
+                }
+            };
+            for cg in &groups_snapshot {
+                let members = cg.members.read();
+                if members.is_empty() {
+                    continue;
+                }
+                let idx = cg.next_idx.fetch_add(1, Ordering::Relaxed) % members.len();
+                let (sid, sub) = &members[idx];
+                snapshot.push((*sid, sub.clone()));
             }
         }
         // Wildcard fanout: walk the pattern list, match each pattern
@@ -3172,6 +3322,158 @@ mod tests {
             broker.subscriber_count(),
             0,
             "DropSubscription should have unsubscribed the slow consumer",
+        );
+    }
+
+    /// Consumer-group MVP: 4 members in the same group on the same
+    /// topic should split N publishes ~evenly, and a non-grouped
+    /// subscriber on the same topic should receive ALL of them
+    /// (broadcast semantics preserved).
+    #[tokio::test]
+    async fn consumer_group_round_robin_load_balances() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let broker = Broker::new(BrokerConfig {
+            default_qos: QoSLevel::AtMostOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: None,
+        });
+        let topic = TopicName::new("orders");
+
+        // Per-member delivery counter. The encoder closure captures
+        // an `Arc<AtomicU64>` so we can read totals after publishing.
+        let group_counts: Vec<Arc<AtomicU64>> =
+            (0..4).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let broadcast_count = Arc::new(AtomicU64::new(0));
+
+        for (i, gc) in group_counts.iter().enumerate() {
+            let counter = gc.clone();
+            let slot = Arc::new(PushSlot::new(1024));
+            let encoder: DeliveryEncoder = Arc::new(move |_buf, _qos, _tag, _topic, _payload| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            broker.subscribe_with_slot_in_group(
+                ClientId::new(format!("c{i}")),
+                topic.clone(),
+                QoSLevel::AtMostOnce,
+                (i + 1) as u64,
+                slot,
+                encoder,
+                "workers".to_string(),
+            );
+        }
+
+        // Non-grouped broadcast subscriber on the same topic.
+        {
+            let counter = broadcast_count.clone();
+            let slot = Arc::new(PushSlot::new(1024));
+            let encoder: DeliveryEncoder = Arc::new(move |_buf, _qos, _tag, _topic, _payload| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            broker.subscribe_with_slot(
+                ClientId::new("broadcaster"),
+                topic.clone(),
+                QoSLevel::AtMostOnce,
+                100,
+                slot,
+                encoder,
+            );
+        }
+
+        const N: u64 = 1000;
+        for _ in 0..N {
+            broker.publish(&topic, Bytes::from_static(b"job"), QoSLevel::AtMostOnce);
+        }
+
+        // Each group member should get ~N/4 = 250 deliveries. With
+        // strict round-robin (no concurrent publishers in this test)
+        // the distribution is exactly even.
+        let totals: Vec<u64> = group_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let group_total: u64 = totals.iter().sum();
+        assert_eq!(
+            group_total, N,
+            "group should have received N total deliveries, got {totals:?}"
+        );
+        for (i, t) in totals.iter().enumerate() {
+            assert_eq!(
+                *t,
+                N / 4,
+                "member {i} should have received exactly N/4=250, got {t} (totals: {totals:?})",
+            );
+        }
+
+        // Broadcast subscriber gets ALL publishes regardless of the
+        // group's load-balancing.
+        assert_eq!(
+            broadcast_count.load(Ordering::Relaxed),
+            N,
+            "broadcast subscriber should see every publish, not just one per group",
+        );
+    }
+
+    /// Two consumer groups on the same topic each get one delivery
+    /// per publish, independently load-balanced inside each group.
+    #[tokio::test]
+    async fn two_consumer_groups_each_get_one_delivery_per_publish() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let broker = Broker::new(BrokerConfig {
+            default_qos: QoSLevel::AtMostOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: None,
+        });
+        let topic = TopicName::new("events");
+
+        let group_a = Arc::new(AtomicU64::new(0));
+        let group_b = Arc::new(AtomicU64::new(0));
+        for (gname, counter) in [("group-a", &group_a), ("group-b", &group_b)] {
+            // Two members per group so each group can load-balance.
+            for i in 0..2 {
+                let c = counter.clone();
+                let slot = Arc::new(PushSlot::new(1024));
+                let encoder: DeliveryEncoder =
+                    Arc::new(move |_buf, _qos, _tag, _topic, _payload| {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    });
+                broker.subscribe_with_slot_in_group(
+                    ClientId::new(format!("{gname}-{i}")),
+                    topic.clone(),
+                    QoSLevel::AtMostOnce,
+                    (gname.len() * 10 + i) as u64,
+                    slot,
+                    encoder,
+                    gname.to_string(),
+                );
+            }
+        }
+
+        const N: u64 = 100;
+        for _ in 0..N {
+            broker.publish(&topic, Bytes::from_static(b"e"), QoSLevel::AtMostOnce);
+        }
+
+        assert_eq!(
+            group_a.load(Ordering::Relaxed),
+            N,
+            "group-a should have N total"
+        );
+        assert_eq!(
+            group_b.load(Ordering::Relaxed),
+            N,
+            "group-b should have N total"
         );
     }
 }

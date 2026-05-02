@@ -149,6 +149,7 @@ impl Client {
             payload: SubscribePayload {
                 topic: topic.to_string(),
                 qos,
+                group: None,
             }
             .encode()
             .unwrap(),

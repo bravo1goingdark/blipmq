@@ -148,6 +148,7 @@ async fn publish_receive_ack_qos1() {
     let sub_payload = SubscribePayload {
         topic: "integration".to_string(),
         qos: 1,
+        group: None,
     }
     .encode()
     .expect("encode subscribe");
@@ -226,6 +227,7 @@ async fn multiple_subscribers_receive_same_message() {
     let sub_payload1 = SubscribePayload {
         topic: "fanout".to_string(),
         qos: 1,
+        group: None,
     }
     .encode()
     .expect("encode subscribe1");
@@ -243,6 +245,7 @@ async fn multiple_subscribers_receive_same_message() {
     let sub_payload2 = SubscribePayload {
         topic: "fanout".to_string(),
         qos: 1,
+        group: None,
     }
     .encode()
     .expect("encode subscribe2");
@@ -318,6 +321,7 @@ async fn invalid_topic_and_ack_produce_nack() {
     let sub_payload = SubscribePayload {
         topic: "".to_string(),
         qos: 1,
+        group: None,
     }
     .encode()
     .expect("encode bad subscribe");

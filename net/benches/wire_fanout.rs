@@ -120,6 +120,7 @@ async fn subscribe(stream: &mut TcpStream, read_buf: &mut BytesMut, topic: &str)
             payload: SubscribePayload {
                 topic: topic.to_string(),
                 qos: 0,
+                group: None,
             }
             .encode()
             .unwrap(),

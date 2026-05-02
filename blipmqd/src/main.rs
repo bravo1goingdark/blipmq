@@ -53,6 +53,7 @@ async fn run_integration_flow(
     let subscribe_payload = SubscribePayload {
         topic: "test".to_string(),
         qos: 1,
+        group: None,
     }
     .encode()?;
 

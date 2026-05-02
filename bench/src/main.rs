@@ -297,6 +297,7 @@ impl BenchClient {
         let payload = SubscribePayload {
             topic: topic.to_string(),
             qos: qos_byte,
+            group: None,
         }
         .encode()?;
         let frame = Frame {

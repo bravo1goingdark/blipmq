@@ -485,7 +485,7 @@ impl MessageHandler for BrokerHandler {
             )?));
         }
 
-        let qos = match self.qos_from_u8(payload.qos) {
+        let qos = match self.qos_from_u8(payload.qos_level()) {
             Some(q) => q,
             None => {
                 return Ok(FrameResponse::Frame(self.make_nack(
@@ -499,9 +499,22 @@ impl MessageHandler for BrokerHandler {
         let client_id = ClientId::new(format!("conn-{conn_id}"));
         let topic = TopicName::new(payload.topic);
 
-        let sub_id = self
-            .broker
-            .subscribe_with_slot(client_id, topic, qos, conn_id, slot, encoder);
+        let sub_id = if let Some(group) = payload.group {
+            // NACK empty group strings — they'd otherwise create a
+            // singleton anonymous group that's hard to debug.
+            if group.is_empty() {
+                return Ok(FrameResponse::Frame(self.make_nack(
+                    frame.correlation_id,
+                    400,
+                    "empty consumer group name",
+                )?));
+            }
+            self.broker
+                .subscribe_with_slot_in_group(client_id, topic, qos, conn_id, slot, encoder, group)
+        } else {
+            self.broker
+                .subscribe_with_slot(client_id, topic, qos, conn_id, slot, encoder)
+        };
 
         let ack_payload = AckPayload {
             subscription_id: sub_id.value(),
@@ -578,17 +591,17 @@ impl MessageHandler for BrokerHandler {
             .ttl_ms
             .map(|ms| std::time::Duration::from_millis(ms as u64));
         match (resolved, ttl_override) {
-            (Some(r), Some(ttl)) => self.broker.publish_resolved_with_ttl(
-                &topic,
-                &r,
-                payload.message,
-                qos,
-                Some(ttl),
-            ),
-            (Some(r), None) => self.broker.publish_resolved(&topic, &r, payload.message, qos),
-            (None, Some(ttl)) => self
+            (Some(r), Some(ttl)) => {
+                self.broker
+                    .publish_resolved_with_ttl(&topic, &r, payload.message, qos, Some(ttl))
+            }
+            (Some(r), None) => self
                 .broker
-                .publish_with_ttl(&topic, payload.message, qos, Some(ttl)),
+                .publish_resolved(&topic, &r, payload.message, qos),
+            (None, Some(ttl)) => {
+                self.broker
+                    .publish_with_ttl(&topic, payload.message, qos, Some(ttl))
+            }
             (None, None) => self.broker.publish(&topic, payload.message, qos),
         }
         Ok(None)

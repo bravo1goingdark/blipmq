@@ -186,6 +186,7 @@ async fn tls_full_publish_subscribe_roundtrip() {
             payload: SubscribePayload {
                 topic: "tls-roundtrip".to_string(),
                 qos: 0,
+                group: None,
             }
             .encode()
             .unwrap(),

@@ -379,24 +379,63 @@ impl DeliverPayload {
     }
 }
 
-/// SUBSCRIBE payload: [u16 topic_len][topic_bytes][u8 qos]
+/// SUBSCRIBE payload: `[u16 topic_len][topic_bytes][u8 qos]` plus
+/// optional `[u16 group_len][group_bytes]` when bit 7 of `qos` is set
+/// (`SUBSCRIBE_FLAG_HAS_GROUP`).
+///
+/// Wire-compatible with the original v2 SUBSCRIBE: clients that don't
+/// need a consumer group leave bit 7 clear and the payload looks
+/// identical to before. Clients opting into a queue-group / consumer-
+/// group set the bit and append the group name.
+///
+/// `qos` low 2 bits = QoS level (0 = at-most-once, 1 = at-least-once).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribePayload {
     pub topic: String,
     pub qos: u8,
+    /// `Some(group)` joins the named consumer group on this topic so
+    /// publishes are load-balanced across the group's members. `None`
+    /// is the original broadcast subscribe.
+    pub group: Option<String>,
 }
 
+const SUBSCRIBE_FLAG_HAS_GROUP: u8 = 0x80;
+const SUBSCRIBE_QOS_MASK: u8 = 0x03;
+
 impl SubscribePayload {
+    /// Wire-format QoS byte: low 2 bits = QoS, bit 7 = has_group.
+    #[inline]
+    pub fn qos_level(&self) -> u8 {
+        self.qos & SUBSCRIBE_QOS_MASK
+    }
+
     pub fn encode(&self) -> Result<Bytes, FrameEncodeError> {
         let topic_bytes = self.topic.as_bytes();
         let topic_len = topic_bytes.len();
         let topic_len_u16 =
             u16::try_from(topic_len).map_err(|_| FrameEncodeError::PayloadTooLarge(topic_len))?;
 
-        let mut buf = BytesMut::with_capacity(2 + topic_len + 1);
+        let group_len = self.group.as_ref().map(|g| g.len()).unwrap_or(0);
+        let group_len_u16 = if let Some(g) = &self.group {
+            Some(u16::try_from(g.len()).map_err(|_| FrameEncodeError::PayloadTooLarge(g.len()))?)
+        } else {
+            None
+        };
+
+        let mut buf = BytesMut::with_capacity(2 + topic_len + 1 + 2 + group_len);
         buf.put_u16(topic_len_u16);
         buf.put_slice(topic_bytes);
-        buf.put_u8(self.qos);
+        let qos_byte = (self.qos & SUBSCRIBE_QOS_MASK)
+            | if self.group.is_some() {
+                SUBSCRIBE_FLAG_HAS_GROUP
+            } else {
+                0
+            };
+        buf.put_u8(qos_byte);
+        if let (Some(group), Some(glen)) = (&self.group, group_len_u16) {
+            buf.put_u16(glen);
+            buf.put_slice(group.as_bytes());
+        }
         Ok(buf.freeze())
     }
 
@@ -416,9 +455,27 @@ impl SubscribePayload {
         let topic = String::from_utf8(topic_bytes.to_vec())
             .map_err(|_| FrameDecodeError::InvalidLength(payload.len() as u32))?;
 
-        let qos = slice.get_u8();
+        let qos_raw = slice.get_u8();
+        let has_group = (qos_raw & SUBSCRIBE_FLAG_HAS_GROUP) != 0;
+        let qos = qos_raw & SUBSCRIBE_QOS_MASK;
 
-        Ok(Self { topic, qos })
+        let group = if has_group {
+            if slice.remaining() < 2 {
+                return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+            }
+            let group_len = slice.get_u16() as usize;
+            if slice.remaining() < group_len {
+                return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+            }
+            let group_bytes = slice.copy_to_bytes(group_len);
+            let g = String::from_utf8(group_bytes.to_vec())
+                .map_err(|_| FrameDecodeError::InvalidLength(payload.len() as u32))?;
+            Some(g)
+        } else {
+            None
+        };
+
+        Ok(Self { topic, qos, group })
     }
 }
 
@@ -695,6 +752,44 @@ mod tests {
     #[test]
     fn protocol_version_is_v2() {
         assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn subscribe_payload_without_group_roundtrip() {
+        let original = SubscribePayload {
+            topic: "orders.us.created".to_string(),
+            qos: 1,
+            group: None,
+        };
+        let encoded = original.encode().expect("encode");
+        // Bit 7 of the qos byte must be clear in the no-group case so
+        // existing v2 clients keep parsing the payload identically.
+        let qos_byte_pos = 2 + original.topic.len();
+        assert_eq!(
+            encoded[qos_byte_pos] & 0x80,
+            0,
+            "has_group flag must be clear"
+        );
+        let decoded = SubscribePayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn subscribe_payload_with_group_roundtrip() {
+        let original = SubscribePayload {
+            topic: "orders.us.created".to_string(),
+            qos: 1,
+            group: Some("workers".to_string()),
+        };
+        let encoded = original.encode().expect("encode");
+        let qos_byte_pos = 2 + original.topic.len();
+        assert_eq!(
+            encoded[qos_byte_pos] & 0x80,
+            0x80,
+            "has_group flag must be set"
+        );
+        let decoded = SubscribePayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
     }
 
     #[test]

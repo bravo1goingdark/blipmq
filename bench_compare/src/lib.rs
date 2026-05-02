@@ -283,6 +283,7 @@ impl BmqClient {
         let payload = SubscribePayload {
             topic: topic.to_string(),
             qos,
+            group: None,
         }
         .encode()?;
         let frame = Frame {
