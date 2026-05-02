@@ -66,6 +66,128 @@ pub type DeliveryEncoder = Arc<
 /// heap.
 type SubscriberSnapshot<'a> = SmallVec<[(SubscriptionId, Arc<Subscriber>); 16]>;
 
+/// A NATS-style subject pattern. Tokens are `.`-separated. `*` matches a
+/// single token; `>` matches one or more remaining tokens (must be the
+/// last token, if present).
+///
+/// Examples:
+/// - `orders.us.created` — exact match.
+/// - `orders.us.*` — matches `orders.us.created`, `orders.us.shipped`.
+/// - `orders.>` — matches any subject starting with `orders.`.
+/// - `*.us.created` — matches `orders.us.created`, `users.us.created`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectPattern {
+    /// Source string for the pattern, kept for diagnostics + display.
+    raw: Arc<str>,
+    /// Pre-parsed segments, one per `.`-separated token.
+    segments: Vec<PatternSegment>,
+    /// True if the pattern ends in `>`. When true, `segments` is the
+    /// fixed prefix; the tail wildcard is not stored as a segment.
+    has_tail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatternSegment {
+    Literal(Arc<str>),
+    Wildcard,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PatternParseError {
+    #[error("empty pattern")]
+    Empty,
+    #[error("empty token in pattern: {0:?}")]
+    EmptyToken(String),
+    #[error("`>` (tail wildcard) must be the last token: {0:?}")]
+    TailNotLast(String),
+}
+
+impl SubjectPattern {
+    /// Parse a NATS-style pattern. Returns `Err` if the pattern has empty
+    /// tokens (e.g. `a..b` or starts/ends with `.`) or if `>` appears in
+    /// any position other than the last.
+    pub fn parse(s: &str) -> Result<Self, PatternParseError> {
+        if s.is_empty() {
+            return Err(PatternParseError::Empty);
+        }
+        let mut segments = Vec::new();
+        let mut has_tail = false;
+        let raw_tokens: Vec<&str> = s.split('.').collect();
+        let last = raw_tokens.len() - 1;
+        for (i, tok) in raw_tokens.iter().enumerate() {
+            if tok.is_empty() {
+                return Err(PatternParseError::EmptyToken(s.to_string()));
+            }
+            if *tok == ">" {
+                if i != last {
+                    return Err(PatternParseError::TailNotLast(s.to_string()));
+                }
+                has_tail = true;
+                // Don't push the tail; it's encoded by `has_tail`.
+            } else if *tok == "*" {
+                segments.push(PatternSegment::Wildcard);
+            } else {
+                segments.push(PatternSegment::Literal(Arc::from(*tok)));
+            }
+        }
+        Ok(Self {
+            raw: Arc::from(s),
+            segments,
+            has_tail,
+        })
+    }
+
+    /// True if this pattern contains no wildcards and matches exactly one
+    /// subject. Used to short-circuit the wildcard list for exact-only
+    /// subscriptions.
+    pub fn is_exact(&self) -> bool {
+        !self.has_tail
+            && self
+                .segments
+                .iter()
+                .all(|s| matches!(s, PatternSegment::Literal(_)))
+    }
+
+    /// The raw pattern string (for diagnostics and Prometheus labels).
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Match a concrete subject against this pattern. The subject must
+    /// have no wildcards itself.
+    pub fn matches(&self, subject: &str) -> bool {
+        let tokens: smallvec::SmallVec<[&str; 8]> = subject.split('.').collect();
+        let fixed = self.segments.len();
+        if self.has_tail {
+            // Fixed prefix must match; tail must be non-empty.
+            if tokens.len() <= fixed {
+                return false;
+            }
+        } else if tokens.len() != fixed {
+            return false;
+        }
+        for (i, seg) in self.segments.iter().enumerate() {
+            match seg {
+                PatternSegment::Literal(lit) => {
+                    if lit.as_ref() != tokens[i] {
+                        return false;
+                    }
+                }
+                PatternSegment::Wildcard => {
+                    // `*` matches any single non-empty token. Tokens are
+                    // produced by `split('.')` which never yields an empty
+                    // token unless the subject itself has empty segments,
+                    // which is invalid input the broker rejects elsewhere.
+                    if tokens[i].is_empty() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 /// A single delivery flowing from the broker to a subscriber's connection
 /// writer task. The push path (`subscribe_with_conn`) is what enables v2
 /// server-initiated DELIVER frames; for v1 poll-only subscribers, this
@@ -244,6 +366,12 @@ pub struct Broker {
     /// recording total publish-to-encode time in nanoseconds. Sampled by
     /// the metrics endpoint.
     publish_fanout_ns: Mutex<Histogram<u64>>,
+    /// Subscriptions whose pattern contains at least one wildcard. Lookup
+    /// on publish is a linear scan — fine for hundreds of patterns; a
+    /// later phase could replace this with a subject trie. Exact-match
+    /// subscriptions stay on the `TopicShards` fast path and don't appear
+    /// here.
+    wildcard_subs: RwLock<Vec<(SubjectPattern, SubscriptionId)>>,
 }
 
 /// A latency snapshot captured for the metrics endpoint. Times are in
@@ -1046,6 +1174,7 @@ impl Broker {
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
+            wildcard_subs: RwLock::new(Vec::new()),
         }
     }
 
@@ -1071,6 +1200,7 @@ impl Broker {
                 Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                     .expect("histogram bounds valid"),
             ),
+            wildcard_subs: RwLock::new(Vec::new()),
         }
     }
 
@@ -1157,6 +1287,76 @@ impl Broker {
         )
     }
 
+    /// Subscribe with a NATS-style subject pattern (may contain `*` and
+    /// `>` wildcards). Exact patterns route through the fast `TopicShards`
+    /// path; wildcard patterns are added to a parallel list scanned on
+    /// every publish.
+    pub fn subscribe_pattern(
+        &self,
+        client_id: ClientId,
+        pattern: SubjectPattern,
+        qos: QoSLevel,
+    ) -> SubscriptionId {
+        if pattern.is_exact() {
+            // Reconstruct the exact subject from segments.
+            let exact = self.exact_subject_from_pattern(&pattern);
+            return self.subscribe(client_id, exact, qos);
+        }
+        let sub_id = self.subscribe_inner(
+            client_id,
+            // Wildcard patterns aren't anchored to any one topic. We
+            // store a synthetic TopicName so the unsubscribe path's
+            // topic-removal logic stays uniform; the fanout path consults
+            // wildcard_subs directly, not the per-topic list.
+            TopicName::from_str(pattern.as_str()),
+            qos,
+            None,
+            None,
+            None,
+        );
+        self.wildcard_subs.write().push((pattern, sub_id));
+        sub_id
+    }
+
+    /// Subscribe with a wildcard pattern in shared-buffer push mode.
+    /// Mirror of `subscribe_pattern` for v2 push subscribers.
+    pub fn subscribe_pattern_with_slot(
+        &self,
+        client_id: ClientId,
+        pattern: SubjectPattern,
+        qos: QoSLevel,
+        conn_id: u64,
+        slot: Arc<PushSlot>,
+        encoder: DeliveryEncoder,
+    ) -> SubscriptionId {
+        if pattern.is_exact() {
+            let exact = self.exact_subject_from_pattern(&pattern);
+            return self.subscribe_with_slot(client_id, exact, qos, conn_id, slot, encoder);
+        }
+        let sub_id = self.subscribe_inner(
+            client_id,
+            TopicName::from_str(pattern.as_str()),
+            qos,
+            Some(conn_id),
+            None,
+            Some((slot, encoder)),
+        );
+        self.wildcard_subs.write().push((pattern, sub_id));
+        sub_id
+    }
+
+    fn exact_subject_from_pattern(&self, pattern: &SubjectPattern) -> TopicName {
+        // is_exact ⇒ all segments are Literal and there's no tail. Join
+        // them back into a `.`-separated string.
+        let mut parts: Vec<&str> = Vec::with_capacity(pattern.segments.len());
+        for seg in &pattern.segments {
+            if let PatternSegment::Literal(s) = seg {
+                parts.push(s.as_ref());
+            }
+        }
+        TopicName::from_str(&parts.join("."))
+    }
+
     fn subscribe_inner(
         &self,
         client_id: ClientId,
@@ -1229,6 +1429,14 @@ impl Broker {
                 topic_subs.remove(sid);
             }
         }
+        // Drop any wildcard entries belonging to these subs.
+        if !removed.is_empty() {
+            let removed_ids: std::collections::HashSet<SubscriptionId> =
+                removed.iter().map(|(sid, _)| *sid).collect();
+            self.wildcard_subs
+                .write()
+                .retain(|(_, sid)| !removed_ids.contains(sid));
+        }
         // `removed` going out of scope drops the only remaining strong
         // references to those Subscribers (and thus their push_senders),
         // which closes the connection's push channel.
@@ -1278,6 +1486,11 @@ impl Broker {
             subs.retain(|s| *s != sub_id);
         }
         conn_map.retain(|_, subs| !subs.is_empty());
+        // Drop the wildcard entry too (no-op if this was an exact-match
+        // subscription).
+        self.wildcard_subs
+            .write()
+            .retain(|(_, sid)| *sid != sub_id);
         true
     }
 
@@ -1350,22 +1563,49 @@ impl Broker {
             }
         }
 
-        let topic = match self.topics.get(topic_name) {
-            Some(t) => t,
-            None => return,
-        };
-        topic.published_total.fetch_add(1, Ordering::Relaxed);
+        // We always count the publish (even if no subscribers match),
+        // since publishers shouldn't have to know which topics have
+        // active subscriptions.
         self.messages_published_total
             .fetch_add(1, Ordering::Relaxed);
 
-        // Snapshot the subscriber list under a brief read lock. With many
-        // subscribers, holding the lock across the whole fanout would
-        // serialize against subscribe/unsubscribe; copying Arc pointers is
-        // a cheap refcount bump.
-        let snapshot: SubscriberSnapshot<'_> = {
+        // Two-source fanout snapshot:
+        //  (a) per-topic exact-match subscribers from `TopicShards`.
+        //  (b) wildcard-pattern subscribers whose pattern matches the
+        //      publish subject. We always run (b) even if no Topic
+        //      exists for this subject, because a wildcard sub may be
+        //      the only consumer.
+        let topic_opt = self.topics.get(topic_name);
+        let mut snapshot: SubscriberSnapshot<'_> = SmallVec::new();
+        if let Some(topic) = &topic_opt {
+            topic.published_total.fetch_add(1, Ordering::Relaxed);
             let subscribers = topic.subscribers.read();
-            subscribers.iter().map(|(id, sub)| (*id, sub.clone())).collect()
-        };
+            for (id, sub) in subscribers.iter() {
+                snapshot.push((*id, sub.clone()));
+            }
+        }
+        // Wildcard fanout: walk the pattern list, match each pattern
+        // against the publish subject, and pull the matching subscriber
+        // Arcs out of the sharded subscriptions map. Cost is O(W) where
+        // W is the number of wildcard subscriptions; for hundreds of
+        // patterns this is well under a microsecond.
+        {
+            let wcs = self.wildcard_subs.read();
+            for (pattern, sid) in wcs.iter() {
+                if pattern.matches(topic_name.as_str()) {
+                    let shard = self.subscriptions.shard_for(*sid).read();
+                    if let Some(sub_ref) = shard.get(sid) {
+                        snapshot.push((*sid, sub_ref.subscriber.clone()));
+                    }
+                }
+            }
+        }
+        // The rest of the function operates on `snapshot`. The
+        // per-topic delivered_total counter will be updated only if a
+        // Topic exists; wildcard deliveries don't bump per-topic stats
+        // for a topic that has no exact-match subscribers (no Topic
+        // record exists to count against).
+        let topic_for_metrics = topic_opt.as_ref();
 
         let mut subs_to_drop: SmallVec<[SubscriptionId; 4]> = SmallVec::new();
         for (sub_id, subscriber) in snapshot.iter() {
@@ -1406,7 +1646,9 @@ impl Broker {
                     }
                 } else {
                     slot.notify.notify_one();
-                    topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                    if let Some(t) = topic_for_metrics {
+                        t.delivered_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.messages_delivered_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -1443,7 +1685,9 @@ impl Broker {
                         subs_to_drop.push(*sub_id);
                     }
                 } else {
-                    topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                    if let Some(t) = topic_for_metrics {
+                        t.delivered_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.messages_delivered_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -1452,7 +1696,9 @@ impl Broker {
                 subscriber
                     .queue
                     .enqueue(payload.clone(), qos, wal_id, Some(self.config.message_ttl));
-                topic.delivered_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(t) = topic_for_metrics {
+                    t.delivered_total.fetch_add(1, Ordering::Relaxed);
+                }
                 self.messages_delivered_total
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -2233,6 +2479,95 @@ mod tests {
         );
 
         let _ = acked_tags; // silence unused
+    }
+
+    #[test]
+    fn subject_pattern_parses_and_matches() {
+        let exact = SubjectPattern::parse("orders.us.created").unwrap();
+        assert!(exact.is_exact());
+        assert!(exact.matches("orders.us.created"));
+        assert!(!exact.matches("orders.us.shipped"));
+
+        let single = SubjectPattern::parse("orders.us.*").unwrap();
+        assert!(!single.is_exact());
+        assert!(single.matches("orders.us.created"));
+        assert!(single.matches("orders.us.shipped"));
+        assert!(!single.matches("orders.us.created.priority")); // too many tokens
+        assert!(!single.matches("orders.eu.created")); // literal mismatch
+
+        let leading = SubjectPattern::parse("*.us.created").unwrap();
+        assert!(leading.matches("orders.us.created"));
+        assert!(leading.matches("users.us.created"));
+        assert!(!leading.matches("us.created")); // too few tokens
+
+        let tail = SubjectPattern::parse("orders.>").unwrap();
+        assert!(tail.matches("orders.us.created"));
+        assert!(tail.matches("orders.eu.shipped.priority"));
+        assert!(!tail.matches("orders")); // tail requires >= 1 trailing token
+        assert!(!tail.matches("users.us.created"));
+    }
+
+    #[test]
+    fn subject_pattern_rejects_malformed() {
+        assert!(SubjectPattern::parse("").is_err());
+        assert!(SubjectPattern::parse("a..b").is_err());
+        assert!(SubjectPattern::parse(".a").is_err());
+        assert!(SubjectPattern::parse("a.").is_err());
+        // `>` must be the last token.
+        assert!(SubjectPattern::parse(">.a").is_err());
+        assert!(SubjectPattern::parse("a.>.b").is_err());
+    }
+
+    #[tokio::test]
+    async fn wildcard_subscription_receives_matching_publish() {
+        let broker = test_broker();
+        let pattern = SubjectPattern::parse("orders.*.created").unwrap();
+        let (tx, rx) = flume::bounded::<DeliveryHandle>(64);
+
+        let _sub = broker.subscribe_pattern(
+            ClientId::new("c"),
+            pattern,
+            QoSLevel::AtMostOnce,
+        );
+        // The above goes through the legacy poll path because we used the
+        // non-slot variant; switch to slot-based pattern subscribe so we
+        // can exercise the actual fanout receive.
+        let _ = tx; let _ = rx;
+
+        // Use the channel-based subscribe with a wildcard pattern via
+        // the trait directly: use subscribe_pattern + push_sender wiring.
+        // For a focused test, we'll subscribe via the channel API.
+        let (tx2, rx2) = flume::bounded::<DeliveryHandle>(64);
+        let _wc_sid = broker.subscribe_inner(
+            ClientId::new("c2"),
+            TopicName::from_str("orders.*.created"),
+            QoSLevel::AtMostOnce,
+            None,
+            Some(tx2),
+            None,
+        );
+        // Manually register the wildcard.
+        let p = SubjectPattern::parse("orders.*.created").unwrap();
+        broker.wildcard_subs.write().push((p, _wc_sid));
+
+        // Publish to a matching subject.
+        broker.publish(
+            &TopicName::from_str("orders.us.created"),
+            Bytes::from_static(b"x"),
+            QoSLevel::AtMostOnce,
+        );
+        let handle = rx2.recv_async().await.expect("delivery");
+        assert_eq!(handle.payload, Bytes::from_static(b"x"));
+
+        // Publish to a NON-matching subject — no delivery on the wildcard.
+        broker.publish(
+            &TopicName::from_str("orders.us.shipped"),
+            Bytes::from_static(b"y"),
+            QoSLevel::AtMostOnce,
+        );
+        let res =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx2.recv_async()).await;
+        assert!(res.is_err(), "non-matching publish must not reach wildcard sub");
     }
 
     #[test]
