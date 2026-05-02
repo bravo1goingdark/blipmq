@@ -516,6 +516,19 @@ struct Topic {
     delivered_total: ShardedCounter,
 }
 
+/// Cacheable handle to a resolved `Topic`. Construct via
+/// [`Broker::resolve_topic`] and pass to
+/// [`Broker::publish_resolved`] / [`Broker::publish_resolved_with_ttl`]
+/// to skip the per-publish `TopicShards` registry lookup.
+///
+/// The inner `Arc<Topic>` is private; callers should treat this type
+/// as opaque. `Topic` records are never removed, so a `ResolvedTopic`
+/// stays valid for the broker's lifetime.
+#[derive(Debug, Clone)]
+pub struct ResolvedTopic {
+    inner: Arc<Topic>,
+}
+
 /// Per-topic metrics snapshot, returned by `Broker::topic_metrics`.
 #[derive(Debug, Clone)]
 pub struct TopicMetrics {
@@ -1696,6 +1709,66 @@ impl Broker {
         self.publish_with_wal_id(topic, payload, qos, None, None);
     }
 
+    /// Resolve a topic to a cacheable handle. Returns `None` if no
+    /// `Topic` record exists yet (no exact-match subscribers have ever
+    /// subscribed). Wildcard subscribers do not create a `Topic`
+    /// record, so a publish to a topic with only wildcard subs will
+    /// keep returning `None` here — that's fine; the
+    /// [`Self::publish_resolved`] hot path falls back to the wildcard
+    /// scan automatically.
+    ///
+    /// Callers should hold this handle across many publishes to skip
+    /// the per-publish `TopicShards.get()` (RwLock read + HashMap
+    /// lookup + `Arc::clone`). Topic records are never removed, so
+    /// the cached handle is valid for the broker's lifetime.
+    #[inline(always)]
+    pub fn resolve_topic(&self, name: &TopicName) -> Option<ResolvedTopic> {
+        self.topics.get(name).map(|inner| ResolvedTopic { inner })
+    }
+
+    /// Publish using a pre-resolved topic handle from
+    /// [`Self::resolve_topic`]. Skips the topic registry lookup for
+    /// the exact-match fanout. Wildcard fanout still runs.
+    #[inline(always)]
+    pub fn publish_resolved(
+        &self,
+        name: &TopicName,
+        resolved: &ResolvedTopic,
+        payload: Bytes,
+        qos: QoSLevel,
+    ) {
+        self.publish_inner(
+            name,
+            Some(resolved.inner.clone()),
+            payload,
+            qos,
+            None,
+            None,
+        );
+    }
+
+    /// Publish with a pre-resolved topic handle and a per-message TTL
+    /// override. Combines [`Self::publish_resolved`] with the
+    /// [`Self::publish_with_ttl`] semantics.
+    #[inline(always)]
+    pub fn publish_resolved_with_ttl(
+        &self,
+        name: &TopicName,
+        resolved: &ResolvedTopic,
+        payload: Bytes,
+        qos: QoSLevel,
+        ttl: Option<Duration>,
+    ) {
+        self.publish_inner(
+            name,
+            Some(resolved.inner.clone()),
+            payload,
+            qos,
+            None,
+            ttl,
+        );
+    }
+
     /// Publish with a per-message TTL override that applies only to this
     /// message's enqueue. `None` falls back to `BrokerConfig::message_ttl`.
     #[inline]
@@ -1719,6 +1792,22 @@ impl Broker {
     fn publish_with_wal_id(
         &self,
         topic_name: &TopicName,
+        payload: Bytes,
+        qos: QoSLevel,
+        wal_id: Option<u64>,
+        ttl_override: Option<Duration>,
+    ) {
+        self.publish_inner(topic_name, None, payload, qos, wal_id, ttl_override);
+    }
+
+    /// Inner publish path. `pre_resolved` is the topic handle from a
+    /// prior [`Self::resolve_topic`] call when the caller has cached
+    /// it; `None` falls back to the per-publish `TopicShards.get()`.
+    #[inline(always)]
+    fn publish_inner(
+        &self,
+        topic_name: &TopicName,
+        pre_resolved: Option<Arc<Topic>>,
         payload: Bytes,
         qos: QoSLevel,
         wal_id: Option<u64>,
@@ -1775,7 +1864,11 @@ impl Broker {
         //      publish subject. We always run (b) even if no Topic
         //      exists for this subject, because a wildcard sub may be
         //      the only consumer.
-        let topic_opt = self.topics.get(topic_name);
+        // Skip the `TopicShards.get()` (RwLock read + HashMap +
+        // Arc::clone) when the caller already cached the resolved
+        // handle from a prior `resolve_topic`. Falls back to the
+        // registry lookup when no cache is available.
+        let topic_opt = pre_resolved.or_else(|| self.topics.get(topic_name));
         let mut snapshot: SubscriberSnapshot<'_> = SmallVec::new();
         if let Some(topic) = &topic_opt {
             topic.published_total.add(1);

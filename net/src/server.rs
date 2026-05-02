@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use auth::ApiKeyValidator;
 use bytes::Bytes;
 use corelib::{
-    Broker, ClientId, DeliveryEncoder, DeliveryTag, PushSender, PushSlot, QoSLevel, SubscriptionId,
-    TopicName, WalError,
+    Broker, ClientId, DeliveryEncoder, DeliveryTag, PushSender, PushSlot, QoSLevel, ResolvedTopic,
+    SubscriptionId, TopicName, WalError,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -122,11 +122,20 @@ pub trait MessageHandler: Send + Sync + 'static {
 /// Per-connection cache for the most recently resolved publish topic.
 /// Same publisher publishes to the same topic millions of times in a
 /// row; this single-slot cache turns each repeat lookup into a single
-/// `Bytes` equality check + `Arc<str>` clone (refcount bump).
+/// `Bytes` equality check + `Arc<str>` clone (refcount bump), and also
+/// caches the broker-side `ResolvedTopic` handle so the publish path
+/// skips `TopicShards.get()` entirely on repeat hits.
 #[derive(Default)]
 pub struct PublishTopicCache {
     last_bytes: Option<Bytes>,
     last_topic: Option<TopicName>,
+    /// Cached `ResolvedTopic` handle (an `Arc<Topic>` opaque clone).
+    /// `None` means: either we haven't resolved yet, or the broker had
+    /// no `Topic` record on the last attempt. We retry the resolve on
+    /// every publish in the `None` case so a subscriber that appears
+    /// after the first publish is picked up; `Some` is sticky for the
+    /// broker's lifetime since topics are never removed.
+    last_resolved: Option<ResolvedTopic>,
 }
 
 impl PublishTopicCache {
@@ -146,7 +155,52 @@ impl PublishTopicCache {
         let new_topic = TopicName::from_str(s);
         self.last_bytes = Some(topic_bytes.clone());
         self.last_topic = Some(new_topic.clone());
+        // Topic name changed — the previous resolved handle is no
+        // longer valid. The next publish will re-resolve.
+        self.last_resolved = None;
         new_topic
+    }
+
+    /// Fetch a `(TopicName, Option<ResolvedTopic>)` pair. The
+    /// `ResolvedTopic` is `None` when no broker-side `Topic` record
+    /// exists yet; in that case the caller should fall back to the
+    /// non-resolved publish path which handles wildcard-only routing.
+    /// On match, the resolved handle is returned without re-querying
+    /// the broker; on miss (or when the previous resolve was `None`),
+    /// `resolver` is called and its result cached when `Some`.
+    #[inline(always)]
+    pub fn get_with_resolve(
+        &mut self,
+        topic_bytes: &Bytes,
+        resolver: impl FnOnce(&TopicName) -> Option<ResolvedTopic>,
+    ) -> (TopicName, Option<ResolvedTopic>) {
+        // Bytes-equality fast path: if the topic name hasn't changed
+        // and we already have a resolved handle, just clone both. The
+        // resolved clone is one Arc refcount bump.
+        if let (Some(prev_bytes), Some(prev_topic)) = (&self.last_bytes, &self.last_topic) {
+            if prev_bytes == topic_bytes {
+                if let Some(resolved) = &self.last_resolved {
+                    return (prev_topic.clone(), Some(resolved.clone()));
+                }
+                // Same topic name but we never managed to resolve it —
+                // try again in case a subscriber appeared.
+                let resolved = resolver(prev_topic);
+                if resolved.is_some() {
+                    self.last_resolved = resolved.clone();
+                }
+                return (prev_topic.clone(), resolved);
+            }
+        }
+        // Topic name changed (or first call): allocate a fresh
+        // `TopicName` and resolve once.
+        // SAFETY: `PublishPayload::decode` validated UTF-8 already.
+        let s = unsafe { std::str::from_utf8_unchecked(topic_bytes) };
+        let new_topic = TopicName::from_str(s);
+        let resolved = resolver(&new_topic);
+        self.last_bytes = Some(topic_bytes.clone());
+        self.last_topic = Some(new_topic.clone());
+        self.last_resolved = resolved.clone();
+        (new_topic, resolved)
     }
 }
 
@@ -513,15 +567,29 @@ impl MessageHandler for BrokerHandler {
             )));
         }
 
-        let topic = topic_cache.get(&payload.topic);
+        // Resolve via the per-conn cache: on repeat publishes to the
+        // same topic this returns the cached `ResolvedTopic` without
+        // touching `TopicShards` (skips a parking_lot read lock + a
+        // HashMap lookup + an Arc::clone). On miss, the resolver
+        // closure does the lookup and the result is cached.
+        let (topic, resolved) =
+            topic_cache.get_with_resolve(&payload.topic, |name| self.broker.resolve_topic(name));
         let ttl_override = payload
             .ttl_ms
             .map(|ms| std::time::Duration::from_millis(ms as u64));
-        if ttl_override.is_some() {
-            self.broker
-                .publish_with_ttl(&topic, payload.message, qos, ttl_override);
-        } else {
-            self.broker.publish(&topic, payload.message, qos);
+        match (resolved, ttl_override) {
+            (Some(r), Some(ttl)) => self.broker.publish_resolved_with_ttl(
+                &topic,
+                &r,
+                payload.message,
+                qos,
+                Some(ttl),
+            ),
+            (Some(r), None) => self.broker.publish_resolved(&topic, &r, payload.message, qos),
+            (None, Some(ttl)) => self
+                .broker
+                .publish_with_ttl(&topic, payload.message, qos, Some(ttl)),
+            (None, None) => self.broker.publish(&topic, payload.message, qos),
         }
         Ok(None)
     }
