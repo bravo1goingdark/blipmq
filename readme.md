@@ -27,7 +27,8 @@
 ## Why BlipMQ
 
 - **Push-based delivery, not poll.** v2 protocol delivers messages to subscribers as `DELIVER` frames the moment a publish lands; subscribers don't long-poll. Single TCP pipe sustains ~1.9 M msg/s on loopback; **8 parallel pipes aggregate to 7.28 M msg/s** on a dev box.
-- **Real durability for QoS1.** `publish_durable` returns *only after* the record is on disk (group-commit fsync), and an in-band ack journal lets a restarted broker re-deliver only the unacked tail — not the whole log.
+- **Real durability for QoS1.** `publish_durable` returns *only after* the record is on disk (group-commit fsync). An in-band ack journal + checkpoint snapshots let a restarted broker re-deliver only the unacked tail; a background compactor reclaims fully-acked WAL segments.
+- **NATS-style subject wildcards.** Subscribers can use `*` (one token) and `>` (rest) in their pattern; exact-match subscriptions stay on the O(1) lookup path.
 - **One static binary.** `blipmqd` ships as a single Rust binary; no JVM, no ZooKeeper, no external dependencies.
 - **Production tooling.** Sharded subscriptions, segmented WAL with CRC32 over headers + payload, snapshot-based fanout, AHash routing, Prometheus-friendly metrics endpoint.
 
@@ -213,7 +214,7 @@ This preserves at-least-once semantics across restarts without abrupt loss of in
 ### Tests
 
 ```bash
-cargo test --workspace          # full suite (28 tests, ~1s)
+cargo test --workspace          # full suite (37 tests, ~1s)
 cargo test -p core              # broker logic
 cargo test -p net               # frame + connection + push delivery
 cargo test -p wal               # segmented WAL, CRC, durability, rollover
@@ -259,10 +260,10 @@ The high-level phases are tracked in `bench_compare/results/`:
 - **Phase 1 — net hot path** ✅ — push delivery, batched writer, TCP_NODELAY, zero-copy decode
 - **Phase 2 — core fanout** ✅ — sharded subscriptions, snapshot fanout, AHash, shared push slot
 - **Phase 3 — WAL durability** ✅ — group-commit fsync, segmented log, CRC over header
-- **Phase 4 — recovery** (in progress) — ack journal ✅, fast replay ✅, checkpoint snapshots, segment compaction
-- **Phase 5 — observability** — Prometheus histograms, per-topic metrics, `/healthz` / `/readyz`
-- **Phase 6 — production hardening** — slow-consumer policy, NACK-on-WAL-full, TLS, auth rate limiting
-- **Phase 7 — feature unification** — NATS-style subject wildcards, Kafka-style consumer groups + offset replay, RabbitMQ-style DLQ + per-message TTL — under one primitive
+- **Phase 4 — recovery** ✅ — ack journal, fast replay, checkpoint snapshots, background segment compaction
+- **Phase 5 — observability** ✅ (histograms + topic counters), in progress (more histogram surfaces)
+- **Phase 6 — production hardening** (in progress) — NACK 503 on backpressure ✅, slow-consumer policy ✅, topic validation ✅, TLS pending, auth rate limiting pending
+- **Phase 7 — feature unification** (in progress) — NATS-style subject wildcards `*` / `>` ✅, Kafka-style consumer groups + offset replay pending, RabbitMQ-style DLQ + per-message TTL pending
 
 ## License
 
