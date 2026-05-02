@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use net::{
-    encode_frame, try_decode_frame, AckPayload, AuthPayload, Frame, FrameType, HelloPayload,
-    PollPayload, PublishPayload, SubscribePayload, PROTOCOL_VERSION,
+    encode_frame, try_decode_frame, AckPayload, AuthPayload, DeliverPayload, Frame, FrameType,
+    HelloPayload, PublishPayload, SubscribePayload, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use sysinfo::Pid;
@@ -326,45 +326,45 @@ impl BmqClient {
         self.send_frame(&frame).await
     }
 
-    pub async fn poll(
+    /// Wait for the next server-initiated `DELIVER` frame, decode it,
+    /// and return the parsed payload. Returns `None` on timeout or
+    /// stream EOF. The broker side of v2 always pushes via
+    /// `DELIVER`; the legacy `POLL` path no longer applies because
+    /// `handle_subscribe_slot` registers the subscription in
+    /// shared-buffer push mode (no per-sub queue to poll).
+    pub async fn next_delivery(
         &mut self,
-        sub_id: u64,
         timeout_dur: Duration,
-    ) -> Option<(Frame, PublishPayload)> {
-        let payload = PollPayload {
-            subscription_id: sub_id,
+    ) -> Option<(Frame, DeliverPayload)> {
+        loop {
+            let resp = timeout(timeout_dur, self.recv_frame()).await.ok().flatten()?;
+            match resp.msg_type {
+                FrameType::Deliver => {
+                    let payload = DeliverPayload::decode(&resp.payload).ok()?;
+                    return Some((resp, payload));
+                }
+                // Drain any inband Acks/Nacks (e.g. for SUBSCRIBE / PUBLISH
+                // responses that arrive after the subscribe completed)
+                // and keep waiting for the next DELIVER. The broker sends
+                // ACK frames for SUBSCRIBE / AUTH / HELLO and NACK frames
+                // on errors; any of these may interleave with DELIVERs on
+                // a busy connection.
+                FrameType::Ack | FrameType::Nack | FrameType::Pong => continue,
+                _ => continue,
+            }
         }
-        .encode()
-        .ok()?;
-        let frame = Frame {
-            msg_type: FrameType::Poll,
-            correlation_id: self.next_correlation_id(),
-            payload,
-        };
-        if self.send_frame(&frame).await.is_err() {
-            return None;
-        }
-
-        let resp = timeout(timeout_dur, self.recv_frame())
-            .await
-            .ok()
-            .flatten()?;
-        if resp.msg_type != FrameType::Publish {
-            return None;
-        }
-
-        let payload = PublishPayload::decode(&resp.payload).ok()?;
-        Some((resp, payload))
     }
 
-    pub async fn ack(&mut self, sub_id: u64, delivery_cid: u64) -> Result<(), BenchError> {
+    pub async fn ack(&mut self, sub_id: u64, delivery_tag: u64) -> Result<(), BenchError> {
         let payload = AckPayload {
             subscription_id: sub_id,
         }
         .encode()?;
+        // The broker matches ACKs to inflight deliveries by the frame's
+        // correlation_id, which the wire format sets to delivery_tag.
         let frame = Frame {
             msg_type: FrameType::Ack,
-            correlation_id: delivery_cid,
+            correlation_id: delivery_tag,
             payload,
         };
         self.send_frame(&frame).await
@@ -430,8 +430,11 @@ async fn run_bmq(case: BenchmarkCase, qos: u8) -> Result<BenchResult, BenchError
                         break;
                     }
 
+                    // v2 push: block on the next DELIVER frame. Short
+                    // timeout so the harness can re-check the `stop`
+                    // flag and bail out cleanly between scenarios.
                     if let Some((frame, payload)) =
-                        client.poll(sub_id, Duration::from_millis(50)).await
+                        client.next_delivery(Duration::from_millis(500)).await
                     {
                         if let Some(sent_ns) = extract_timestamp_ns(&payload.message) {
                             let latency = now_ns().saturating_sub(sent_ns);
@@ -441,8 +444,6 @@ async fn run_bmq(case: BenchmarkCase, qos: u8) -> Result<BenchResult, BenchError
                         if qos == 1 {
                             let _ = client.ack(sub_id, frame.correlation_id).await;
                         }
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
 

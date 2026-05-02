@@ -50,7 +50,6 @@ async fn main() -> Result<(), BenchError> {
     let total_target = args.count * args.parallelism as u64;
     let received = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
-    let start = Instant::now();
 
     for _ in 0..args.parallelism {
         let api_key = args.api_key.clone();
@@ -62,40 +61,62 @@ async fn main() -> Result<(), BenchError> {
             let mut client = BmqClient::connect(addr, &api_key).await?;
             let sub_id = client.subscribe(&subject, qos).await?;
             let mut stats = LatencyStats::default();
+            // Start the receive timer at the first message, not at
+            // task start. This excludes connection setup, subscribe
+            // handshake, and any wait for the publisher to begin —
+            // matching `nats bench`'s methodology and giving an
+            // apples-to-apples receive-throughput number.
+            let mut first_msg_at: Option<Instant> = None;
 
             while received.load(Ordering::Relaxed) < total_target {
-                match client.poll(sub_id, Duration::from_millis(50)).await {
+                // v2 push: read DELIVER frames as they arrive. No
+                // per-poll round-trip; the broker fans messages
+                // straight into the connection's writer task buffer
+                // and the kernel buffers them on the socket.
+                match client.next_delivery(Duration::from_secs(5)).await {
                     Some((frame, payload)) => {
+                        if first_msg_at.is_none() {
+                            first_msg_at = Some(Instant::now());
+                        }
                         if let Some(sent_ns) = extract_timestamp_ns(&payload.message) {
                             let latency = bench_compare::now_ns().saturating_sub(sent_ns);
                             stats.record_ns(latency);
                         }
                         received.fetch_add(1, Ordering::Relaxed);
                         if qos == 1 {
+                            // ACK the delivery_tag (carried in
+                            // frame.correlation_id by the wire format).
                             let _ = client.ack(sub_id, frame.correlation_id).await;
                         }
                     }
                     None => {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        // Timeout / EOF — bail out so we don't loop
+                        // forever on a stalled stream.
+                        break;
                     }
                 }
             }
 
-            Ok::<LatencyStats, BenchError>(stats)
+            let elapsed = first_msg_at.map(|t| t.elapsed()).unwrap_or_default();
+            Ok::<(LatencyStats, Duration), BenchError>((stats, elapsed))
         });
 
         handles.push(handle);
     }
 
     let mut combined = LatencyStats::default();
+    let mut max_elapsed = Duration::default();
     for handle in handles {
-        let stats = handle
+        let (stats, elapsed) = handle
             .await
             .map_err(|e| format!("subscriber join error: {e}"))??;
         combined.merge(stats);
+        if elapsed > max_elapsed {
+            max_elapsed = elapsed;
+        }
     }
 
-    let elapsed = start.elapsed();
+    let elapsed = max_elapsed;
     let recvd = received.load(Ordering::SeqCst);
     let throughput = if elapsed.as_secs_f64() > 0.0 {
         recvd as f64 / elapsed.as_secs_f64()
