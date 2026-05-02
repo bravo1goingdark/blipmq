@@ -212,6 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let server = Server::new(
                 NetworkConfig {
                     bind_addr: SocketAddr::new(config.bind_addr.parse().unwrap(), config.port),
+                    tls: None,
                 },
                 handler.clone(),
                 auth_validator,

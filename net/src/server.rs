@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,19 +9,46 @@ use corelib::{
     Broker, ClientId, DeliveryEncoder, DeliveryTag, PushSender, PushSlot, QoSLevel, SubscriptionId,
     TopicName, WalError,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info};
 
-use crate::connection::Connection;
+use crate::connection::{BoxedReader, BoxedWriter, Connection};
 use crate::error::Error;
 use crate::frame::{
     AckPayload, Frame, FrameType, NackPayload, PollPayload, PublishPayload, SubscribePayload,
 };
 
+/// TLS configuration for the broker's TCP listener. When `Some` on
+/// [`NetworkConfig`], every accepted connection is wrapped in a
+/// `tokio_rustls::server::TlsStream`. PEM cert chain + PKCS#8 / RSA
+/// key are loaded once at server start.
+///
+/// The struct is always defined so call sites can compile under either
+/// feature flag; loading the actual cert/key requires the `tls` feature
+/// to be enabled (otherwise `Server::start` returns an error).
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert_chain: PathBuf,
+    pub private_key: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub bind_addr: SocketAddr,
+    /// When `Some`, all accepted connections are wrapped in a TLS handshake
+    /// before any frames flow. Requires the `tls` feature.
+    pub tls: Option<TlsConfig>,
+}
+
+impl NetworkConfig {
+    /// Convenience: plain (non-TLS) config bound to `addr`.
+    pub fn plain(bind_addr: SocketAddr) -> Self {
+        Self {
+            bind_addr,
+            tls: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -156,7 +184,18 @@ where
         let _guard = span.enter();
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
-        info!("net listening on {}", local_addr);
+
+        // Pre-build a TLS acceptor if configured. This validates the cert
+        // and key paths once at startup rather than per-connection. When
+        // the `tls` feature is off but the user supplied a `TlsConfig`,
+        // we refuse to start so misconfiguration is surfaced loudly.
+        let tls_acceptor = build_tls_acceptor(self.config.tls.as_ref())?;
+
+        if tls_acceptor.is_some() {
+            info!("net listening on {} (TLS)", local_addr);
+        } else {
+            info!("net listening on {}", local_addr);
+        }
 
         let mut next_conn_id: u64 = 1;
         let mut shutdown_rx = self.shutdown.clone();
@@ -172,6 +211,7 @@ where
                             let handler = self.handler.clone();
                             let conn_shutdown = shutdown_rx.clone();
                             let auth = self.auth_validator.clone();
+                            let tls = tls_acceptor.clone();
 
                             // Disable Nagle: writer task issues already-batched frames; we want
                             // each batched write on the wire immediately, not coalesced again.
@@ -181,8 +221,29 @@ where
 
                             debug!("accepted connection {} from {}", conn_id, addr);
 
-                            let connection = Connection::new(conn_id, stream, handler, auth, conn_shutdown);
+                            // Hand off the TLS handshake (if any) and the
+                            // connection's run-loop into a per-conn task
+                            // so a slow handshake doesn't block accept.
                             tokio::spawn(async move {
+                                let split = match accept_and_split(stream, tls.as_ref()).await {
+                                    Ok(pair) => pair,
+                                    Err(err) => {
+                                        debug!(
+                                            "conn {} accept/handshake failed: {}",
+                                            conn_id, err
+                                        );
+                                        return;
+                                    }
+                                };
+                                let (read_half, write_half) = split;
+                                let connection = Connection::new(
+                                    conn_id,
+                                    read_half,
+                                    write_half,
+                                    handler,
+                                    auth,
+                                    conn_shutdown,
+                                );
                                 connection.run().await;
                             });
                         }
@@ -634,3 +695,106 @@ impl BrokerHandler {
         Ok(FrameResponse::Frame(publish_frame))
     }
 }
+
+// ---- TLS helpers ----------------------------------------------------------
+
+/// Build a TLS acceptor from the configured cert+key. Returns `Ok(None)`
+/// when `cfg` is `None` (plain TCP); errors loudly when `cfg` is `Some`
+/// but the `tls` feature is off, so misconfiguration doesn't silently
+/// degrade to plain TCP.
+#[cfg(feature = "tls")]
+fn build_tls_acceptor(
+    cfg: Option<&TlsConfig>,
+) -> Result<Option<tokio_rustls::TlsAcceptor>, Error> {
+    use std::io::BufReader;
+    use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
+    use tokio_rustls::TlsAcceptor;
+
+    let Some(cfg) = cfg else { return Ok(None) };
+
+    let cert_file = std::fs::File::open(&cfg.cert_chain).map_err(Error::Io)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Error::Io)?;
+    if certs.is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "TLS cert chain file contained no PEM certificates",
+        )));
+    }
+
+    let key_file = std::fs::File::open(&cfg.private_key).map_err(Error::Io)?;
+    let mut key_reader = BufReader::new(key_file);
+    // Try PKCS#8 first (modern), fall back to RSA-style PKCS#1.
+    let key: PrivateKeyDer<'static> = if let Some(k) =
+        rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+            .next()
+            .transpose()
+            .map_err(Error::Io)?
+    {
+        PrivateKeyDer::Pkcs8(k)
+    } else {
+        let key_file = std::fs::File::open(&cfg.private_key).map_err(Error::Io)?;
+        let mut key_reader = BufReader::new(key_file);
+        let k = rustls_pemfile::rsa_private_keys(&mut key_reader)
+            .next()
+            .ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "no PKCS#8 or RSA private key found in TLS key file",
+                ))
+            })?
+            .map_err(Error::Io)?;
+        PrivateKeyDer::Pkcs1(k)
+    };
+
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+
+    Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
+}
+
+#[cfg(not(feature = "tls"))]
+fn build_tls_acceptor(cfg: Option<&TlsConfig>) -> Result<Option<()>, Error> {
+    if cfg.is_some() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TLS configured but the `tls` feature is not enabled at compile time",
+        )));
+    }
+    Ok(None)
+}
+
+/// Accept the connection and (if a TLS acceptor is configured) drive the
+/// handshake before splitting into reader/writer halves. Returns the
+/// type-erased halves the connection layer uses.
+#[cfg(feature = "tls")]
+async fn accept_and_split(
+    stream: TcpStream,
+    tls: Option<&tokio_rustls::TlsAcceptor>,
+) -> Result<(BoxedReader, BoxedWriter), Error> {
+    use std::pin::Pin;
+    use tokio::io;
+    if let Some(acceptor) = tls {
+        let tls_stream = acceptor.accept(stream).await.map_err(Error::Io)?;
+        let (r, w) = io::split(tls_stream);
+        Ok((Pin::new(Box::new(r)), Pin::new(Box::new(w))))
+    } else {
+        let (r, w) = stream.into_split();
+        Ok((Pin::new(Box::new(r)), Pin::new(Box::new(w))))
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+async fn accept_and_split(
+    stream: TcpStream,
+    _tls: Option<&()>,
+) -> Result<(BoxedReader, BoxedWriter), Error> {
+    use std::pin::Pin;
+    let (r, w) = stream.into_split();
+    Ok((Pin::new(Box::new(r)), Pin::new(Box::new(w))))
+}
+

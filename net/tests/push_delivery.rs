@@ -50,7 +50,7 @@ async fn start_test_server() -> (SocketAddr, watch::Sender<bool>, Arc<Broker>) {
                  // acceptable for a smoke test.
 
     let server = Server::new(
-        NetworkConfig { bind_addr: local },
+        NetworkConfig { bind_addr: local, tls: None },
         handler,
         auth,
         shutdown_rx,

@@ -1,12 +1,17 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::BytesMut;
 use corelib::{DeliveryEncoder, PushSlot, QoSLevel};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, trace};
+
+/// Type-erased read half so the connection layer doesn't care whether
+/// the underlying stream is a plain `TcpStream` or a `TlsStream` over one.
+pub type BoxedReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
+/// Type-erased write half, see [`BoxedReader`].
+pub type BoxedWriter = Pin<Box<dyn AsyncWrite + Send + Unpin>>;
 
 use auth::{ApiKey, ApiKeyValidator};
 
@@ -32,7 +37,8 @@ where
     H: MessageHandler + Clone,
 {
     id: u64,
-    stream: TcpStream,
+    read_half: BoxedReader,
+    write_half: BoxedWriter,
     handler: H,
     shutdown: watch::Receiver<bool>,
     auth_validator: Arc<dyn ApiKeyValidator>,
@@ -42,16 +48,22 @@ impl<H> Connection<H>
 where
     H: MessageHandler + Clone,
 {
+    /// Construct from already-split, type-erased halves. The caller
+    /// (typically `Server::start`) is responsible for accepting the
+    /// underlying stream — plain TCP or post-TLS-handshake — and
+    /// splitting it via `tokio::io::split`.
     pub fn new(
         id: u64,
-        stream: TcpStream,
+        read_half: BoxedReader,
+        write_half: BoxedWriter,
         handler: H,
         auth_validator: Arc<dyn ApiKeyValidator>,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         Self {
             id,
-            stream,
+            read_half,
+            write_half,
             handler,
             shutdown,
             auth_validator,
@@ -65,7 +77,8 @@ where
         let conn_id = self.id;
         let handler = self.handler.clone();
 
-        let (read_half, write_half) = self.stream.into_split();
+        let read_half = self.read_half;
+        let write_half = self.write_half;
 
         // Per-conn shared push slot: broker encodes DELIVER frames directly
         // into `slot.buf` under the parking_lot mutex and pings
@@ -128,7 +141,7 @@ where
 
 async fn writer_task(
     conn_id: u64,
-    mut write_half: OwnedWriteHalf,
+    mut write_half: BoxedWriter,
     slot: Arc<PushSlot>,
     mut inband_rx: mpsc::Receiver<Frame>,
     mut shutdown: watch::Receiver<bool>,
@@ -234,7 +247,7 @@ where
     H: MessageHandler + Clone,
 {
     id: u64,
-    read_half: OwnedReadHalf,
+    read_half: BoxedReader,
     handler: H,
     auth_validator: Arc<dyn ApiKeyValidator>,
     shutdown: watch::Receiver<bool>,
@@ -256,7 +269,7 @@ where
 {
     fn new(
         id: u64,
-        read_half: OwnedReadHalf,
+        read_half: BoxedReader,
         handler: H,
         auth_validator: Arc<dyn ApiKeyValidator>,
         shutdown: watch::Receiver<bool>,
@@ -408,7 +421,7 @@ where
     }
 
     #[inline]
-    async fn send_inband(&self, frame: Frame) -> Result<(), Error> {
+    async fn send_inband(&mut self, frame: Frame) -> Result<(), Error> {
         if self.inband_tx.send(frame).await.is_err() {
             // Writer task gone; treat as connection-closed.
             return Err(Error::Io(std::io::Error::new(
@@ -419,7 +432,7 @@ where
         Ok(())
     }
 
-    async fn send_ack(&self, correlation_id: u64) -> Result<(), Error> {
+    async fn send_ack(&mut self, correlation_id: u64) -> Result<(), Error> {
         let payload = AckPayload { subscription_id: 0 }.encode()?;
         self.send_inband(Frame {
             msg_type: FrameType::Ack,
@@ -430,7 +443,7 @@ where
     }
 
     async fn send_nack(
-        &self,
+        &mut self,
         correlation_id: u64,
         code: u16,
         message: &str,

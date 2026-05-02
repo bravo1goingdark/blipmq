@@ -44,7 +44,7 @@ async fn start_test_server(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let server = Server::new(
-        NetworkConfig { bind_addr: addr },
+        NetworkConfig { bind_addr: addr, tls: None },
         handler,
         auth_validator,
         shutdown_rx,

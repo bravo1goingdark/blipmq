@@ -6,6 +6,12 @@ authors.workspace = true
 description = "BlipMQ networking: TCP server and protocol framing"
 license.workspace = true
 
+[features]
+default = []
+# Optional TLS support via tokio-rustls. Off by default so the binary
+# stays small for users who terminate TLS at a load balancer.
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+
 [dependencies]
 tokio = { workspace = true }
 bytes = { workspace = true }
@@ -15,6 +21,8 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 auth = { path = "../auth" }
 flume = { version = "0.11", default-features = false, features = ["async"] }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util"] }

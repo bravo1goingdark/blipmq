@@ -44,7 +44,7 @@ async fn start_server() -> (SocketAddr, watch::Sender<bool>, Arc<Broker>) {
     drop(probe);
 
     let server = Server::new(
-        NetworkConfig { bind_addr: local },
+        NetworkConfig { bind_addr: local, tls: None },
         handler,
         auth,
         shutdown_rx,
