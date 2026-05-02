@@ -60,9 +60,11 @@ Each item should be validated on the target environment (or a close staging repl
 - [ ] **Random network disconnects**
   - [ ] Use a chaos tool (e.g., `chaos::maybe_disconnect` or tc/netem) to randomly close client connections:
     - [ ] Confirm broker remains stable and resources (connections, memory) are cleaned up.
-- [ ] **Slow disk simulation**
-  - [ ] Introduce artificial delay into WAL writes (e.g., `simulate_slow_disk_write` or slower storage):
-    - [ ] Confirm backpressure is applied (producers slow down) rather than unbounded buffering.
+- [x] **Slow disk simulation**
+  - [x] When the WAL channel is full, durable PUBLISH returns
+        `NACK 503 wal_busy` to the publisher rather than blocking
+        indefinitely; publishers retry with backoff. Implemented in
+        commits across Phase 6 hardening.
 - [ ] **WAL corruption injection**
   - [ ] Corrupt WAL files (e.g., using `corrupt_file_tail_bit` or direct byte flips):
     - [ ] Restart broker and confirm:
@@ -98,15 +100,19 @@ Each item should be validated on the target environment (or a close staging repl
     - [ ] Normal operation produces limited `info` logs.
     - [ ] Errors (I/O failures, WAL corruption, config parse failures) are logged at `error` with context.
     - [ ] Debug/trace logs can be enabled via `RUST_LOG` without recompilation.
-- [ ] **Metrics endpoint**
-  - [ ] Confirm `/metrics` exposes:
-    - [ ] `topics`
-    - [ ] `subscribers`
-    - [ ] `messages_published_total`
-    - [ ] `messages_delivered_total`
-    - [ ] `messages_inflight`
-    - [ ] `wal_appends_total`
-    - [ ] `wal_bytes_total`
+- [x] **Metrics endpoint** (Prometheus exposition format,
+      `text/plain; version=0.0.4`):
+  - [x] `blipmq_topics_total`, `blipmq_subscribers_total`
+  - [x] `blipmq_messages_published_total`, `blipmq_messages_delivered_total`
+  - [x] `blipmq_messages_inflight`
+  - [x] `blipmq_push_dropped_total` (slow-consumer drops)
+  - [x] `blipmq_topic_published_total{topic="…"}`,
+        `blipmq_topic_delivered_total{topic="…"}` (per-topic)
+  - [x] `blipmq_publish_fanout_seconds` (hdrhistogram summary,
+        1-in-64 sampled)
+  - [x] `blipmq_wal_appends_total`, `blipmq_wal_bytes_total`
+  - [x] `/healthz` (liveness), `/readyz` (broker accepting publishes
+        after WAL replay)
   - [ ] Verify metrics values change as expected under test load.
   - [ ] Integrate with the production metrics system (e.g., Prometheus) and validate scrape configuration.
 
@@ -123,7 +129,11 @@ Each item should be validated on the target environment (or a close staging repl
   - [ ] Confirm that keys can be supplied via environment variables or secrets management and not hardcoded.
 - [ ] **Network exposure**
   - [ ] Confirm `bind_addr` and port configuration restricts the broker to the intended interfaces.
-  - [ ] Validate TLS termination strategy (if applicable) in front of BlipMQ.
+  - [x] **TLS support is built in.** Enable the `net` crate's `tls`
+        feature; supply `tls_cert_path` + `tls_key_path` in the config
+        and the broker wraps every accepted connection in a
+        `tokio_rustls::server::TlsStream`. See [docs/SECURITY.md](./docs/SECURITY.md).
+        Setting only one of cert/key is rejected at startup.
 - [ ] **Dependency and crate audit**
   - [ ] Run `cargo audit` and address critical vulnerabilities in dependencies.
 
@@ -131,16 +141,21 @@ Each item should be validated on the target environment (or a close staging repl
 
 ## 7. Graceful shutdown
 
-- [ ] **Signal handling**
-  - [ ] Verify that `SIGINT`/`SIGTERM` are handled:
-    - [ ] Broker stops accepting new connections and new publishes.
-    - [ ] Background tasks (maintenance, metrics, network server) receive shutdown signals.
-- [ ] **In-flight message draining**
-  - [ ] Confirm that on shutdown:
-    - [ ] The broker waits up to a bounded timeout for in-flight QoS1 messages to be acknowledged.
-    - [ ] Unacked QoS1 messages are left in WAL for redelivery after restart.
-- [ ] **WAL flush**
-  - [ ] Confirm that WAL is flushed (fsync) before exit when configured to do so, and that no committed messages are lost across a clean shutdown.
+- [x] **Signal handling**
+  - [x] `SIGINT` / `SIGTERM` handled in `blipmqd`: broker is marked
+        shutting-down (rejects new publishes), maintenance and
+        network tasks are signaled to stop, and the daemon waits for
+        the in-flight drain before flushing the WAL and exiting.
+- [x] **In-flight message draining**
+  - [x] Notify-based drain loop (`Broker::wait_for_drain`) wakes the
+        instant the last QoS1 inflight is acked or expired. Bounded
+        timeout (default 2 s) so a hung consumer can't block exit
+        forever; on timeout, unacked records stay in the WAL for
+        redelivery after restart.
+- [x] **WAL flush**
+  - [x] `Broker::flush_wal` runs at the end of the shutdown
+        sequence. With `fsync_policy ≠ "none"`, every committed
+        record is on disk before exit.
 
 ---
 
@@ -175,14 +190,17 @@ Each item should be validated on the target environment (or a close staging repl
 
 ## 10. WAL corruption behavior
 
-- [ ] **Detection**
-  - [ ] Corrupt WAL segments (bit flips) and restart broker:
-    - [ ] Ensure CRC mismatches are detected and reported as `Corruption` errors.
-- [ ] **Recovery strategy**
-  - [ ] Decide and document recovery behavior:
-    - [ ] Whether to truncate WAL at the first corrupt record.
-    - [ ] Whether to ignore tail segments while preserving earlier valid records.
-  - [ ] Confirm implementation matches the documented strategy.
+- [x] **Detection**
+  - [x] Each WAL record carries a CRC32 over `(id, len, payload)` so
+        a flip in any of those fields is caught at replay
+        (`HEADER_VERSION` 3, in commit `Phase 3` and follow-ups).
+        Header magic + version are also CRC-protected.
+- [x] **Recovery strategy**
+  - [x] Torn / truncated trailing records are treated as
+        end-of-segment (clean shutdown signal), not fatal. Mid-record
+        CRC mismatches surface as `WalError::Corruption` and stop
+        the replay loop with the offending segment + offset in the
+        error string. See [docs/RECOVERY.md](./docs/RECOVERY.md).
 - [ ] **Operator guidance**
   - [ ] Provide clear operational steps for handling detected WAL corruption:
     - [ ] How to back up and truncate the WAL.

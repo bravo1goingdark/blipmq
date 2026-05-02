@@ -37,15 +37,23 @@ If `length == 0`, `length < 9`, or `length > MAX_FRAME_SIZE`, frame decoding fai
 
 | Name       | Value | Direction       | Description                               |
 |-----------|-------|-----------------|-------------------------------------------|
-| HELLO     | 0x01  | Client ? Server | Protocol version negotiation              |
-| AUTH      | 0x02  | Client ? Server | API key authentication                    |
-| PUBLISH   | 0x03  | Both            | Publish or deliver a message              |
-| SUBSCRIBE | 0x04  | Client ? Server | Subscribe to a topic                      |
+| HELLO     | 0x01  | Client → Server | Protocol version negotiation              |
+| AUTH      | 0x02  | Client → Server | API key authentication                    |
+| PUBLISH   | 0x03  | Client → Server | Publish a message                         |
+| SUBSCRIBE | 0x04  | Client → Server | Subscribe to a topic                      |
 | ACK       | 0x05  | Both            | ACK for handshake or QoS1 deliveries      |
-| NACK      | 0x06  | Server ? Client | Error response                            |
-| PING      | 0x07  | Client ? Server | Liveness check                            |
-| PONG      | 0x08  | Server ? Client | Liveness response                         |
-| POLL      | 0x09  | Client ? Server | Request next message for a subscription   |
+| NACK      | 0x06  | Server → Client | Error response                            |
+| PING      | 0x07  | Client → Server | Liveness check                            |
+| PONG      | 0x08  | Server → Client | Liveness response                         |
+| POLL      | 0x09  | Client → Server | (v1 only) Request next message for a sub  |
+| DELIVER   | 0x0A  | Server → Client | Server-pushed message delivery (v2)       |
+
+**v1 vs v2:** The `PROTOCOL_VERSION` value sent in the HELLO frame
+selects delivery mode for that connection. v1 clients pull messages
+via repeated POLL frames; v2 clients receive `DELIVER` frames asynchronously
+as the broker fans messages out. The current value of `PROTOCOL_VERSION`
+is **2**; v1 is preserved for back-compat with older clients but is no
+longer the recommended path.
 
 Unknown frame types result in a decode error and connection close.
 
@@ -110,75 +118,115 @@ All multi-byte integers are big-endian.
 
 ### PUBLISH
 
-Client ? Server (publish).
-Server ? Client (delivery).
+Client → Server only. (Server-side delivery to subscribers uses
+`DELIVER`, see below.)
 
 Payload:
 
 ```text
-[u8 qos][u16 topic_len][topic_bytes...][message_bytes...]
+[u8 qos_flags]
+  [u32 ttl_ms          if has_ttl]
+  [u16 key_len + key   if has_partition_key]
+[u16 topic_len][topic_bytes...]
+[message_bytes...]
 ```
 
-- `qos`:
-  - `0` ? QoS0 (AtMostOnce).
-  - `1` ? QoS1 (AtLeastOnce).
-- `topic_len`:
-  - Length of topic in bytes (`u16`).
-- `topic_bytes`:
-  - UTF-8 topic name.
-- `message_bytes`:
-  - Opaque payload.
+The `qos_flags` byte packs the QoS level and two optional-field flags:
+
+| bit | name              | meaning                                                |
+|-----|-------------------|--------------------------------------------------------|
+|  0–1| qos               | `0` = AtMostOnce, `1` = AtLeastOnce                    |
+|   6 | has_partition_key | when set, a `[u16 key_len][key_bytes]` pair follows    |
+|   7 | has_ttl           | when set, a `u32 ttl_ms` field follows the qos byte    |
+
+Order when both flag bits are set: `qos_flags → ttl_ms → key_len + key → topic_len + topic → message`.
+
+- `ttl_ms`: per-message TTL override in milliseconds. Replaces the
+  broker's default `message_ttl` for this single message.
+- `partition_key`: opaque bytes used as a routing key for sticky-by-key
+  routing within consumer groups (same key always lands on the same
+  group member). Empty key (`key_len = 0`) is rejected; use
+  `has_partition_key = 0` for "no key, round-robin within the group".
+- `topic_bytes`: UTF-8 topic name.
+- `message_bytes`: opaque payload.
 
 Server behavior on incoming PUBLISH:
 
-- If topic empty:
-  - `NACK(400, "empty topic")`.
-- If qos not in {0,1}:
-  - `NACK(400, "invalid QoS value")`.
+- If topic empty: `NACK(400, "empty topic")`.
+- If topic is not valid UTF-8 or contains a NUL byte: `NACK(400, ...)`.
+- If qos not in {0,1}: `NACK(400, "invalid QoS value")`.
+- If WAL channel is full: `NACK(503, "wal_busy")`.
 - If QoS1 and WAL configured:
-  - Append to WAL.
-  - On WAL error: `NACK(500, "durable publish failed: ...")`.
-  - On success: enqueue message to subscriber queues.
+  - Append to WAL, group-commit fsync, then fan out to subscribers.
+  - On WAL error: `NACK(500, "durable_publish_failed: ...")`.
 - Otherwise:
-  - Enqueue message in-memory only.
+  - Fan out in-memory only.
 - On success:
   - No response frame (fire-and-forget).
 
-Server behavior when sending PUBLISH as delivery:
+### DELIVER
 
-- Sent in response to a POLL request.
-- `qos` and topic/payload fields reflect the message.
-- `correlation_id`:
-  - For QoS1: equals `DeliveryTag.value()` to be used in ACK.
-  - For QoS0: usually matches the POLL correlation id.
-
-### SUBSCRIBE
-
-Client ? Server.
+Server → Client. v2-only. Sent asynchronously as the broker fans
+messages out to push subscribers; the client does not request it.
 
 Payload:
 
 ```text
-[u16 topic_len][topic_bytes...][u8 qos]
+[u8 qos][u64 delivery_tag][u16 topic_len][topic_bytes...][message_bytes...]
 ```
 
-- `topic_len`:
-  - Length of UTF-8 topic.
-- `topic_bytes`:
-  - Topic name.
-- `qos`:
-  - Requested QoS (`0` or `1`).
+- `qos`: 0 or 1 (matches the publishing QoS level).
+- `delivery_tag`: per-subscription monotonic tag. For QoS1, the
+  client must echo this back as the ACK frame's `correlation_id`.
+  Always 0 for QoS0.
+- The frame's outer `correlation_id` field also carries `delivery_tag`
+  (mirrored), so simple clients can match on either field.
+
+### SUBSCRIBE
+
+Client → Server.
+
+Payload:
+
+```text
+[u16 topic_len][topic_bytes...]
+[u8 qos_flags]
+  [u16 group_len + group  if has_group]
+  [u64 from_offset        if has_offset]
+```
+
+The `qos_flags` byte packs the QoS level and two optional-field flags:
+
+| bit | name        | meaning                                                |
+|-----|-------------|--------------------------------------------------------|
+|  0–1| qos         | requested QoS level                                    |
+|   6 | has_offset  | when set, a `u64 from_offset` field follows            |
+|   7 | has_group   | when set, a `[u16 group_len][group_bytes]` pair follows |
+
+Order when both flag bits are set: `topic → qos_flags → group → from_offset`.
+
+- `group`: name of the consumer group to join. With `has_group = 0`
+  this is a broadcast subscriber (every publish to the topic is
+  delivered). With `has_group = 1`, the subscriber competes with
+  other group members; each publish is delivered to exactly one
+  member (round-robin or sticky-by-key).
+- `from_offset`: when `has_offset = 1`, the broker walks the WAL
+  from this id and re-pushes matching records to the subscriber
+  before live publishes start flowing. Special value `0` means
+  "earliest". Wildcard subscriptions are not supported on the
+  replay path.
 
 Server behavior:
 
-- Invalid payload:
-  - `NACK(400, "invalid SUBSCRIBE payload")`.
-- Empty topic:
-  - `NACK(400, "empty topic")`.
-- Invalid QoS:
-  - `NACK(400, "invalid QoS value")`.
+- Invalid payload: `NACK(400, "invalid SUBSCRIBE payload")`.
+- Empty topic: `NACK(400, "empty topic")`.
+- Invalid QoS: `NACK(400, "invalid QoS value")`.
+- Empty group name when `has_group = 1`: `NACK(400, "empty consumer group name")`.
 - On success:
-  - Creates a subscription and returns `ACK(subscription_id = new_id)`.
+  - Registers the subscription on the v2 push path.
+  - If `has_offset = 1` and the broker has a WAL: replay records
+    from `from_offset` to the subscriber after live registration.
+  - Returns `ACK(subscription_id = new_id)`.
 
 ### ACK
 
@@ -232,9 +280,14 @@ Payload:
 - `message_bytes`:
   - UTF-8 error message.
 
-### POLL
+### POLL (v1 only — deprecated)
 
-Client ? Server.
+Client → Server. Frame type retained for backward compatibility, but
+**v2 SUBSCRIBE registers a push-mode subscription that does not
+service POLL**: a v2 client that sends POLL after SUBSCRIBE will get
+no message (the broker's poll path returns `None` for slot-mode
+subs). v2 clients should read `DELIVER` frames asynchronously
+instead.
 
 Payload:
 
@@ -242,18 +295,12 @@ Payload:
 [u64 subscription_id]
 ```
 
-Server behavior:
+Server behavior (v1 path):
 
-- Invalid payload:
-  - `NACK(400, "invalid POLL payload")`.
-- `subscription_id == 0`:
-  - `NACK(400, "subscription_id must be non-zero")`.
-- On success:
-  - If no message available:
-    - Returns no frame; client should backoff and retry.
-  - If message available:
-    - Returns `PUBLISH` frame carrying the message.
-    - For QoS1, `correlation_id` is the delivery tag and must be used in ACK.
+- Invalid payload: `NACK(400, "invalid POLL payload")`.
+- `subscription_id == 0`: `NACK(400, "subscription_id must be non-zero")`.
+- On success: returns a `PUBLISH` frame with the next queued message,
+  or no frame if the queue is empty.
 
 ### PING / PONG
 
@@ -275,7 +322,11 @@ BlipMQ uses numeric codes in NACK payloads:
 | 401  | Authentication / authorization failure   | `"unauthenticated"`, `"invalid API key"`        |
 | 404  | Unknown resource                         | `"unknown subscription or delivery tag"`        |
 | 426  | Protocol version mismatch                | `"unsupported protocol version"`                |
-| 500  | Internal server error                    | `"durable publish failed: ..."`                 |
+| 500  | Internal server error                    | `"durable_publish_failed: ..."`                 |
+| 503  | Backpressure / transient overload        | `"wal_busy"`, `"wal_writer_stopped"`            |
+
+Clients SHOULD treat 503 as transient: retry with exponential
+backoff, don't crash.
 
 Clients SHOULD:
 
