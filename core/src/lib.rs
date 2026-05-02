@@ -379,6 +379,10 @@ pub struct Broker {
     /// subscriptions stay on the `TopicShards` fast path and don't appear
     /// here.
     wildcard_subs: RwLock<Vec<(SubjectPattern, SubscriptionId)>>,
+    /// Length of `wildcard_subs` mirrored as an atomic so the publish
+    /// hot path can early-exit without acquiring the read lock when no
+    /// wildcard subs are registered (the common case).
+    wildcard_subs_len: AtomicU64,
     /// Fires whenever the broker's inflight QoS1 count could have
     /// decreased (an ack or a maintenance-tick expiry/retry-drop).
     /// `wait_for_drain` awaits this so graceful shutdown completes the
@@ -1210,6 +1214,7 @@ impl Broker {
                     .expect("histogram bounds valid"),
             ),
             wildcard_subs: RwLock::new(Vec::new()),
+            wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
         }
     }
@@ -1237,6 +1242,7 @@ impl Broker {
                     .expect("histogram bounds valid"),
             ),
             wildcard_subs: RwLock::new(Vec::new()),
+            wildcard_subs_len: AtomicU64::new(0),
             drain_notify: Notify::new(),
         }
     }
@@ -1351,7 +1357,12 @@ impl Broker {
             None,
             None,
         );
-        self.wildcard_subs.write().push((pattern, sub_id));
+        {
+            let mut wcs = self.wildcard_subs.write();
+            wcs.push((pattern, sub_id));
+            self.wildcard_subs_len
+                .store(wcs.len() as u64, Ordering::Release);
+        }
         sub_id
     }
 
@@ -1378,7 +1389,12 @@ impl Broker {
             None,
             Some((slot, encoder)),
         );
-        self.wildcard_subs.write().push((pattern, sub_id));
+        {
+            let mut wcs = self.wildcard_subs.write();
+            wcs.push((pattern, sub_id));
+            self.wildcard_subs_len
+                .store(wcs.len() as u64, Ordering::Release);
+        }
         sub_id
     }
 
@@ -1470,9 +1486,10 @@ impl Broker {
         if !removed.is_empty() {
             let removed_ids: std::collections::HashSet<SubscriptionId> =
                 removed.iter().map(|(sid, _)| *sid).collect();
-            self.wildcard_subs
-                .write()
-                .retain(|(_, sid)| !removed_ids.contains(sid));
+            let mut wcs = self.wildcard_subs.write();
+            wcs.retain(|(_, sid)| !removed_ids.contains(sid));
+            self.wildcard_subs_len
+                .store(wcs.len() as u64, Ordering::Release);
         }
         // `removed` going out of scope drops the only remaining strong
         // references to those Subscribers (and thus their push_senders),
@@ -1525,9 +1542,12 @@ impl Broker {
         conn_map.retain(|_, subs| !subs.is_empty());
         // Drop the wildcard entry too (no-op if this was an exact-match
         // subscription).
-        self.wildcard_subs
-            .write()
-            .retain(|(_, sid)| *sid != sub_id);
+        {
+            let mut wcs = self.wildcard_subs.write();
+            wcs.retain(|(_, sid)| *sid != sub_id);
+            self.wildcard_subs_len
+                .store(wcs.len() as u64, Ordering::Release);
+        }
         true
     }
 
@@ -1647,7 +1667,11 @@ impl Broker {
         // Arcs out of the sharded subscriptions map. Cost is O(W) where
         // W is the number of wildcard subscriptions; for hundreds of
         // patterns this is well under a microsecond.
-        {
+        //
+        // The atomic-counter early-exit avoids the parking_lot read
+        // lock acquisition entirely when no wildcard subs are
+        // registered (the common case in practice).
+        if self.wildcard_subs_len.load(Ordering::Acquire) > 0 {
             let wcs = self.wildcard_subs.read();
             for (pattern, sid) in wcs.iter() {
                 if pattern.matches(topic_name.as_str()) {
@@ -1770,14 +1794,19 @@ impl Broker {
             self.unsubscribe_one(sid);
         }
 
-        // Record fanout latency. The histogram lock is parking_lot and
-        // uncontended in steady state (only the metrics endpoint reads
-        // it). Recording errors (saturating high values) are silently
-        // ignored: the histogram caps at 60s, and any publish that
-        // somehow took longer than that is already an outlier we don't
-        // need fine-grained visibility on.
+        // Record fanout latency, but never block the hot path on the
+        // histogram lock: under multi-publisher contention an N-way
+        // serialize on a single mutex would dominate the budget. We
+        // `try_lock` instead — if another thread is currently recording,
+        // this publish skips the sample. The histogram still gets a
+        // representative distribution (samples are uniformly random with
+        // respect to publish-rate variation per pipe), and the metrics
+        // endpoint reads correct quantiles. Saturating record so the
+        // histogram's 60s upper bound never causes a real error.
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        let _ = self.publish_fanout_ns.lock().saturating_record(elapsed_ns);
+        if let Some(mut h) = self.publish_fanout_ns.try_lock() {
+            let _ = h.saturating_record(elapsed_ns);
+        }
     }
 
     /// Publish a message durably by first appending it to the write-ahead log
@@ -2723,9 +2752,18 @@ mod tests {
             Some(tx2),
             None,
         );
-        // Manually register the wildcard.
+        // Manually register the wildcard. Bumping wildcard_subs_len
+        // mirrors what `subscribe_pattern` would do; without it the
+        // atomic-gated fanout scan in publish_with_wal_id would skip
+        // the new entry.
         let p = SubjectPattern::parse("orders.*.created").unwrap();
-        broker.wildcard_subs.write().push((p, _wc_sid));
+        {
+            let mut wcs = broker.wildcard_subs.write();
+            wcs.push((p, _wc_sid));
+            broker
+                .wildcard_subs_len
+                .store(wcs.len() as u64, Ordering::Release);
+        }
 
         // Publish to a matching subject.
         broker.publish(
