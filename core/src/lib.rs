@@ -242,6 +242,12 @@ pub struct BrokerConfig {
     /// buffer is at or above this size, the broker applies
     /// `slow_consumer_policy` to incoming deliveries. Default 16 MiB.
     pub slow_consumer_buffer_bytes: usize,
+    /// Suffix appended to a topic name when forming its dead-letter queue
+    /// (DLQ) topic. When set, QoS1 messages dropped by maintenance
+    /// (TTL-expired or max-retries-exceeded) are republished to
+    /// `<original_topic><dlq_suffix>` at QoS0 so subscribers can react to
+    /// undeliverable traffic. `None` disables the DLQ feature.
+    pub dlq_suffix: Option<String>,
 }
 
 impl Default for BrokerConfig {
@@ -254,6 +260,7 @@ impl Default for BrokerConfig {
             retry_base_delay: Duration::from_millis(50),
             slow_consumer_policy: SlowConsumerPolicy::DropNewest,
             slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
         }
     }
 }
@@ -1089,8 +1096,14 @@ impl SubscriberQueue {
         inner.retry_heap.len()
     }
 
-    fn maintenance_tick(&self, now: std::time::Instant, max_retries: u32, _base_delay: Duration) {
+    fn maintenance_tick(
+        &self,
+        now: std::time::Instant,
+        max_retries: u32,
+        _base_delay: Duration,
+    ) -> SmallVec<[(Bytes, DropReason); 4]> {
         let mut inner = self.inner.lock();
+        let mut dropped: SmallVec<[(Bytes, DropReason); 4]> = SmallVec::new();
 
         while let Some(Reverse(expiration)) = inner.expiration_heap.peek().copied() {
             if expiration.expires_at > now {
@@ -1104,7 +1117,9 @@ impl SubscriberQueue {
                     .map(|ttl| entry.created_at + ttl == expiration.expires_at)
                     .unwrap_or(false)
                 {
-                    inner.pending_entries.remove(&expiration.tag);
+                    if let Some(removed) = inner.pending_entries.remove(&expiration.tag) {
+                        dropped.push((removed.payload, DropReason::TtlExpired));
+                    }
                 }
                 continue;
             }
@@ -1115,7 +1130,9 @@ impl SubscriberQueue {
                     .map(|ttl| entry.created_at + ttl == expiration.expires_at)
                     .unwrap_or(false)
                 {
-                    inner.inflight.remove(&expiration.tag);
+                    if let Some(removed) = inner.inflight.remove(&expiration.tag) {
+                        dropped.push((removed.payload, DropReason::TtlExpired));
+                    }
                 }
             }
         }
@@ -1135,7 +1152,9 @@ impl SubscriberQueue {
             }
 
             if entry.delivery_attempts >= max_retries {
-                inner.inflight.remove(&retry.tag);
+                if let Some(removed) = inner.inflight.remove(&retry.tag) {
+                    dropped.push((removed.payload, DropReason::MaxRetriesExceeded));
+                }
                 continue;
             }
 
@@ -1145,7 +1164,17 @@ impl SubscriberQueue {
                 inner.pending_entries.insert(entry.tag, entry);
             }
         }
+
+        dropped
     }
+}
+
+/// Why a queue entry was removed by maintenance. Surfaced to the broker
+/// so it can publish a synthetic message to the dead-letter topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    TtlExpired,
+    MaxRetriesExceeded,
 }
 
 impl Topic {
@@ -2044,15 +2073,42 @@ impl Broker {
     /// scheduling. Intended to be called from a Tokio interval in the
     /// daemon.
     pub fn maintenance_tick(&self, now: std::time::Instant) {
+        // Collect (dlq_topic, payload) tuples while shard locks are held;
+        // publish them after the walk so we don't reentrantly take the
+        // same locks. Most maintenance ticks produce zero drops, so the
+        // SmallVec inline storage handles the common case.
+        let mut to_dlq: SmallVec<[(TopicName, Bytes); 4]> = SmallVec::new();
+        let dlq_suffix = self.config.dlq_suffix.clone();
+
         for shard in &self.subscriptions.shards {
             for sub_ref in shard.read().values() {
-                sub_ref.subscriber.queue.maintenance_tick(
+                let dropped = sub_ref.subscriber.queue.maintenance_tick(
                     now,
                     self.config.max_retries,
                     self.config.retry_base_delay,
                 );
+                if let Some(suffix) = &dlq_suffix {
+                    let topic_str = sub_ref.topic.as_str();
+                    // Skip self-DLQ to avoid recursion: if the subscriber's
+                    // own topic already ends in the DLQ suffix, dropped
+                    // messages are silently lost rather than echoed back to
+                    // the same DLQ.
+                    if !topic_str.ends_with(suffix.as_str()) {
+                        let dlq_topic =
+                            TopicName::from_str(&format!("{}{}", topic_str, suffix));
+                        for (payload, _reason) in dropped {
+                            to_dlq.push((dlq_topic.clone(), payload));
+                        }
+                    }
+                }
             }
         }
+
+        // Publish DLQ messages outside the shard read locks.
+        for (topic, payload) in to_dlq {
+            self.publish(&topic, payload, QoSLevel::AtMostOnce);
+        }
+
         // Maintenance may have expired or dropped inflight entries; wake
         // any graceful-shutdown waiter so it re-checks immediately.
         self.drain_notify.notify_waiters();
@@ -2111,6 +2167,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(50),
             slow_consumer_policy: SlowConsumerPolicy::DropNewest,
             slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
         })
     }
 
@@ -2199,6 +2256,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(10),
             slow_consumer_policy: SlowConsumerPolicy::DropNewest,
             slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
         });
 
         let topic = TopicName::new("ttl-test");
@@ -2223,6 +2281,57 @@ mod tests {
         assert!(broker.poll(sub_id).is_none(), "message should have expired");
     }
 
+    /// When a QoS1 message expires while inflight (TTL passed without
+    /// ACK), it must be re-published to the DLQ topic
+    /// `<topic><dlq_suffix>` if the broker has DLQ configured. A
+    /// subscriber on the DLQ topic should receive the original payload.
+    #[test]
+    fn ttl_expired_message_goes_to_dlq() {
+        let broker = Broker::new(BrokerConfig {
+            default_qos: QoSLevel::AtLeastOnce,
+            message_ttl: Duration::from_millis(50),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(10),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
+        });
+
+        let topic = TopicName::new("dlq-source");
+        let dlq_topic = TopicName::new("dlq-source.dlq");
+
+        let primary_sub = broker.subscribe(
+            ClientId::new("primary"),
+            topic.clone(),
+            QoSLevel::AtLeastOnce,
+        );
+        let dlq_sub = broker.subscribe(
+            ClientId::new("dlq-watcher"),
+            dlq_topic.clone(),
+            QoSLevel::AtMostOnce,
+        );
+
+        let payload = Bytes::from_static(b"will-expire");
+        broker.publish(&topic, payload.clone(), QoSLevel::AtLeastOnce);
+
+        // Pull the message into the inflight set on the primary sub but
+        // never ack it; this simulates a consumer that died.
+        let polled = broker.poll(primary_sub).expect("delivery");
+        assert!(polled.delivery_tag.is_some());
+
+        // Wait past TTL, then run maintenance.
+        std::thread::sleep(Duration::from_millis(70));
+        broker.maintenance_tick(Instant::now());
+
+        // Primary sub must NOT see a re-delivery (the message expired).
+        assert!(broker.poll(primary_sub).is_none());
+
+        // DLQ subscriber should now have the original payload.
+        let dlq_msg = broker.poll(dlq_sub).expect("DLQ delivery");
+        assert_eq!(dlq_msg.payload, payload);
+    }
+
     #[test]
     fn qos1_retry_after_timeout() {
         let broker = Broker::new(BrokerConfig {
@@ -2233,6 +2342,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(20),
             slow_consumer_policy: SlowConsumerPolicy::DropNewest,
             slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
         });
 
         let topic = TopicName::new("retry-test");
@@ -2292,6 +2402,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(50),
             slow_consumer_policy: SlowConsumerPolicy::DropNewest,
             slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
         };
 
         let broker1 = Broker::new_with_wal(config.clone(), wal.clone());
@@ -2470,6 +2581,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(50),
             slow_consumer_policy: SlowConsumerPolicy::DropNewest,
             slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: Some(".dlq".to_string()),
         };
 
         let topic = TopicName::new("ack-journal-topic");
@@ -2767,6 +2879,7 @@ mod tests {
             // second sees buf already past the cap and triggers the
             // policy).
             slow_consumer_buffer_bytes: 1,
+            dlq_suffix: None,
         });
         let topic = TopicName::new("slow-consumer");
         let slot = std::sync::Arc::new(PushSlot::new(64));
