@@ -200,6 +200,7 @@ async fn run_fanout(
         qos: 0,
         message: payload,
         ttl_ms: None,
+        partition_key: None,
     }
     .encode()
     .unwrap();

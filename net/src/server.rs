@@ -610,19 +610,35 @@ impl MessageHandler for BrokerHandler {
         let ttl_override = payload
             .ttl_ms
             .map(|ms| std::time::Duration::from_millis(ms as u64));
-        match (resolved, ttl_override) {
-            (Some(r), Some(ttl)) => {
+        // Hot path: when there's no partition key (the common case),
+        // dispatch through the existing specialized methods so
+        // there's no extra option-handling overhead. When a key is
+        // supplied, fall through to the unified options entry point.
+        match (resolved, payload.partition_key.clone()) {
+            (Some(r), None) => match ttl_override {
+                Some(ttl) => self.broker.publish_resolved_with_ttl(
+                    &topic,
+                    &r,
+                    payload.message,
+                    qos,
+                    Some(ttl),
+                ),
+                None => self
+                    .broker
+                    .publish_resolved(&topic, &r, payload.message, qos),
+            },
+            (Some(r), Some(key)) => self.broker.publish_resolved_with_options(
+                &topic,
+                &r,
+                payload.message,
+                qos,
+                ttl_override,
+                Some(key),
+            ),
+            (None, key) => {
                 self.broker
-                    .publish_resolved_with_ttl(&topic, &r, payload.message, qos, Some(ttl))
+                    .publish_with_key(&topic, payload.message, qos, ttl_override, key)
             }
-            (Some(r), None) => self
-                .broker
-                .publish_resolved(&topic, &r, payload.message, qos),
-            (None, Some(ttl)) => {
-                self.broker
-                    .publish_with_ttl(&topic, payload.message, qos, Some(ttl))
-            }
-            (None, None) => self.broker.publish(&topic, payload.message, qos),
         }
         Ok(None)
     }
@@ -680,6 +696,14 @@ impl BrokerHandler {
                 let nack = self.make_nack(frame.correlation_id, code, &format!("{label}: {e}"))?;
                 return Ok(FrameResponse::Frame(nack));
             }
+        } else if payload.partition_key.is_some() {
+            self.broker.publish_with_key(
+                &topic,
+                payload.message,
+                qos,
+                ttl_override,
+                payload.partition_key,
+            );
         } else if ttl_override.is_some() {
             self.broker
                 .publish_with_ttl(&topic, payload.message, qos, ttl_override);
@@ -802,6 +826,7 @@ impl BrokerHandler {
             qos: qos_byte,
             message: polled.payload,
             ttl_ms: None,
+            partition_key: None,
         }
         .encode()?;
 

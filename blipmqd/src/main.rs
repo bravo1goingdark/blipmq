@@ -79,6 +79,7 @@ async fn run_integration_flow(
         qos: 1,
         message: Bytes::from_static(b"hello"),
         ttl_ms: None,
+        partition_key: None,
     }
     .encode()?;
 

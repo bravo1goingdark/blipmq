@@ -186,6 +186,7 @@ async fn run_pipe(addr: SocketAddr, topic: String, n_msgs: u64, payload_len: usi
         qos: 0,
         message: payload,
         ttl_ms: None,
+        partition_key: None,
     }
     .encode()
     .unwrap();

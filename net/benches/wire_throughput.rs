@@ -204,6 +204,7 @@ async fn run_ingress(addr: SocketAddr, n: u64, payload_len: usize) -> IngressRes
         qos: 0,
         message: payload.clone(),
         ttl_ms: None,
+        partition_key: None,
     }
     .encode()
     .unwrap();

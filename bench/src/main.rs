@@ -333,6 +333,7 @@ impl BenchClient {
             qos: qos_byte,
             message,
             ttl_ms: None,
+            partition_key: None,
         }
         .encode()?;
         let frame = Frame {

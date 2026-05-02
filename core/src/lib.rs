@@ -1870,7 +1870,15 @@ impl Broker {
         payload: Bytes,
         qos: QoSLevel,
     ) {
-        self.publish_inner(name, Some(resolved.inner.clone()), payload, qos, None, None);
+        self.publish_inner(
+            name,
+            Some(resolved.inner.clone()),
+            payload,
+            qos,
+            None,
+            None,
+            None,
+        );
     }
 
     /// Publish with a pre-resolved topic handle and a per-message TTL
@@ -1885,7 +1893,44 @@ impl Broker {
         qos: QoSLevel,
         ttl: Option<Duration>,
     ) {
-        self.publish_inner(name, Some(resolved.inner.clone()), payload, qos, None, ttl);
+        self.publish_inner(
+            name,
+            Some(resolved.inner.clone()),
+            payload,
+            qos,
+            None,
+            ttl,
+            None,
+        );
+    }
+
+    /// Publish with a per-message partition key for sticky-by-key
+    /// routing within consumer groups. Messages with the same
+    /// `partition_key` always land on the same group member,
+    /// preserving per-key ordering. The key is ignored for
+    /// non-grouped subscribers (broadcast and wildcard).
+    ///
+    /// `partition_key = None` falls back to round-robin within
+    /// each group (the default).
+    #[inline(always)]
+    pub fn publish_resolved_with_options(
+        &self,
+        name: &TopicName,
+        resolved: &ResolvedTopic,
+        payload: Bytes,
+        qos: QoSLevel,
+        ttl: Option<Duration>,
+        partition_key: Option<Bytes>,
+    ) {
+        self.publish_inner(
+            name,
+            Some(resolved.inner.clone()),
+            payload,
+            qos,
+            None,
+            ttl,
+            partition_key,
+        );
     }
 
     /// Publish with a per-message TTL override that applies only to this
@@ -1899,6 +1944,20 @@ impl Broker {
         ttl: Option<Duration>,
     ) {
         self.publish_with_wal_id(topic, payload, qos, None, ttl);
+    }
+
+    /// Publish with a per-message partition key. See
+    /// [`Self::publish_resolved_with_options`] for routing semantics.
+    #[inline]
+    pub fn publish_with_key(
+        &self,
+        topic: &TopicName,
+        payload: Bytes,
+        qos: QoSLevel,
+        ttl: Option<Duration>,
+        partition_key: Option<Bytes>,
+    ) {
+        self.publish_inner(topic, None, payload, qos, None, ttl, partition_key);
     }
 
     // No `#[tracing::instrument]` on this — the macro still creates,
@@ -1916,13 +1975,18 @@ impl Broker {
         wal_id: Option<u64>,
         ttl_override: Option<Duration>,
     ) {
-        self.publish_inner(topic_name, None, payload, qos, wal_id, ttl_override);
+        self.publish_inner(topic_name, None, payload, qos, wal_id, ttl_override, None);
     }
 
     /// Inner publish path. `pre_resolved` is the topic handle from a
     /// prior [`Self::resolve_topic`] call when the caller has cached
     /// it; `None` falls back to the per-publish `TopicShards.get()`.
+    /// `partition_key`, when `Some`, is hashed (AHash) and used to
+    /// pick a deterministic member of each consumer group on the
+    /// topic — same key always lands on the same member, preserving
+    /// per-key ordering. `None` keeps the round-robin default.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn publish_inner(
         &self,
         topic_name: &TopicName,
@@ -1931,6 +1995,7 @@ impl Broker {
         qos: QoSLevel,
         wal_id: Option<u64>,
         ttl_override: Option<Duration>,
+        partition_key: Option<Bytes>,
     ) {
         if self.is_shutting_down() {
             return;
@@ -2022,7 +2087,20 @@ impl Broker {
                 if members.is_empty() {
                     continue;
                 }
-                let idx = cg.next_idx.fetch_add(1, Ordering::Relaxed) % members.len();
+                // Sticky-by-key when a partition key is supplied; the
+                // key is hashed (AHash, fixed seed for determinism)
+                // and reduced modulo the member count. Same key →
+                // same member, preserving per-key ordering. With no
+                // key, fall back to round-robin so deliveries
+                // balance evenly across the group.
+                let idx = match &partition_key {
+                    Some(key) if !key.is_empty() => {
+                        let mut h = ahash::AHasher::default();
+                        h.write(key);
+                        (h.finish() as usize) % members.len()
+                    }
+                    _ => cg.next_idx.fetch_add(1, Ordering::Relaxed) % members.len(),
+                };
                 let (sid, sub) = &members[idx];
                 snapshot.push((*sid, sub.clone()));
             }
@@ -3685,6 +3763,114 @@ mod tests {
             .expect("replay none");
         assert_eq!(delivered_none, 0);
         assert_eq!(count.load(Ordering::Relaxed), prev2);
+    }
+
+    /// Sticky-by-key partitioning: every publish carrying the same
+    /// `partition_key` must land on the same group member. With 4
+    /// distinct keys × 200 publishes each, the four group members
+    /// should each "own" one key: total deliveries per member can
+    /// vary, but the per-key→member mapping must be stable across
+    /// every publish.
+    #[tokio::test]
+    async fn sticky_by_key_routes_same_key_to_same_member() {
+        use parking_lot::Mutex as PMutex;
+        use std::sync::atomic::Ordering;
+
+        let broker = Broker::new(BrokerConfig {
+            default_qos: QoSLevel::AtMostOnce,
+            message_ttl: Duration::from_secs(60),
+            per_subscriber_queue_capacity: 16,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(50),
+            slow_consumer_policy: SlowConsumerPolicy::DropNewest,
+            slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+            dlq_suffix: None,
+        });
+        let topic = TopicName::new("orders");
+
+        // Each member records the keys it received. A key→member
+        // mapping is stable iff every "key" string only ever lands
+        // in one member's set.
+        let member_keys: Vec<Arc<PMutex<Vec<String>>>> =
+            (0..4).map(|_| Arc::new(PMutex::new(Vec::new()))).collect();
+
+        for (i, mk) in member_keys.iter().enumerate() {
+            let recorder = mk.clone();
+            let slot = Arc::new(PushSlot::new(4096));
+            let encoder: DeliveryEncoder = Arc::new(move |_buf, _qos, _tag, _topic, payload| {
+                // The bench test passes the key as the message body
+                // for simplicity. Real callers can use any payload;
+                // sticky-by-key only inspects the partition_key.
+                let s = std::str::from_utf8(payload).unwrap_or("").to_string();
+                recorder.lock().push(s);
+            });
+            broker.subscribe_with_slot_in_group(
+                ClientId::new(format!("c{i}")),
+                topic.clone(),
+                QoSLevel::AtMostOnce,
+                (i + 1) as u64,
+                slot,
+                encoder,
+                "workers".to_string(),
+            );
+        }
+
+        let keys = ["alpha", "bravo", "charlie", "delta"];
+        const PER_KEY: usize = 200;
+        for _ in 0..PER_KEY {
+            for k in &keys {
+                broker.publish_with_key(
+                    &topic,
+                    Bytes::from(k.to_string()),
+                    QoSLevel::AtMostOnce,
+                    None,
+                    Some(Bytes::from_static(k.as_bytes())),
+                );
+            }
+        }
+
+        // For each key, find which member(s) received it. Sticky
+        // routing means each key appears in exactly one member's
+        // recorded list.
+        for k in &keys {
+            let mut owners: Vec<usize> = Vec::new();
+            for (i, mk) in member_keys.iter().enumerate() {
+                let recorded = mk.lock();
+                if recorded.iter().any(|r| r == k) {
+                    owners.push(i);
+                }
+            }
+            assert_eq!(
+                owners.len(),
+                1,
+                "key {k} should land on exactly one member, got owners={owners:?}",
+            );
+            // And that member should have received exactly PER_KEY
+            // copies of this key.
+            let owner = owners[0];
+            let recorded = member_keys[owner].lock();
+            let count = recorded.iter().filter(|r| *r == k).count();
+            assert_eq!(
+                count, PER_KEY,
+                "key {k} owner (member {owner}) got {count} deliveries, expected {PER_KEY}",
+            );
+        }
+
+        // Sanity: total deliveries == keys.len() × PER_KEY.
+        let total: usize = member_keys.iter().map(|m| m.lock().len()).sum();
+        assert_eq!(total, keys.len() * PER_KEY);
+
+        // The next_idx round-robin counter should NOT have advanced
+        // (sticky path skips it). Look up the consumer group and
+        // check.
+        let topic_arc = broker.topics.get(&topic).expect("topic exists");
+        let groups = topic_arc.consumer_groups.read();
+        let cg = groups.get("workers").expect("group exists");
+        assert_eq!(
+            cg.next_idx.load(Ordering::Relaxed),
+            0,
+            "round-robin counter must not advance on sticky-by-key publishes",
+        );
     }
 
     /// Offset replay must filter by topic: a subscriber on `topic-a`

@@ -211,6 +211,7 @@ async fn tls_full_publish_subscribe_roundtrip() {
                 qos: 0,
                 message: Bytes::from_static(b"over-tls"),
                 ttl_ms: None,
+                partition_key: None,
             }
             .encode()
             .unwrap(),

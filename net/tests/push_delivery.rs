@@ -171,6 +171,7 @@ impl Client {
                 qos,
                 message,
                 ttl_ms: None,
+                partition_key: None,
             }
             .encode()
             .unwrap(),

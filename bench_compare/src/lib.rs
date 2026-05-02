@@ -315,6 +315,7 @@ impl BmqClient {
             qos,
             message,
             ttl_ms: None,
+            partition_key: None,
         }
         .encode()?;
         let frame = Frame {

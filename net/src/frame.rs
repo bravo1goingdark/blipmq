@@ -208,7 +208,7 @@ impl NackPayload {
     }
 }
 
-/// PUBLISH payload: [u8 qos][u16 topic_len][topic_bytes][message_bytes...]
+/// PUBLISH payload: `[u8 qos][optional u32 ttl_ms][optional u16 key_len + key_bytes][u16 topic_len][topic_bytes][message_bytes...]`
 ///
 /// `topic` and `message` are zero-copy slices of the originating buffer
 /// (they share the underlying `Bytes` allocation). Constructing the topic
@@ -216,12 +216,20 @@ impl NackPayload {
 /// the broker ingress hot path; UTF-8 is validated in `decode` without
 /// copying.
 ///
-/// **Wire format flag bits:** the low 2 bits of `qos` carry the QoS
-/// level (0 = at-most-once, 1 = at-least-once). Bit 7 (`0x80`) is the
-/// `has_ttl` flag: when set, a `u32 ttl_ms` field follows the qos byte
-/// before the topic length. Old clients leave bit 7 clear and rely on
-/// the broker's default `message_ttl`; new clients can override
-/// per-message. This is wire-compatible with the original v2 format.
+/// **Wire format flag bits** in the qos byte:
+/// - bit 0..1: QoS level (0 = at-most-once, 1 = at-least-once)
+/// - bit 7 (`0x80`) `has_ttl`: a `u32 ttl_ms` field follows the qos byte
+/// - bit 6 (`0x40`) `has_partition_key`: a `[u16 key_len][key_bytes]`
+///   pair follows the optional ttl field
+///
+/// When both flags are set, the order is qos → ttl → key → topic →
+/// message. Wire-compatible with the original v2 PUBLISH and with the
+/// per-message-TTL extension: clients that don't set bit 6 leave the
+/// payload identical to before.
+///
+/// `partition_key` is the key used for sticky-by-key routing within
+/// consumer groups: messages with the same key always land on the same
+/// group member, preserving per-key ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishPayload {
     pub topic: Bytes,
@@ -230,9 +238,14 @@ pub struct PublishPayload {
     /// Optional per-message TTL in milliseconds. When `Some`, overrides
     /// the broker's `BrokerConfig::message_ttl` for this single message.
     pub ttl_ms: Option<u32>,
+    /// Optional partition key for sticky routing within consumer
+    /// groups. Empty `Bytes` is rejected by the broker — use `None`
+    /// for "no key, round-robin within the group".
+    pub partition_key: Option<Bytes>,
 }
 
 const PUBLISH_FLAG_HAS_TTL: u8 = 0x80;
+const PUBLISH_FLAG_HAS_KEY: u8 = 0x40;
 const PUBLISH_QOS_MASK: u8 = 0x03;
 
 impl PublishPayload {
@@ -242,17 +255,36 @@ impl PublishPayload {
             u16::try_from(topic_len).map_err(|_| FrameEncodeError::PayloadTooLarge(topic_len))?;
 
         let message_len = self.message.len();
-        let qos_byte = if self.ttl_ms.is_some() {
-            (self.qos & PUBLISH_QOS_MASK) | PUBLISH_FLAG_HAS_TTL
+        let key_len = self.partition_key.as_ref().map(|k| k.len()).unwrap_or(0);
+        let key_len_u16 = if let Some(k) = &self.partition_key {
+            Some(u16::try_from(k.len()).map_err(|_| FrameEncodeError::PayloadTooLarge(k.len()))?)
         } else {
-            self.qos & PUBLISH_QOS_MASK
+            None
         };
-        let extra = if self.ttl_ms.is_some() { 4 } else { 0 };
 
-        let mut buf = BytesMut::with_capacity(1 + extra + 2 + topic_len + message_len);
+        let mut qos_byte = self.qos & PUBLISH_QOS_MASK;
+        if self.ttl_ms.is_some() {
+            qos_byte |= PUBLISH_FLAG_HAS_TTL;
+        }
+        if self.partition_key.is_some() {
+            qos_byte |= PUBLISH_FLAG_HAS_KEY;
+        }
+        let ttl_extra = if self.ttl_ms.is_some() { 4 } else { 0 };
+        let key_extra = if self.partition_key.is_some() {
+            2 + key_len
+        } else {
+            0
+        };
+
+        let mut buf =
+            BytesMut::with_capacity(1 + ttl_extra + key_extra + 2 + topic_len + message_len);
         buf.put_u8(qos_byte);
         if let Some(ttl) = self.ttl_ms {
             buf.put_u32(ttl);
+        }
+        if let (Some(key), Some(klen)) = (&self.partition_key, key_len_u16) {
+            buf.put_u16(klen);
+            buf.put_slice(key);
         }
         buf.put_u16(topic_len_u16);
         buf.put_slice(&self.topic);
@@ -269,6 +301,7 @@ impl PublishPayload {
         let qos_byte = slice.get_u8();
         let qos = qos_byte & PUBLISH_QOS_MASK;
         let has_ttl = qos_byte & PUBLISH_FLAG_HAS_TTL != 0;
+        let has_key = qos_byte & PUBLISH_FLAG_HAS_KEY != 0;
 
         let mut header_len = 1usize;
         let ttl_ms = if has_ttl {
@@ -278,6 +311,24 @@ impl PublishPayload {
             let ttl = slice.get_u32();
             header_len += 4;
             Some(ttl)
+        } else {
+            None
+        };
+
+        let partition_key = if has_key {
+            if slice.remaining() < 2 {
+                return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+            }
+            let klen = slice.get_u16() as usize;
+            header_len += 2;
+            if slice.remaining() < klen {
+                return Err(FrameDecodeError::InvalidLength(payload.len() as u32));
+            }
+            // Zero-copy slice of the parent Bytes.
+            let key = payload.slice(header_len..header_len + klen);
+            slice.advance(klen);
+            header_len += klen;
+            Some(key)
         } else {
             None
         };
@@ -305,6 +356,7 @@ impl PublishPayload {
             qos,
             message,
             ttl_ms,
+            partition_key,
         })
     }
 
@@ -744,6 +796,7 @@ mod tests {
             qos: 1,
             message: Bytes::from_static(b"hello"),
             ttl_ms: Some(5_000),
+            partition_key: None,
         };
         let encoded = original.encode().expect("encode");
         let decoded = PublishPayload::decode(&encoded).expect("decode");
@@ -752,18 +805,55 @@ mod tests {
 
     #[test]
     fn publish_payload_without_ttl_roundtrip() {
-        // No TTL: wire format should be byte-compatible with the
-        // pre-TTL v2 layout.
+        // No TTL, no key: wire format should be byte-compatible with
+        // the pre-TTL v2 layout.
         let original = PublishPayload {
             topic: Bytes::from_static(b"a.b.c"),
             qos: 0,
             message: Bytes::from_static(b"x"),
             ttl_ms: None,
+            partition_key: None,
         };
         let encoded = original.encode().expect("encode");
         // Layout: [qos:1][topic_len:2][topic][message]
         assert_eq!(encoded.len(), 1 + 2 + 5 + 1);
+        assert_eq!(
+            encoded[0] & 0xC0,
+            0,
+            "has_ttl + has_key flags must both be clear"
+        );
+        let decoded = PublishPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn publish_payload_with_partition_key_roundtrip() {
+        let original = PublishPayload {
+            topic: Bytes::from_static(b"orders"),
+            qos: 0,
+            message: Bytes::from_static(b"event-data"),
+            ttl_ms: None,
+            partition_key: Some(Bytes::from_static(b"customer-42")),
+        };
+        let encoded = original.encode().expect("encode");
+        // Bit 6 set, bit 7 clear.
+        assert_eq!(encoded[0] & 0x40, 0x40, "has_key flag must be set");
         assert_eq!(encoded[0] & 0x80, 0, "has_ttl flag must be clear");
+        let decoded = PublishPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn publish_payload_with_ttl_and_key_roundtrip() {
+        let original = PublishPayload {
+            topic: Bytes::from_static(b"orders"),
+            qos: 1,
+            message: Bytes::from_static(b"d"),
+            ttl_ms: Some(10_000),
+            partition_key: Some(Bytes::from_static(b"k")),
+        };
+        let encoded = original.encode().expect("encode");
+        assert_eq!(encoded[0] & 0xC0, 0xC0, "both flag bits must be set");
         let decoded = PublishPayload::decode(&encoded).expect("decode");
         assert_eq!(decoded, original);
     }

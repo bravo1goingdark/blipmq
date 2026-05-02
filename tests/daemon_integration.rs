@@ -171,7 +171,8 @@ async fn publish_receive_ack_qos1() {
         qos: 1,
         message: Bytes::from_static(b"hello"),
             ttl_ms: None,
-    }
+            partition_key: None,
+        }
     .encode()
     .expect("encode publish");
     let pub_frame = Frame {
@@ -268,7 +269,8 @@ async fn multiple_subscribers_receive_same_message() {
         qos: 1,
         message: Bytes::from_static(b"fanout-msg"),
             ttl_ms: None,
-    }
+            partition_key: None,
+        }
     .encode()
     .expect("encode publish");
     let pub_frame = Frame {
