@@ -249,8 +249,7 @@ impl PublishPayload {
         };
         let extra = if self.ttl_ms.is_some() { 4 } else { 0 };
 
-        let mut buf =
-            BytesMut::with_capacity(1 + extra + 2 + topic_len + message_len);
+        let mut buf = BytesMut::with_capacity(1 + extra + 2 + topic_len + message_len);
         buf.put_u8(qos_byte);
         if let Some(ttl) = self.ttl_ms {
             buf.put_u32(ttl);
@@ -684,7 +683,10 @@ mod tests {
 
         let encoded = original.encode().expect("encode");
         // Sanity: 5-byte fixed prefix [qos:1][tag:8][topic_len:2] before topic+message.
-        assert_eq!(encoded.len(), 1 + 8 + 2 + original.topic.len() + original.message.len());
+        assert_eq!(
+            encoded.len(),
+            1 + 8 + 2 + original.topic.len() + original.message.len()
+        );
 
         let decoded = DeliverPayload::decode(&encoded).expect("decode");
         assert_eq!(decoded, original);

@@ -58,8 +58,22 @@ impl ShardedCounter {
         }
         Self {
             shards: [
-                z(), z(), z(), z(), z(), z(), z(), z(),
-                z(), z(), z(), z(), z(), z(), z(), z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
+                z(),
             ],
         }
     }
@@ -74,10 +88,7 @@ impl ShardedCounter {
     }
 
     pub fn load(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|s| s.load(Ordering::Relaxed))
-            .sum()
+        self.shards.iter().map(|s| s.load(Ordering::Relaxed)).sum()
     }
 }
 
@@ -126,8 +137,13 @@ impl PushSlot {
 /// dependency; the actual frame format lives in the net crate and is
 /// passed in via this closure at subscribe time.
 pub type DeliveryEncoder = Arc<
-    dyn Fn(&mut BytesMut, /*qos*/ QoSLevel, /*tag*/ u64, /*topic*/ &str, /*payload*/ &Bytes)
-        + Send
+    dyn Fn(
+            &mut BytesMut,
+            /*qos*/ QoSLevel,
+            /*tag*/ u64,
+            /*topic*/ &str,
+            /*payload*/ &Bytes,
+        ) + Send
         + Sync,
 >;
 
@@ -349,6 +365,10 @@ impl TopicName {
     }
 
     /// Construct from a `&str` without a `String` round-trip.
+    /// Inherent method (not `FromStr` trait) because TopicName
+    /// construction is infallible and we don't want callers to write
+    /// `.unwrap()` on every site. Suppressing the trait-confusion lint.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Self(Arc::from(s))
     }
@@ -583,7 +603,10 @@ impl SubscriptionShards {
     }
 
     #[inline(always)]
-    fn shard_for(&self, sub_id: SubscriptionId) -> &RwLock<HashMap<SubscriptionId, SubscriptionRef>> {
+    fn shard_for(
+        &self,
+        sub_id: SubscriptionId,
+    ) -> &RwLock<HashMap<SubscriptionId, SubscriptionRef>> {
         &self.shards[(sub_id.value() as usize) & self.mask]
     }
 
@@ -741,19 +764,16 @@ impl CheckpointSnapshot {
         buf.put_slice(CHECKPOINT_MAGIC);
         buf.put_u32(CHECKPOINT_VERSION);
         buf.put_u64(self.snapshot_id);
-        let n = u32::try_from(self.cursors.len()).map_err(|_| {
-            LogError::Corruption("too many checkpoint entries".to_string())
-        })?;
+        let n = u32::try_from(self.cursors.len())
+            .map_err(|_| LogError::Corruption("too many checkpoint entries".to_string()))?;
         buf.put_u32(n);
         for ((cid, topic), wal_id) in &self.cursors {
             let cid_bytes = cid.as_bytes();
             let topic_bytes = topic.as_bytes();
-            let cid_len = u16::try_from(cid_bytes.len()).map_err(|_| {
-                LogError::Corruption("client_id too long".to_string())
-            })?;
-            let topic_len = u16::try_from(topic_bytes.len()).map_err(|_| {
-                LogError::Corruption("topic too long".to_string())
-            })?;
+            let cid_len = u16::try_from(cid_bytes.len())
+                .map_err(|_| LogError::Corruption("client_id too long".to_string()))?;
+            let topic_len = u16::try_from(topic_bytes.len())
+                .map_err(|_| LogError::Corruption("topic too long".to_string()))?;
             buf.put_u16(cid_len);
             buf.put_slice(cid_bytes);
             buf.put_u16(topic_len);
@@ -784,9 +804,7 @@ impl CheckpointSnapshot {
         let mut hasher = Crc32Hasher::new();
         hasher.update(body);
         if hasher.finalize() != stored_crc {
-            return Err(LogError::Corruption(
-                "checkpoint CRC mismatch".to_string(),
-            ));
+            return Err(LogError::Corruption("checkpoint CRC mismatch".to_string()));
         }
 
         let mut slice = body;
@@ -857,9 +875,9 @@ impl WalEntry {
             return Err(LogError::Corruption("empty WAL entry".to_string()));
         }
         match bytes[0] {
-            WAL_KIND_MESSAGE => {
-                Ok(WalEntry::Message(WalMessageRecord::decode_after_kind(&bytes[1..])?))
-            }
+            WAL_KIND_MESSAGE => Ok(WalEntry::Message(WalMessageRecord::decode_after_kind(
+                &bytes[1..],
+            )?)),
             WAL_KIND_ACK => Ok(WalEntry::Ack(WalAckRecord::decode_after_kind(&bytes[1..])?)),
             other => Err(LogError::Corruption(format!(
                 "unknown WAL entry kind {other}"
@@ -891,9 +909,7 @@ impl WalAckRecord {
         let topic_len = u16::try_from(topic_bytes.len())
             .map_err(|_| LogError::Corruption("topic too long for WAL ack".to_string()))?;
 
-        let mut buf = BytesMut::with_capacity(
-            1 + 2 + cid_bytes.len() + 2 + topic_bytes.len() + 8,
-        );
+        let mut buf = BytesMut::with_capacity(1 + 2 + cid_bytes.len() + 2 + topic_bytes.len() + 8);
         buf.put_u8(WAL_KIND_ACK);
         buf.put_u16(cid_len);
         buf.put_slice(cid_bytes);
@@ -1387,7 +1403,14 @@ impl Broker {
         conn_id: u64,
         push_sender: PushSender,
     ) -> SubscriptionId {
-        self.subscribe_inner(client_id, topic, qos, Some(conn_id), Some(push_sender), None)
+        self.subscribe_inner(
+            client_id,
+            topic,
+            qos,
+            Some(conn_id),
+            Some(push_sender),
+            None,
+        )
     }
 
     /// Subscribe in shared-buffer push mode (v2 fast path). Messages are
@@ -1592,7 +1615,10 @@ impl Broker {
         let h = self.publish_fanout_ns.lock();
         LatencyStats {
             count: h.len(),
-            sum_ns: h.iter_recorded().map(|v| v.value_iterated_to() * v.count_at_value()).sum(),
+            sum_ns: h
+                .iter_recorded()
+                .map(|v| v.value_iterated_to() * v.count_at_value())
+                .sum(),
             p50_ns: h.value_at_quantile(0.50),
             p95_ns: h.value_at_quantile(0.95),
             p99_ns: h.value_at_quantile(0.99),
@@ -1898,7 +1924,7 @@ impl Broker {
         if let Some(start) = sample_start {
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             if let Some(mut h) = self.publish_fanout_ns.try_lock() {
-                let _ = h.saturating_record(elapsed_ns);
+                h.saturating_record(elapsed_ns);
             }
         }
     }
@@ -2042,9 +2068,7 @@ impl Broker {
                     }
                     slot.notify.notify_one();
                 } else {
-                    subscriber
-                        .queue
-                        .enqueue(payload, qos, Some(record.id), ttl);
+                    subscriber.queue.enqueue(payload, qos, Some(record.id), ttl);
                 }
             }
         }
@@ -2156,7 +2180,9 @@ impl Broker {
         // Make sure the parent directory exists.
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.map_err(LogError::Io)?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(LogError::Io)?;
             }
         }
         tokio::fs::write(&tmp, &bytes[..])
@@ -2171,9 +2197,7 @@ impl Broker {
     /// if the file doesn't exist (fresh deployment); `Err(_)` only if it
     /// exists but is structurally bad (caller should fall back to a full
     /// replay).
-    pub async fn load_checkpoint_from(
-        path: &Path,
-    ) -> Result<Option<CheckpointSnapshot>, LogError> {
+    pub async fn load_checkpoint_from(path: &Path) -> Result<Option<CheckpointSnapshot>, LogError> {
         match tokio::fs::read(path).await {
             Ok(bytes) => Ok(Some(CheckpointSnapshot::decode(&bytes)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2238,8 +2262,7 @@ impl Broker {
                     // messages are silently lost rather than echoed back to
                     // the same DLQ.
                     if !topic_str.ends_with(suffix.as_str()) {
-                        let dlq_topic =
-                            TopicName::from_str(&format!("{}{}", topic_str, suffix));
+                        let dlq_topic = TopicName::from_str(&format!("{}{}", topic_str, suffix));
                         for (payload, _reason) in dropped {
                             to_dlq.push((dlq_topic.clone(), payload));
                         }
@@ -2607,8 +2630,10 @@ mod tests {
         assert_eq!(handle.delivery_tag, 0); // QoS0 has no tag
 
         // Push subscribers should NOT also queue for poll.
-        assert!(broker.poll(sub_id).is_none(),
-            "push subscriber must not have a pending poll-path entry");
+        assert!(
+            broker.poll(sub_id).is_none(),
+            "push subscriber must not have a pending poll-path entry"
+        );
     }
 
     #[tokio::test]
@@ -2669,8 +2694,10 @@ mod tests {
         // RecvError::Disconnected once the last Sender goes away).
         broker.publish(&topic_a, Bytes::from_static(b"x"), QoSLevel::AtMostOnce);
         broker.publish(&topic_b, Bytes::from_static(b"y"), QoSLevel::AtMostOnce);
-        assert!(rx.recv_async().await.is_err(),
-            "channel should close once last sender is dropped");
+        assert!(
+            rx.recv_async().await.is_err(),
+            "channel should close once last sender is dropped"
+        );
     }
 
     #[tokio::test]
@@ -2711,11 +2738,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_file(&path);
 
-        let wal = Arc::new(
-            WriteAheadLog::open(&path)
-                .await
-                .expect("open WAL"),
-        );
+        let wal = Arc::new(WriteAheadLog::open(&path).await.expect("open WAL"));
 
         let config = BrokerConfig {
             default_qos: QoSLevel::AtLeastOnce,
@@ -2734,11 +2757,7 @@ mod tests {
         // -- pre-crash session --
         let acked_tags = {
             let broker = Broker::new_with_wal(config.clone(), wal.clone());
-            let sub_id = broker.subscribe(
-                client_id.clone(),
-                topic.clone(),
-                QoSLevel::AtLeastOnce,
-            );
+            let sub_id = broker.subscribe(client_id.clone(), topic.clone(), QoSLevel::AtLeastOnce);
 
             let mut tags = Vec::new();
             for i in 0..5u8 {
@@ -2763,8 +2782,7 @@ mod tests {
 
         // -- post-crash session: same WAL, same client_id, fresh broker --
         let broker2 = Broker::new_with_wal(config, wal.clone());
-        let sub_id2 =
-            broker2.subscribe(client_id, topic.clone(), QoSLevel::AtLeastOnce);
+        let sub_id2 = broker2.subscribe(client_id, topic.clone(), QoSLevel::AtLeastOnce);
         broker2.replay_from_wal().await.unwrap();
 
         // Drain whatever the replay enqueued. Should be exactly the 1
@@ -2824,15 +2842,12 @@ mod tests {
         let pattern = SubjectPattern::parse("orders.*.created").unwrap();
         let (tx, rx) = flume::bounded::<DeliveryHandle>(64);
 
-        let _sub = broker.subscribe_pattern(
-            ClientId::new("c"),
-            pattern,
-            QoSLevel::AtMostOnce,
-        );
+        let _sub = broker.subscribe_pattern(ClientId::new("c"), pattern, QoSLevel::AtMostOnce);
         // The above goes through the legacy poll path because we used the
         // non-slot variant; switch to slot-based pattern subscribe so we
         // can exercise the actual fanout receive.
-        let _ = tx; let _ = rx;
+        let _ = tx;
+        let _ = rx;
 
         // Use the channel-based subscribe with a wildcard pattern via
         // the trait directly: use subscribe_pattern + push_sender wiring.
@@ -2876,7 +2891,10 @@ mod tests {
         );
         let res =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx2.recv_async()).await;
-        assert!(res.is_err(), "non-matching publish must not reach wildcard sub");
+        assert!(
+            res.is_err(),
+            "non-matching publish must not reach wildcard sub"
+        );
     }
 
     #[test]
@@ -2893,7 +2911,9 @@ mod tests {
         assert_eq!(decoded.snapshot_id, 12345);
         assert_eq!(decoded.cursors.len(), 2);
         assert_eq!(
-            decoded.cursors.get(&("client-A".to_string(), "orders".to_string())),
+            decoded
+                .cursors
+                .get(&("client-A".to_string(), "orders".to_string())),
             Some(&10),
         );
     }
@@ -2902,8 +2922,7 @@ mod tests {
     fn checkpoint_corruption_caught_by_crc() {
         let mut snap = CheckpointSnapshot::empty();
         snap.snapshot_id = 1;
-        snap.cursors
-            .insert(("c".to_string(), "t".to_string()), 7);
+        snap.cursors.insert(("c".to_string(), "t".to_string()), 7);
         let mut bytes = snap.encode().expect("encode").to_vec();
         // Flip a byte in the body.
         bytes[10] ^= 0xFF;
@@ -2943,11 +2962,7 @@ mod tests {
         // Pre-crash session: publish 5, ack 4, write checkpoint.
         {
             let broker = Broker::new_with_wal(config.clone(), wal.clone());
-            let sub_id = broker.subscribe(
-                client_id.clone(),
-                topic.clone(),
-                QoSLevel::AtLeastOnce,
-            );
+            let sub_id = broker.subscribe(client_id.clone(), topic.clone(), QoSLevel::AtLeastOnce);
             for i in 0..5u8 {
                 broker
                     .publish_durable(&topic, Bytes::from(vec![i; 4]), QoSLevel::AtLeastOnce)

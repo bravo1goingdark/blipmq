@@ -48,7 +48,10 @@ async fn start_server() -> (SocketAddr, watch::Sender<bool>, Arc<Broker>) {
     drop(probe);
 
     let server = Server::new(
-        NetworkConfig { bind_addr: local, tls: None },
+        NetworkConfig {
+            bind_addr: local,
+            tls: None,
+        },
         handler,
         auth,
         shutdown_rx,
@@ -194,15 +197,14 @@ async fn run_fanout(
         topic: Bytes::copy_from_slice(TOPIC.as_bytes()),
         qos: 0,
         message: payload,
-            ttl_ms: None,
+        ttl_ms: None,
     }
     .encode()
     .unwrap();
 
     const COALESCE: u64 = 256;
-    let mut wire = BytesMut::with_capacity(
-        (publish_payload_bytes.len() + 16) as usize * COALESCE as usize,
-    );
+    let mut wire =
+        BytesMut::with_capacity((publish_payload_bytes.len() + 16) as usize * COALESCE as usize);
 
     let drops_before = broker.push_dropped_total();
     let pub_start = Instant::now();

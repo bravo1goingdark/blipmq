@@ -42,7 +42,9 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 ///   - the path to the key (PEM, PKCS#8),
 ///   - the cert in DER form (so the test client can trust it without
 ///     a system CA).
-fn generate_self_signed(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+fn generate_self_signed(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
     let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("rcgen self-signed");
     let cert_pem = cert_key.cert.pem();
@@ -56,7 +58,10 @@ fn generate_self_signed(dir: &std::path::Path) -> (std::path::PathBuf, std::path
     (cert_path, key_path, cert_der)
 }
 
-async fn read_until_frame(stream: &mut tokio_rustls::client::TlsStream<TcpStream>, buf: &mut BytesMut) -> Frame {
+async fn read_until_frame(
+    stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    buf: &mut BytesMut,
+) -> Frame {
     loop {
         if let Some(f) = try_decode_frame(buf).unwrap() {
             return f;
@@ -141,7 +146,11 @@ async fn tls_full_publish_subscribe_roundtrip() {
             .unwrap();
             tls.write_all(&out).await.unwrap();
             let resp = read_until_frame(&mut tls, &mut buf).await;
-            assert_eq!(resp.msg_type, FrameType::Ack, "HELLO must be ACKed over TLS");
+            assert_eq!(
+                resp.msg_type,
+                FrameType::Ack,
+                "HELLO must be ACKed over TLS"
+            );
 
             // AUTH
             out.clear();
@@ -189,8 +198,7 @@ async fn tls_full_publish_subscribe_roundtrip() {
     assert_eq!(resp.msg_type, FrameType::Ack, "SUBSCRIBE must be ACKed");
 
     // 5. Publisher connects + publishes.
-    let (mut pub_stream, _pub_buf) =
-        connect_and_handshake(connector, server_name, local).await;
+    let (mut pub_stream, _pub_buf) = connect_and_handshake(connector, server_name, local).await;
     out.clear();
     encode_frame(
         &Frame {
@@ -211,9 +219,12 @@ async fn tls_full_publish_subscribe_roundtrip() {
     pub_stream.write_all(&out).await.unwrap();
 
     // 6. Subscriber should receive the DELIVER frame through the TLS tunnel.
-    let frame = timeout(TEST_TIMEOUT, read_until_frame(&mut sub_stream, &mut sub_buf))
-        .await
-        .expect("DELIVER frame must arrive over TLS within timeout");
+    let frame = timeout(
+        TEST_TIMEOUT,
+        read_until_frame(&mut sub_stream, &mut sub_buf),
+    )
+    .await
+    .expect("DELIVER frame must arrive over TLS within timeout");
     assert_eq!(frame.msg_type, FrameType::Deliver);
     let payload = DeliverPayload::decode(&frame.payload).unwrap();
     assert_eq!(payload.topic, "tls-roundtrip");

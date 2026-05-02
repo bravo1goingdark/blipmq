@@ -407,18 +407,15 @@ impl WriteAheadLog {
             file.seek(std::io::SeekFrom::Start(start_offset_for_segment))
                 .await?;
             let mut offset = start_offset_for_segment;
-            loop {
-                match read_next_record_with_offset(&mut file, offset).await? {
-                    Some((id, payload, _record_offset, total_len)) => {
-                        if id >= min_id {
-                            records.push(WalRecord { id, payload });
-                        }
-                        offset = offset
-                            .checked_add(total_len)
-                            .ok_or_else(|| WalError::Corruption("offset overflow".to_string()))?;
-                    }
-                    None => break,
+            while let Some((id, payload, _record_offset, total_len)) =
+                read_next_record_with_offset(&mut file, offset).await?
+            {
+                if id >= min_id {
+                    records.push(WalRecord { id, payload });
                 }
+                offset = offset
+                    .checked_add(total_len)
+                    .ok_or_else(|| WalError::Corruption("offset overflow".to_string()))?;
             }
         }
 
@@ -520,7 +517,10 @@ impl WriteAheadLog {
 }
 
 impl WalWriter {
-    async fn run(mut self, index: Arc<Mutex<HashMap<u64, RecordLocation>>>) -> Result<(), WalError> {
+    async fn run(
+        mut self,
+        index: Arc<Mutex<HashMap<u64, RecordLocation>>>,
+    ) -> Result<(), WalError> {
         while let Some(message) = self.receiver.recv().await {
             match message {
                 WalMessage::Record(record) => {
@@ -729,7 +729,9 @@ fn segment_path(dir: &Path, seq: u64) -> PathBuf {
 /// Parse a segment filename like `wal-00000000000000000007.log` into 7.
 /// Returns `None` if the filename doesn't match.
 fn parse_segment_seq(name: &str) -> Option<u64> {
-    let s = name.strip_prefix(SEGMENT_PREFIX)?.strip_suffix(SEGMENT_SUFFIX)?;
+    let s = name
+        .strip_prefix(SEGMENT_PREFIX)?
+        .strip_suffix(SEGMENT_SUFFIX)?;
     s.parse::<u64>().ok()
 }
 
@@ -792,9 +794,7 @@ async fn validate_header(file: &mut File) -> Result<(), WalError> {
 
 /// Walk one segment from end-of-header to EOF (or first corruption),
 /// returning (records_in_segment, next_id_after_segment, end_offset).
-async fn rebuild_segment_index(
-    file: &mut File,
-) -> Result<(Vec<(u64, u64)>, u64, u64), WalError> {
+async fn rebuild_segment_index(file: &mut File) -> Result<(Vec<(u64, u64)>, u64, u64), WalError> {
     let mut records = Vec::new();
     let mut next_id = 1u64;
 
@@ -831,11 +831,11 @@ async fn read_next_record_with_offset(
     while read < header.len() {
         let n = file.read(&mut header[read..]).await?;
         if n == 0 {
-            return if read == 0 {
-                Ok(None)
-            } else {
-                Ok(None)
-            };
+            // Either end-of-segment (read == 0) or a torn header at the
+            // tail. Both mean "no more readable records here". A torn
+            // header is real corruption only if a CRC-validated record
+            // followed; on clean shutdown this is the normal terminator.
+            return Ok(None);
         }
         read += n;
     }
@@ -1058,7 +1058,10 @@ mod tests {
         // Verify multiple segment files exist.
         let mut seqs = list_segment_seqs(&dir).await.unwrap();
         seqs.sort_unstable();
-        assert!(seqs.len() >= 2, "expected at least 2 segments, got {seqs:?}");
+        assert!(
+            seqs.len() >= 2,
+            "expected at least 2 segments, got {seqs:?}"
+        );
 
         // Reopen and read everything back.
         let wal = WriteAheadLog::open_with_config(&dir, config).await.unwrap();
@@ -1093,7 +1096,10 @@ mod tests {
 
         // We expect at least 2 segments; otherwise the test setup is wrong.
         let seqs_before = list_segment_seqs(&dir).await.unwrap();
-        assert!(seqs_before.len() >= 3, "need >= 3 segments to exercise compaction, got {seqs_before:?}");
+        assert!(
+            seqs_before.len() >= 3,
+            "need >= 3 segments to exercise compaction, got {seqs_before:?}"
+        );
         let active = wal.active_segment_seq();
 
         // Compact everything strictly below the wal_id of the 4th record

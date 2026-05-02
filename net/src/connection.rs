@@ -345,9 +345,7 @@ where
                     ) {
                         Ok(None) => return Ok(()),
                         Ok(Some(nack)) => return self.send_inband(nack).await,
-                        Err(Error::Io(e))
-                            if e.kind() == std::io::ErrorKind::Unsupported =>
-                        {
+                        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
                             // Falls through to the async path below.
                         }
                         Err(e) => return Err(e),
@@ -434,8 +432,9 @@ where
             // key guessing without making a single typo painful for
             // legitimate clients.
             let base_ms = 50u64;
-            let backoff_ms =
-                base_ms.saturating_mul(1u64 << (self.auth_failures.min(5) - 1).min(4)).min(1000);
+            let backoff_ms = base_ms
+                .saturating_mul(1u64 << (self.auth_failures.min(5) - 1).min(4))
+                .min(1000);
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
 
             self.send_nack(frame.correlation_id, 401, "invalid API key")
@@ -499,4 +498,3 @@ where
         .await
     }
 }
-

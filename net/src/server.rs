@@ -211,6 +211,13 @@ where
                             let handler = self.handler.clone();
                             let conn_shutdown = shutdown_rx.clone();
                             let auth = self.auth_validator.clone();
+                            // `Option<TlsAcceptor>` (with tls feature) is an
+                            // Arc-backed handle and `.clone()` is a refcount
+                            // bump; without the feature this is `Option<()>`,
+                            // and clippy correctly flags the clone-on-Copy
+                            // — but we can't avoid one form without breaking
+                            // the other.
+                            #[allow(clippy::clone_on_copy)]
                             let tls = tls_acceptor.clone();
 
                             // Disable Nagle: writer task issues already-batched frames; we want
@@ -569,11 +576,7 @@ impl BrokerHandler {
                     WalError::WriterStopped => (503, "wal_writer_stopped"),
                     _ => (500, "durable_publish_failed"),
                 };
-                let nack = self.make_nack(
-                    frame.correlation_id,
-                    code,
-                    &format!("{label}: {e}"),
-                )?;
+                let nack = self.make_nack(frame.correlation_id, code, &format!("{label}: {e}"))?;
                 return Ok(FrameResponse::Frame(nack));
             }
         } else if ttl_override.is_some() {
@@ -723,9 +726,7 @@ impl BrokerHandler {
 /// but the `tls` feature is off, so misconfiguration doesn't silently
 /// degrade to plain TCP.
 #[cfg(feature = "tls")]
-fn build_tls_acceptor(
-    cfg: Option<&TlsConfig>,
-) -> Result<Option<tokio_rustls::TlsAcceptor>, Error> {
+fn build_tls_acceptor(cfg: Option<&TlsConfig>) -> Result<Option<tokio_rustls::TlsAcceptor>, Error> {
     use std::io::BufReader;
     use tokio_rustls::rustls::{pki_types::PrivateKeyDer, ServerConfig};
     use tokio_rustls::TlsAcceptor;
@@ -817,4 +818,3 @@ async fn accept_and_split(
     let (r, w) = stream.into_split();
     Ok((Pin::new(Box::new(r)), Pin::new(Box::new(w))))
 }
-

@@ -166,11 +166,7 @@ async fn metrics_response(broker: &Broker, wal: &WriteAheadLog) -> Response<Body
         "blipmq_publish_fanout_seconds{{quantile=\"0.99\"}} {:.9}",
         lat.p99_ns as f64 / 1e9,
     );
-    let _ = writeln!(
-        out,
-        "blipmq_publish_fanout_seconds_count {}",
-        lat.count,
-    );
+    let _ = writeln!(out, "blipmq_publish_fanout_seconds_count {}", lat.count,);
     let _ = writeln!(
         out,
         "blipmq_publish_fanout_seconds_sum {:.9}",

@@ -2,9 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use corelib::{
-    Broker, BrokerConfig, ClientId, DeliveryHandle, PushReceiver, QoSLevel, TopicName,
-};
+use corelib::{Broker, BrokerConfig, ClientId, DeliveryHandle, PushReceiver, QoSLevel, TopicName};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Capacity for each push subscriber's channel in the bench. Big enough to
@@ -21,6 +19,7 @@ fn make_broker() -> Broker {
         retry_base_delay: Duration::from_millis(50),
         slow_consumer_policy: corelib::SlowConsumerPolicy::DropNewest,
         slow_consumer_buffer_bytes: 16 * 1024 * 1024,
+        dlq_suffix: Some(".dlq".to_string()),
     })
 }
 
@@ -59,7 +58,9 @@ fn build_push_broker(
 /// section — the goal is to measure broker fanout cost, not channel-recv
 /// throughput.
 fn bench_publish_push_qos0(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("publish_qos0_push_fanout");
     let payload = Bytes::from(vec![0u8; 256]);
 
@@ -71,9 +72,7 @@ fn bench_publish_push_qos0(c: &mut Criterion) {
             // `bench_with_input` re-builds state per iteration sample, so
             // these tasks are short-lived.
             for rx in receivers {
-                rt.spawn(async move {
-                    while rx.recv_async().await.is_ok() {}
-                });
+                rt.spawn(async move { while rx.recv_async().await.is_ok() {} });
             }
             b.iter(|| {
                 broker.publish(&topic, payload.clone(), QoSLevel::AtMostOnce);
@@ -85,7 +84,9 @@ fn bench_publish_push_qos0(c: &mut Criterion) {
 }
 
 fn bench_publish_push_qos1(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("publish_qos1_push_fanout");
     let payload = Bytes::from(vec![0u8; 256]);
 
@@ -94,9 +95,7 @@ fn bench_publish_push_qos1(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, &subs| {
             let (broker, topic, receivers) = build_push_broker(&rt, subs, QoSLevel::AtLeastOnce);
             for rx in receivers {
-                rt.spawn(async move {
-                    while rx.recv_async().await.is_ok() {}
-                });
+                rt.spawn(async move { while rx.recv_async().await.is_ok() {} });
             }
             b.iter(|| {
                 broker.publish(&topic, payload.clone(), QoSLevel::AtLeastOnce);
@@ -119,7 +118,11 @@ fn bench_publish_poll_qos0(c: &mut Criterion) {
             let broker = make_broker();
             let topic = TopicName::new("bench/topic");
             for i in 0..subs {
-                broker.subscribe(ClientId::new(format!("c{i}")), topic.clone(), QoSLevel::AtMostOnce);
+                broker.subscribe(
+                    ClientId::new(format!("c{i}")),
+                    topic.clone(),
+                    QoSLevel::AtMostOnce,
+                );
             }
             b.iter(|| {
                 broker.publish(&topic, payload.clone(), QoSLevel::AtMostOnce);
@@ -131,13 +134,13 @@ fn bench_publish_poll_qos0(c: &mut Criterion) {
 }
 
 fn bench_publish_payload_sizes(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("publish_payload_sizes_push_64subs");
     let (broker, topic, receivers) = build_push_broker(&rt, 64, QoSLevel::AtMostOnce);
     for rx in receivers {
-        rt.spawn(async move {
-            while rx.recv_async().await.is_ok() {}
-        });
+        rt.spawn(async move { while rx.recv_async().await.is_ok() {} });
     }
 
     for &size in &[64usize, 1024, 16 * 1024] {

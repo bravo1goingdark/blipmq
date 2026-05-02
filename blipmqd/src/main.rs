@@ -76,7 +76,7 @@ async fn run_integration_flow(
         topic: Bytes::from_static(b"test"),
         qos: 1,
         message: Bytes::from_static(b"hello"),
-            ttl_ms: None,
+        ttl_ms: None,
     }
     .encode()?;
 
@@ -290,7 +290,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         changed = ckpt_shutdown.changed() => {
-                            if changed.is_err() {}
+                            // Sender dropped or shutdown signaled — either way we exit.
+                            let _ = changed;
                             break;
                         }
                     }

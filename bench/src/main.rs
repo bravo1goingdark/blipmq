@@ -192,7 +192,10 @@ async fn start_server(broker: Arc<Broker>, api_key: &str) -> (SocketAddr, watch:
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let server = Server::new(
-        NetworkConfig { bind_addr: addr, tls: None },
+        NetworkConfig {
+            bind_addr: addr,
+            tls: None,
+        },
         handler,
         auth_validator,
         shutdown_rx,

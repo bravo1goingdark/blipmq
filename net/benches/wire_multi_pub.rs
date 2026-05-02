@@ -55,7 +55,10 @@ async fn start_server() -> (SocketAddr, watch::Sender<bool>, Arc<Broker>) {
     drop(probe);
 
     let server = Server::new(
-        NetworkConfig { bind_addr: local, tls: None },
+        NetworkConfig {
+            bind_addr: local,
+            tls: None,
+        },
         handler,
         auth,
         shutdown_rx,
@@ -180,15 +183,14 @@ async fn run_pipe(addr: SocketAddr, topic: String, n_msgs: u64, payload_len: usi
         topic: Bytes::copy_from_slice(topic.as_bytes()),
         qos: 0,
         message: payload,
-            ttl_ms: None,
+        ttl_ms: None,
     }
     .encode()
     .unwrap();
 
     const COALESCE: u64 = 256;
-    let mut wire = BytesMut::with_capacity(
-        (publish_payload_bytes.len() + 16) as usize * COALESCE as usize,
-    );
+    let mut wire =
+        BytesMut::with_capacity((publish_payload_bytes.len() + 16) as usize * COALESCE as usize);
 
     let start = Instant::now();
     let mut sent: u64 = 0;
